@@ -30,3 +30,14 @@ jobs:
           STRESS_DURATION: ${{ inputs.duration || '300' }}
           STRESS_CONCURRENCY: ${{ inputs.concurrency || '30' }}
         run: ./server/stress_test.sh
+
+      # cancelled(), not just failure(): a timeout-minutes cancellation
+      # deserves the same partial artifacts a real failure gets, same
+      # reasoning kasan-boot.yml's own upload step already uses.
+      - name: Upload server log and per-worker error details on failure
+        if: ${{ failure() || cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: stress-test-failure
+          path: server/stress-failure-artifacts/
+          if-no-files-found: ignore

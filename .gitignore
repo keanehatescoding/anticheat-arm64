@@ -25,3 +25,4 @@ server/*.db
 server/*.db-wal
 server/*.db-shm
 server/__pycache__/
+server/stress-failure-artifacts/
