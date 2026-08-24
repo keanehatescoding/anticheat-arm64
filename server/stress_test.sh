@@ -97,8 +97,8 @@ trap cleanup EXIT
 # incidental, which matters here specifically because leftover workers
 # are a real, previously-hit failure mode (see the comment above), not
 # a hypothetical one.
-trap 'cleanup; exit 130' INT
-trap 'cleanup; exit 143' TERM
+trap 'FAIL=1; cleanup; exit 130' INT
+trap 'FAIL=1; cleanup; exit 143' TERM
 
 echo "=== server stress test: $CONCURRENCY workers x ${DURATION}s ==="
 echo
@@ -163,6 +163,7 @@ worker() {
             ok=$((ok + 1))
         elif [ "$rc" -eq 28 ]; then
             timeouts=$((timeouts + 1))
+            printf 'n=%d rc=%d (timeout, response unavailable)\n' "$n" "$rc" >> "$TESTDIR/worker-$id.errlog"
         else
             errors=$((errors + 1))
             # Only rc=0 means curl actually got a complete response to show
