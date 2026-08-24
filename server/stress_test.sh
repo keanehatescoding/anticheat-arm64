@@ -35,6 +35,13 @@ fi
 PORT=18900
 TESTDIR="$(mktemp -d /tmp/ac_server_stress.XXXXXXXX)"
 DB="$TESTDIR/ac_server.db"
+# cleanup() below always rm -rf's $TESTDIR, including server.log and every
+# worker's errlog -- exactly the files needed to diagnose a failure. On
+# FAIL, copy them here (relative to this script's own dir, i.e.
+# server/stress-failure-artifacts/) before that happens, so CI can upload
+# them as a build artifact instead of the failure reason being lost the
+# moment this script exits.
+ARTIFACT_DIR="$(pwd)/stress-failure-artifacts"
 REPORT_KEY="stress-report-key-$$"
 ADMIN_KEY="stress-admin-key-$$"
 BASE="http://127.0.0.1:$PORT"
@@ -77,6 +84,11 @@ cleanup() {
     # shellcheck disable=SC2086
     [ -n "$WORKER_PIDS" ] && wait $WORKER_PIDS 2>/dev/null
     wait "$SERVER_PID" 2>/dev/null
+    if [ "$FAIL" -ne 0 ]; then
+        mkdir -p "$ARTIFACT_DIR"
+        cp "$TESTDIR/server.log" "$ARTIFACT_DIR/" 2>/dev/null
+        cp "$TESTDIR"/worker-*.errlog "$ARTIFACT_DIR/" 2>/dev/null
+    fi
     rm -rf "$TESTDIR"
 }
 trap cleanup EXIT
@@ -85,8 +97,8 @@ trap cleanup EXIT
 # incidental, which matters here specifically because leftover workers
 # are a real, previously-hit failure mode (see the comment above), not
 # a hypothetical one.
-trap 'cleanup; exit 130' INT
-trap 'cleanup; exit 143' TERM
+trap 'FAIL=1; cleanup; exit 130' INT
+trap 'FAIL=1; cleanup; exit 143' TERM
 
 echo "=== server stress test: $CONCURRENCY workers x ${DURATION}s ==="
 echo
@@ -139,10 +151,11 @@ worker() {
     local timeouts=0
     local errors=0
     local n=0
+    local bodyfile="$TESTDIR/worker-$id.lastbody"
     local end=$(( $(date +%s) + DURATION ))
     while [ "$(date +%s)" -lt "$end" ]; do
         n=$((n + 1))
-        code=$(curl -s "${CURL_TIMEOUT[@]}" -o /dev/null -w '%{http_code}' -X POST "$BASE/report" \
+        code=$(curl -s "${CURL_TIMEOUT[@]}" -o "$bodyfile" -w '%{http_code}' -X POST "$BASE/report" \
             -H "Authorization: Bearer $REPORT_KEY" -H 'Content-Type: application/json' \
             -d "{\"client_id\":\"$cid\",\"event_type\":\"X\",\"detail\":\"n=$n\",\"ts\":$n}")
         rc=$?
@@ -150,8 +163,20 @@ worker() {
             ok=$((ok + 1))
         elif [ "$rc" -eq 28 ]; then
             timeouts=$((timeouts + 1))
+            printf 'n=%d rc=%d (timeout, response unavailable)\n' "$n" "$rc" >> "$TESTDIR/worker-$id.errlog"
         else
             errors=$((errors + 1))
+            # Only rc=0 means curl actually got a complete response to show
+            # a body/code for; a nonzero, non-28 rc is a transport failure
+            # (connection refused/reset) where $bodyfile is stale or empty
+            # from a prior iteration, not useful/attributable to this one.
+            {
+                if [ "$rc" -eq 0 ]; then
+                    printf 'n=%d rc=%d code=%s body=%s\n' "$n" "$rc" "$code" "$(head -c 300 "$bodyfile" 2>/dev/null)"
+                else
+                    printf 'n=%d rc=%d (transport failure, no response)\n' "$n" "$rc"
+                fi
+            } >> "$TESTDIR/worker-$id.errlog"
         fi
     done
     printf '%s %d %d %d\n' "$cid" "$ok" "$timeouts" "$errors" > "$TESTDIR/worker-$id.result"
