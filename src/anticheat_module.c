@@ -39,6 +39,7 @@
 #include <linux/pid_namespace.h>
 #include <linux/mm.h>
 #include <linux/mmap_lock.h>
+#include <linux/vmalloc.h>
 #include <linux/kprobes.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
@@ -930,9 +931,28 @@ static unsigned long long ac_module_size(const struct module *mod)
  * (module_mutex is not exported).  A garbage entry with base=0 and a huge
  * size would otherwise make within_module_core() claim every kernel
  * address, poisoning both the hidden-module check and the syscall
- * plausibility filter. */
+ * plausibility filter.
+ *
+ * The is_vmalloc_addr() check guards against a subtler problem than a
+ * torn entry: both walk sites below do
+ * list_for_each_entry(m, &THIS_MODULE->list, list), which only stops
+ * once it circles back to THIS_MODULE's own list node -- not the
+ * kernel's real (unexported) `modules` list_head sentinel. A full walk
+ * necessarily passes through that sentinel too, and list_for_each_entry
+ * unconditionally container_of()s it into a `struct module *` as if it
+ * were a real entry, even though it isn't embedded in one. Dereferencing
+ * that bogus pointer reads whatever kernel global happens to sit at
+ * that computed offset -- a real, reproduced KASAN global-out-of-bounds
+ * (confirmed: lands inside a kernel workqueue global on one tested
+ * layout). A genuine struct module always lives inside that module's
+ * own vmalloc'd core memory; the sentinel-derived pointer instead lands
+ * in the kernel's statically-linked image, so is_vmalloc_addr() tells
+ * the two apart without ever needing the sentinel's own (unexported)
+ * address. */
 static bool ac_module_sane(const struct module *m)
 {
+    if (!is_vmalloc_addr(m))
+        return false;
     if (m->state != MODULE_STATE_LIVE)
         return false;
     if (!m->mem[MOD_TEXT].base || !m->mem[MOD_TEXT].size)
