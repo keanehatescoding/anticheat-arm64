@@ -51,10 +51,15 @@ automatically on every kernel package upgrade. Building it needs Linux
 kernel headers for the running kernel.
 
 On install this package also points DKMS's built-in Secure Boot signing
-at a self-generated Machine Owner Key (MOK) under /var/lib/anticheat/mok/
-and enrolls it via mokutil if Secure Boot is on -- expect a one-time
-reboot-and-approve prompt in that case. Same setup as upstream's
-scripts/dkms-install.sh and the AUR package.
+at a self-generated Machine Owner Key (MOK) under /var/lib/anticheat/mok/.
+Fedora packaging guidelines don't allow an interactive scriptlet, so unlike
+upstream's scripts/dkms-install.sh and the AUR package, this package does
+NOT run the MOK enrollment prompt for you -- if Secure Boot is on, enroll
+it yourself once after installing with "sudo mokutil --import
+/var/lib/anticheat/mok/mok.der", then reboot and approve it in the blue
+"MOK Management" screen (Enroll MOK -> Continue -> enter the one-time
+password -> Reboot). Until you do this, the signed module will fail to
+load.
 
 %prep
 %autosetup -n hypranticheat-%{version}
@@ -151,7 +156,13 @@ case "$rc" in
         ;;
 esac
 
-mok_rc=0
+# Fedora packaging guidelines require scriptlets to never be interactive
+# (rpm-scriptlets(7); a %post can run with both stdin/stdout attached to a
+# real terminal during an interactive `dnf install`, unlike Debian's more
+# permissive-when-a-tty's-present policy -- see the tty-gated version of
+# this in packaging/debian/hypranticheat-dkms.postinst), so unlike that
+# script, this one never calls `mokutil --import` itself at all -- only
+# ever prints the manual command (also documented in %description dkms).
 cert=/var/lib/anticheat/mok/mok.der
 if [ -e "$cert" ]; then
     if ! command -v mokutil >/dev/null 2>&1; then
@@ -160,38 +171,18 @@ if [ -e "$cert" ]; then
     elif mokutil --sb-state 2>/dev/null | grep -qi enabled; then
         if mokutil --test-key "$cert" 2>/dev/null | grep -qi "already enrolled"; then
             :
-        elif [ ! -t 0 ] || [ ! -t 1 ]; then
-            # mokutil --import always prompts for a one-time password on
-            # its controlling terminal and has no non-interactive mode;
-            # dnf/rpm can run this scriptlet with no tty at all (scripted/
-            # unattended installs), so only attempt it when one is
-            # actually available -- otherwise defer with instructions,
-            # same as the missing-kernel-headers case above.
-            echo "==> Secure Boot is ON and hypranticheat's signing key is not yet trusted,"
-            echo "==> but this install has no terminal to prompt for the MOK enrollment"
-            echo "==> password on (a scripted/unattended install). Enroll it manually:"
-            echo "==>   sudo mokutil --import $cert"
-            echo "==> then REBOOT and approve it in the blue 'MOK Management' screen."
         else
             echo "==> Secure Boot is ON and hypranticheat's signing key is not yet trusted."
-            echo "==> Enrolling it now -- you will be asked to set a one-time password."
-            echo "==> REBOOT after this and approve the request in the blue 'MOK Management'"
-            echo "==> screen (Enroll MOK -> Continue -> enter the password -> Reboot)."
-            echo "==> Until you do this, the signed module will still fail to load."
-            if ! mokutil --import "$cert"; then
-                echo "==> mokutil --import failed; enroll manually: sudo mokutil --import $cert" >&2
-                mok_rc=1
-            fi
+            echo "==> Enroll it manually (this scriptlet won't prompt for you):"
+            echo "==>   sudo mokutil --import $cert"
+            echo "==> then REBOOT and approve it in the blue 'MOK Management' screen"
+            echo "==> (Enroll MOK -> Continue -> enter the password -> Reboot). Until you"
+            echo "==> do this, the signed module will still fail to load."
         fi
     fi
 fi
 
 [ "$rc" -eq 0 ] && echo "==> load it with: sudo modprobe anticheat"
-# A real (interactively attempted) MOK enrollment failure, not the
-# deferred-no-tty case above -- fail the scriptlet here too rather than
-# reporting a successful install while Secure Boot is still going to
-# refuse to load the module.
-[ "$rc" -eq 0 ] && [ "$mok_rc" -ne 0 ] && exit "$mok_rc"
 exit "$rc"
 
 %preun dkms

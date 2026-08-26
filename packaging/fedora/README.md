@@ -33,9 +33,14 @@ rebuilt independently):
   the `/var/lib/anticheat/baselines` state directory.
 - **`hypranticheat-dkms`** — the kernel module source, registered with
   DKMS. Its `%post`/`%preun` scriptlets do the same dkms-add/build/install
-  + Secure Boot MOK-signing setup as `scripts/dkms-install.sh` and the AUR
-  package's `.install` hooks, using rpm's own `%post $1`/`%preun $1`
-  install-vs-upgrade-vs-removal argument convention instead of pacman's.
+  + Secure Boot MOK signing-key setup as `scripts/dkms-install.sh` and the
+  AUR package's `.install` hooks, using rpm's own `%post $1`/`%preun $1`
+  install-vs-upgrade-vs-removal argument convention instead of pacman's —
+  with one deliberate difference: Fedora packaging guidelines forbid
+  interactive scriptlets, so `%post` never runs the MOK enrollment prompt
+  itself (unlike `dkms-install.sh` and the AUR package); it only prints
+  the `mokutil --import` command for you to run manually. See
+  `%description dkms` in the spec.
 
 `x86-64` only (`ExclusiveArch: x86_64`) — see README.md's "Build" section
 for why.
