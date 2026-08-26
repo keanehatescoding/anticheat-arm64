@@ -35,7 +35,11 @@ without it the daemon can only run against its userspace mock.
 
 %package dkms
 Summary:        Kernel module (DKMS) for a kernel-mode anticheat
-Requires:       dkms
+# mok_signing_key/mok_certificate/framework.conf.d support (what %%post's
+# /etc/dkms/framework.conf.d/anticheat.conf fragment relies on) only
+# exists from DKMS 3.0 -- an older dkms would silently ignore that
+# fragment and build unsigned.
+Requires:       dkms >= 3.0
 Requires:       %{name} = %{version}-%{release}
 Provides:       anticheat-dkms
 ExclusiveArch:  x86_64
@@ -109,7 +113,15 @@ install -dm700 %{buildroot}%{_localstatedir}/lib/anticheat/mok
 # done by asking dkms directly rather than diffing old/new version
 # strings, since rpm %%post's "$1 == 2 means upgrade" doesn't tell us
 # what the *previous* version actually was.
-for old in $(dkms status -m anticheat 2>/dev/null | cut -d, -f2 | tr -d ' '); do
+#
+# dkms status prints "<module>/<version>, <kernel>, <arch>: <status>" per
+# built kernel (or just "<module>/<version>: added" before any kernel
+# build exists) -- the module *version* is inside field 1, not field 2
+# (that's the kernel version); field 1 can also carry a trailing
+# ": <status>" when there's no kernel/arch part, hence the extra `cut -d:`.
+# sort -u collapses the one-line-per-built-kernel duplication down to
+# distinct versions.
+for old in $(dkms status -m anticheat 2>/dev/null | cut -d, -f1 | cut -d: -f1 | cut -d/ -f2 | tr -d ' ' | sort -u); do
     [ "$old" = "%{version}" ] && continue
     dkms remove -m anticheat -v "$old" --all >/dev/null 2>&1 || true
 done
@@ -139,6 +151,7 @@ case "$rc" in
         ;;
 esac
 
+mok_rc=0
 cert=/var/lib/anticheat/mok/mok.der
 if [ -e "$cert" ]; then
     if ! command -v mokutil >/dev/null 2>&1; then
@@ -147,19 +160,38 @@ if [ -e "$cert" ]; then
     elif mokutil --sb-state 2>/dev/null | grep -qi enabled; then
         if mokutil --test-key "$cert" 2>/dev/null | grep -qi "already enrolled"; then
             :
+        elif [ ! -t 0 ] || [ ! -t 1 ]; then
+            # mokutil --import always prompts for a one-time password on
+            # its controlling terminal and has no non-interactive mode;
+            # dnf/rpm can run this scriptlet with no tty at all (scripted/
+            # unattended installs), so only attempt it when one is
+            # actually available -- otherwise defer with instructions,
+            # same as the missing-kernel-headers case above.
+            echo "==> Secure Boot is ON and hypranticheat's signing key is not yet trusted,"
+            echo "==> but this install has no terminal to prompt for the MOK enrollment"
+            echo "==> password on (a scripted/unattended install). Enroll it manually:"
+            echo "==>   sudo mokutil --import $cert"
+            echo "==> then REBOOT and approve it in the blue 'MOK Management' screen."
         else
             echo "==> Secure Boot is ON and hypranticheat's signing key is not yet trusted."
             echo "==> Enrolling it now -- you will be asked to set a one-time password."
             echo "==> REBOOT after this and approve the request in the blue 'MOK Management'"
             echo "==> screen (Enroll MOK -> Continue -> enter the password -> Reboot)."
             echo "==> Until you do this, the signed module will still fail to load."
-            mokutil --import "$cert" || \
-                echo "==> mokutil --import failed; enroll manually: sudo mokutil --import $cert"
+            if ! mokutil --import "$cert"; then
+                echo "==> mokutil --import failed; enroll manually: sudo mokutil --import $cert" >&2
+                mok_rc=1
+            fi
         fi
     fi
 fi
 
 [ "$rc" -eq 0 ] && echo "==> load it with: sudo modprobe anticheat"
+# A real (interactively attempted) MOK enrollment failure, not the
+# deferred-no-tty case above -- fail the scriptlet here too rather than
+# reporting a successful install while Secure Boot is still going to
+# refuse to load the module.
+[ "$rc" -eq 0 ] && [ "$mok_rc" -ne 0 ] && exit "$mok_rc"
 exit "$rc"
 
 %preun dkms

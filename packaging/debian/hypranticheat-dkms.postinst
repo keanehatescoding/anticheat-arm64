@@ -59,13 +59,32 @@ enroll_mok_if_needed() {
     if mokutil --test-key "$cert" 2>/dev/null | grep -qi "already enrolled"; then
         return 0
     fi
+
+    # mokutil --import always prompts for a one-time password on its
+    # controlling terminal -- it has no non-interactive mode. Debian
+    # policy requires maintainer scripts not to block on stdin (apt runs
+    # postinst with no tty in unattended/scripted installs), so only
+    # attempt it when one is actually available; otherwise defer with
+    # instructions, same as the missing-kernel-headers case above.
+    if [ ! -t 0 ] || [ ! -t 1 ]; then
+        echo "==> Secure Boot is ON and hypranticheat's signing key is not yet trusted,"
+        echo "==> but this install has no terminal to prompt for the MOK enrollment"
+        echo "==> password on (a scripted/unattended install). Enroll it manually:"
+        echo "==>   sudo mokutil --import $cert"
+        echo "==> then REBOOT and approve it in the blue 'MOK Management' screen."
+        return 0
+    fi
+
     echo "==> Secure Boot is ON and hypranticheat's signing key is not yet trusted."
     echo "==> Enrolling it now -- you will be asked to set a one-time password."
     echo "==> REBOOT after this and approve the request in the blue 'MOK Management'"
     echo "==> screen (Enroll MOK -> Continue -> enter the password -> Reboot). Until"
     echo "==> you do this, the signed module will still fail to load."
-    mokutil --import "$cert" || \
-        echo "==> mokutil --import failed; enroll manually: sudo mokutil --import $cert"
+    if mokutil --import "$cert"; then
+        return 0
+    fi
+    echo "==> mokutil --import failed; enroll manually: sudo mokutil --import $cert" >&2
+    return 1
 }
 
 case "$1" in
@@ -86,7 +105,14 @@ case "$1" in
         # tells us the *previously configured package* version, not
         # whether dkms.conf's PACKAGE_VERSION actually changed, so this
         # just asks dkms directly rather than tracking that separately).
-        for old in $(dkms status -m anticheat 2>/dev/null | cut -d, -f2 | tr -d ' '); do
+        # dkms status prints "<module>/<version>, <kernel>, <arch>: <status>"
+        # per built kernel (or just "<module>/<version>: added" before any
+        # kernel build exists) -- the module *version* is inside field 1,
+        # not field 2 (that's the kernel version); field 1 can also carry a
+        # trailing ": <status>" when there's no kernel/arch part, hence the
+        # extra `cut -d:`. sort -u collapses the one-line-per-built-kernel
+        # duplication down to distinct versions.
+        for old in $(dkms status -m anticheat 2>/dev/null | cut -d, -f1 | cut -d: -f1 | cut -d/ -f2 | tr -d ' ' | sort -u); do
             [ "$old" = "$ver" ] && continue
             dkms remove -m anticheat -v "$old" --all >/dev/null 2>&1 || true
         done
@@ -94,7 +120,8 @@ case "$1" in
         dkms add -m anticheat -v "$ver" 2>/dev/null || true
         rc=0
         dkms_install "$ver" || rc=$?
-        enroll_mok_if_needed
+        mok_rc=0
+        enroll_mok_if_needed || mok_rc=$?
         if [ "$rc" -ne 0 ]; then
             # A genuine build/install failure (not the deferred-headers
             # case above, which already returned 0) -- fail the postinst
@@ -104,6 +131,11 @@ case "$1" in
             exit "$rc"
         fi
         echo "==> load it with: sudo modprobe anticheat"
+        # A real (interactively attempted) MOK enrollment failure, not the
+        # deferred-no-tty case above (which already returned 0) -- fail the
+        # postinst here too rather than reporting configured-successfully
+        # while Secure Boot is still going to refuse to load the module.
+        [ "$mok_rc" -ne 0 ] && exit "$mok_rc"
         ;;
 esac
 

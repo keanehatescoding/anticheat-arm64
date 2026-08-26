@@ -47,9 +47,10 @@ machine — see `packaging/aur/README.md`), this spec has **not** been run
 through a real `rpmbuild`/`rpmlint`/`dnf install` cycle — none of
 `rpmbuild`, `rpmlint`, or `rpmdevtools` were available in the environment
 this was authored in. Before relying on this for a real install, build it
-and check `rpmlint` comes back clean, and run through a real
-`dnf install ./hypranticheat*.rpm` / `dnf remove hypranticheat-dkms` cycle
-on a disposable VM or container (the DKMS + MOK setup mutates real system
-state — `/etc/dkms/`, `/var/lib/dkms/`, the running kernel's module tree —
-same reason the AUR README gives for not testing `pacman -U` on the
-authoring machine).
+and check `rpmlint ~/rpmbuild/RPMS/x86_64/hypranticheat*.rpm` comes back
+clean, and run through a real
+`dnf install ~/rpmbuild/RPMS/x86_64/hypranticheat*.rpm` /
+`dnf remove hypranticheat-dkms` cycle on a disposable VM or container (the
+DKMS + MOK setup mutates real system state — `/etc/dkms/`,
+`/var/lib/dkms/`, the running kernel's module tree — same reason the AUR
+README gives for not testing `pacman -U` on the authoring machine).

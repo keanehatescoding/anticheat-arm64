@@ -31,7 +31,11 @@ Same split as the AUR package (`packaging/aur/`) and for the same reason
   dkms-add/build/install + Secure Boot MOK-signing setup as
   `scripts/dkms-install.sh` and the AUR package's `.install` hooks, wired
   into dpkg's `configure`/`remove` maintainer-script actions instead of a
-  manual script run.
+  manual script run. `control` pins `dkms (>= 3.0)` because
+  `mok_signing_key`/`mok_certificate`/`framework.conf.d` support — what
+  the postinst's `/etc/dkms/framework.conf.d/anticheat.conf` fragment
+  relies on — was only added in DKMS 3.0; an older `dkms` would silently
+  ignore that fragment and build unsigned.
 
 ## Native package, not an archive upload
 
@@ -51,8 +55,8 @@ machine — see `packaging/aur/README.md`), this has **not** been run
 through a real `dpkg-buildpackage`/`lintian`/`apt install` cycle — none of
 `dpkg-buildpackage`, `debhelper`, or `lintian` were available in the
 environment this was authored in. Before relying on this for a real
-install, build it and check `lintian *.changes` comes back clean, and run
-through a real `apt install ./hypranticheat*.deb` /
+install, build it and check `lintian ../hypranticheat*.changes` comes back
+clean, and run through a real `apt install ../hypranticheat*.deb` /
 `apt remove hypranticheat-dkms` cycle on a disposable VM or container (the
 DKMS + MOK setup mutates real system state — `/etc/dkms/`,
 `/var/lib/dkms/`, the running kernel's module tree — same reason the AUR

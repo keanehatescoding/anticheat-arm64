@@ -24,7 +24,7 @@ Description: userspace daemon/CLI for a kernel-mode anticheat
 
 Package: hypranticheat-dkms
 Architecture: amd64
-Depends: dkms, ${misc:Depends}
+Depends: dkms (>= 3.0), ${misc:Depends}
 Provides: anticheat-dkms
 Description: kernel module (DKMS) for a kernel-mode anticheat
  Kernel module source for hypranticheat (syscall/module integrity,
