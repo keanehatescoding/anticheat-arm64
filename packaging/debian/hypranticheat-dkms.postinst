@@ -1,0 +1,112 @@
+#!/bin/sh
+# DKMS registration + Secure Boot MOK enrollment prompt, mirroring
+# scripts/dkms-install.sh and the AUR package's hypranticheat-dkms.install
+# in the upstream repo.
+#
+# /etc/dkms/framework.conf.d/anticheat.conf (the system-wide signing-key
+# config DKMS's built-in Secure Boot signing reads) and
+# /var/lib/anticheat/mok/ are installed by debian/rules, as files owned by
+# this package -- the config file in particular is a dpkg conffile
+# (anything under /etc is automatically treated as one), so a locally
+# modified copy is prompted about on upgrade instead of silently
+# overwritten.
+set -e
+
+# DKMS's own exit code for "kernel headers for this kernel cannot be
+# found" is 21 (see prepare_kernel() in /usr/sbin/dkms) -- stable,
+# documented in dkms's own source header, and distinct from every other
+# failure class. Only that specific code is a "this will build itself
+# later via AUTOINSTALL" situation; every other nonzero exit is a real
+# failure and must not be reported as if it were fine.
+dkms_install() {
+    ver="$1"
+    rc=0
+    dkms install -m anticheat -v "$ver" || rc=$?
+    case "$rc" in
+        0)
+            return 0
+            ;;
+        21)
+            echo "==> dkms install deferred -- no matching kernel headers yet;"
+            echo "==> it will build automatically the next time a kernel with"
+            echo "==> headers installed is booted (AUTOINSTALL, see dkms.conf)."
+            echo "==> note: the Secure Boot signing key also won't exist until"
+            echo "==> that later build actually happens; once it has (check"
+            echo "==> 'dkms status -m anticheat'), re-run:"
+            echo "==>   sudo mokutil --import /var/lib/anticheat/mok/mok.der"
+            echo "==> if Secure Boot is on, to pick up enrollment."
+            return 0
+            ;;
+        *)
+            echo "==> dkms install FAILED (exit $rc, not the missing-headers" >&2
+            echo "==> case above) -- see the dkms output above for the real" >&2
+            echo "==> error, and 'sudo dkms status -m anticheat' /" >&2
+            echo "==> /var/lib/dkms/anticheat/$ver/*/log/make.log for detail." >&2
+            return "$rc"
+            ;;
+    esac
+}
+
+enroll_mok_if_needed() {
+    cert=/var/lib/anticheat/mok/mok.der
+    [ -e "$cert" ] || return 0
+    if ! command -v mokutil >/dev/null 2>&1; then
+        echo "==> mokutil not found -- if Secure Boot is on, install it and run:"
+        echo "==>   sudo mokutil --import $cert"
+        return 0
+    fi
+    mokutil --sb-state 2>/dev/null | grep -qi enabled || return 0
+    if mokutil --test-key "$cert" 2>/dev/null | grep -qi "already enrolled"; then
+        return 0
+    fi
+    echo "==> Secure Boot is ON and hypranticheat's signing key is not yet trusted."
+    echo "==> Enrolling it now -- you will be asked to set a one-time password."
+    echo "==> REBOOT after this and approve the request in the blue 'MOK Management'"
+    echo "==> screen (Enroll MOK -> Continue -> enter the password -> Reboot). Until"
+    echo "==> you do this, the signed module will still fail to load."
+    mokutil --import "$cert" || \
+        echo "==> mokutil --import failed; enroll manually: sudo mokutil --import $cert"
+}
+
+case "$1" in
+    configure)
+        dkms_src=
+        for d in /usr/src/anticheat-*; do
+            [ -d "$d" ] && dkms_src="$d" && break
+        done
+        if [ -z "$dkms_src" ]; then
+            echo "==> no /usr/src/anticheat-* staged -- broken package build?" >&2
+            exit 1
+        fi
+        ver="$(awk -F'"' '/^PACKAGE_VERSION=/{print $2}' "$dkms_src/dkms.conf")"
+
+        # Remove any previously-registered anticheat DKMS version other
+        # than this one, so an upgrade doesn't leave a stale build
+        # registered alongside the new one (dpkg's postinst arg2 only
+        # tells us the *previously configured package* version, not
+        # whether dkms.conf's PACKAGE_VERSION actually changed, so this
+        # just asks dkms directly rather than tracking that separately).
+        for old in $(dkms status -m anticheat 2>/dev/null | cut -d, -f2 | tr -d ' '); do
+            [ "$old" = "$ver" ] && continue
+            dkms remove -m anticheat -v "$old" --all >/dev/null 2>&1 || true
+        done
+
+        dkms add -m anticheat -v "$ver" 2>/dev/null || true
+        rc=0
+        dkms_install "$ver" || rc=$?
+        enroll_mok_if_needed
+        if [ "$rc" -ne 0 ]; then
+            # A genuine build/install failure (not the deferred-headers
+            # case above, which already returned 0) -- fail the postinst
+            # so dpkg reports this package as not configured, rather than
+            # silently swallowing it. Matches the AUR hook's behavior
+            # (post_install there returns $rc the same way).
+            exit "$rc"
+        fi
+        echo "==> load it with: sudo modprobe anticheat"
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0
