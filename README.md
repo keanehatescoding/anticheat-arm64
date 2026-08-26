@@ -803,6 +803,22 @@ MOK setup as `scripts/dkms-install.sh`, wired into `pacman`'s own
 `post_install`/`post_upgrade`/`pre_remove` hooks instead of a manual
 script run — see `packaging/aur/README.md`.
 
+**Debian / Ubuntu:** `packaging/debian/` is a `debian/` control directory
+(stage it as `debian/` at the repo root to build — see
+`packaging/debian/README.md`) producing the same `hypranticheat`/
+`hypranticheat-dkms` split, with the DKMS + MOK setup wired into
+`postinst`/`prerm` maintainer scripts. Not uploaded to the Debian
+archive — build a local `.deb` with `dpkg-buildpackage`.
+
+**Fedora / RPM:** `packaging/fedora/hypranticheat.spec` is a standard
+`rpmbuild` spec producing the same split, with the DKMS + MOK setup in
+`%post`/`%preun` scriptlets — see `packaging/fedora/README.md`.
+
+The AUR package has been built and verified on a real Arch machine (see
+its README); the Debian and Fedora packaging has not yet been run through
+a real `dpkg-buildpackage`/`rpmbuild` + install cycle — see the "Not yet
+verified" section in each one's README before relying on it.
+
 ### SteamOS / Steam Deck / other immutable distros
 
 `/lib/modules` and `/usr` are read-only on SteamOS and get replaced
@@ -977,6 +993,8 @@ TROUBLESHOOTING.md       crash/panic recovery, blacklisting, filing a bug report
 RELEASING.md             versioning scheme + release checklist
 LICENSE                  GPL-2.0
 packaging/aur/           AUR PKGBUILD (hypranticheat + hypranticheat-dkms split package)
+packaging/debian/        debian/ control dir for a .deb (same split package)
+packaging/fedora/        rpmbuild .spec for an .rpm (same split package)
 .github/workflows/ci.yml CI: userspace build + mock suite, module smoke build
 test.sh                  end-to-end live test (root)
 diag.sh                  root diagnostics (dmesg, discovery, module walk)

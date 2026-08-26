@@ -1,0 +1,42 @@
+#!/usr/bin/make -f
+# Builds the two hypranticheat / hypranticheat-dkms binary packages. See
+# packaging/debian/README.md for how to actually invoke this (debian/ has
+# to be staged at the repo root first -- dpkg-buildpackage doesn't look in
+# packaging/debian for it).
+
+include /usr/share/dpkg/pkg-info.mk
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	$(MAKE) CFLAGS="$(shell dpkg-buildflags --get CFLAGS) -Wall -Wextra" \
+	        LDFLAGS="$(shell dpkg-buildflags --get LDFLAGS)" daemon
+
+override_dh_auto_test:
+	# make test-mock needs LD_PRELOAD interposition of open/ioctl/geteuid
+	# that doesn't play well inside a sandboxed dh_auto_test environment,
+	# and the kernel module itself can't be built or loaded during a
+	# package build at all (needs the target machine's own running
+	# kernel's headers -- see dkms.conf). .github/workflows/ci.yml
+	# already runs the mock suite on every push; nothing to duplicate
+	# here.
+
+override_dh_auto_install:
+	install -Dm755 anticheat debian/hypranticheat/usr/bin/anticheat
+	install -dm755 debian/hypranticheat/var/lib/anticheat/baselines
+
+	install -Dm644 Makefile \
+	        debian/hypranticheat-dkms/usr/src/anticheat-$(DEB_VERSION_UPSTREAM)/Makefile
+	install -Dm644 dkms.conf \
+	        debian/hypranticheat-dkms/usr/src/anticheat-$(DEB_VERSION_UPSTREAM)/dkms.conf
+	cp -a src debian/hypranticheat-dkms/usr/src/anticheat-$(DEB_VERSION_UPSTREAM)/
+	install -Dm644 debian/anticheat-dkms.framework.conf \
+	        debian/hypranticheat-dkms/etc/dkms/framework.conf.d/anticheat.conf
+	# DKMS's own signing step creates the MOK key pair here on first
+	# build; pre-create the (empty, private) directory so that has
+	# somewhere to write regardless of install order -- same reasoning
+	# as scripts/dkms-install.sh and the AUR package.
+	install -dm700 debian/hypranticheat-dkms/var/lib/anticheat/mok

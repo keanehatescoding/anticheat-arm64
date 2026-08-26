@@ -1,0 +1,40 @@
+Source: hypranticheat
+Section: kernel
+Priority: optional
+Maintainer: keanehatescoding <noreply@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+Homepage: https://github.com/keanehatescoding/hypranticheat
+
+Package: hypranticheat
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Recommends: hypranticheat-dkms
+Description: userspace daemon/CLI for a kernel-mode anticheat
+ hypranticheat is a Linux kernel-mode anticheat: a loadable kernel module
+ that performs syscall/module integrity checks and process protection,
+ plus this userspace daemon/CLI that talks to it over /dev/anticheat
+ (protect/scan/baseline/monitor commands -- see anticheat(1) usage via
+ --help).
+ .
+ This package installs the daemon and CLI (anticheat) only. Real
+ kernel-level detection needs the companion hypranticheat-dkms package;
+ without it the daemon can only run against its userspace mock.
+
+Package: hypranticheat-dkms
+Architecture: amd64
+Depends: dkms (>= 3.0), ${misc:Depends}
+Provides: anticheat-dkms
+Description: kernel module (DKMS) for a kernel-mode anticheat
+ Kernel module source for hypranticheat (syscall/module integrity,
+ ptrace denial, RWX/anon-exec detection), registered with DKMS so it is
+ rebuilt automatically on every kernel package upgrade. Building it
+ needs Linux kernel headers for the running kernel; only x86-64 is
+ supported.
+ .
+ On install this package also points DKMS's built-in Secure Boot
+ signing at a self-generated Machine Owner Key (MOK) under
+ /var/lib/anticheat/mok/ and enrolls it via mokutil if Secure Boot is
+ on -- expect a one-time reboot-and-approve prompt in that case. See
+ /usr/share/doc/hypranticheat-dkms/README.md.

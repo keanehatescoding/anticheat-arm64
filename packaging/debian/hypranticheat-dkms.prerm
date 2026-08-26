@@ -1,0 +1,24 @@
+#!/bin/sh
+# Deregisters the DKMS module on real removal only -- "upgrade"/
+# "failed-upgrade" here means dpkg is about to unpack a *new* version of
+# this same package (its postinst will re-add/rebuild for the new
+# version), not an actual uninstall, so don't rip the module out from
+# under that.
+set -e
+
+case "$1" in
+    remove)
+        dkms_src=
+        for d in /usr/src/anticheat-*; do
+            [ -d "$d" ] && dkms_src="$d" && break
+        done
+        if [ -n "$dkms_src" ]; then
+            ver="$(awk -F'"' '/^PACKAGE_VERSION=/{print $2}' "$dkms_src/dkms.conf" 2>/dev/null)"
+            [ -n "$ver" ] && dkms remove -m anticheat -v "$ver" --all >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

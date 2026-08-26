@@ -1,0 +1,7 @@
+hypranticheat (1.0.0-1) unstable; urgency=medium
+
+  * Initial Debian packaging: hypranticheat (daemon/CLI) and
+    hypranticheat-dkms (kernel module via DKMS + Secure Boot MOK signing,
+    same setup as scripts/dkms-install.sh and the AUR package).
+
+ -- keanehatescoding <noreply@users.noreply.github.com>  Wed, 26 Aug 2026 12:00:00 +0000

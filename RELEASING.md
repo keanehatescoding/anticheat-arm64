@@ -96,6 +96,20 @@ the same protocol" case this guards against), independent of whatever
    (`pkgrel` only bumps on its own, without a `pkgver` change, if the
    *packaging* changes but upstream didn't — e.g. a PKGBUILD fix.)
 
+8. Bump the in-repo Debian and Fedora packaging to match (neither is
+   published anywhere automatically — no PPA/COPR is wired up — this just
+   keeps `packaging/` buildable at the new version for anyone building
+   locally, same as AUR's `pkgrel` note above):
+
+   ```sh
+   # packaging/debian/changelog -- new entry at the top, e.g. via dch:
+   cd packaging/debian && dch -v <VERSION>-1 "New upstream release." && cd -
+
+   # packaging/fedora/hypranticheat.spec -- bump Version: and add a
+   # matching %changelog entry (rpmdev-bumpspec does both, if installed):
+   rpmdev-bumpspec -n <VERSION> -c "New upstream release." packaging/fedora/hypranticheat.spec
+   ```
+
 There is no separate "-dev"/pre-release version between releases — the
 next bump happens at step 2 of the *next* release, not right after this
 one ships.
