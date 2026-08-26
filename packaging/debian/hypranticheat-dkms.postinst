@@ -21,7 +21,14 @@ set -e
 dkms_install() {
     ver="$1"
     rc=0
-    dkms install -m anticheat -v "$ver" || rc=$?
+    # --force: without it, `dkms install` for a version DKMS already has
+    # registered as installed (a pkgrel-only reinstall/upgrade that didn't
+    # change PACKAGE_VERSION, so $ver is unchanged and the stale-version
+    # cleanup loop above deliberately left it alone) can fail instead of
+    # rebuilding against the just-updated /usr/src/anticheat-$ver source --
+    # same reasoning as the AUR package's post_upgrade hook, which passes
+    # --force here for exactly this case.
+    dkms install --force -m anticheat -v "$ver" || rc=$?
     case "$rc" in
         0)
             return 0

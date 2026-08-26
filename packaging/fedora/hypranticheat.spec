@@ -131,8 +131,15 @@ for old in $(dkms status -m anticheat 2>/dev/null | cut -d, -f1 | cut -d: -f1 | 
     dkms remove -m anticheat -v "$old" --all >/dev/null 2>&1 || true
 done
 
+# --force: without it, `dkms install` for a version DKMS already has
+# registered as installed (a Release-only reinstall/upgrade that didn't
+# change Version, so %{version} is unchanged and the stale-version cleanup
+# loop above deliberately left it alone) can fail instead of rebuilding
+# against the just-updated /usr/src/anticheat-%{version} source -- same
+# reasoning as the AUR package's post_upgrade hook, which passes --force
+# here for exactly this case.
 dkms add -m anticheat -v %{version} >/dev/null 2>&1 || true
-dkms install -m anticheat -v %{version}
+dkms install --force -m anticheat -v %{version}
 rc=$?
 case "$rc" in
     0)

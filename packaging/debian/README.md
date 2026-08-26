@@ -57,7 +57,13 @@ through a real `dpkg-buildpackage`/`lintian`/`apt install` cycle — none of
 environment this was authored in. Before relying on this for a real
 install, build it and check `lintian ../hypranticheat*.changes` comes back
 clean, and run through a real `apt install ../hypranticheat*.deb` /
-`apt remove hypranticheat-dkms` cycle on a disposable VM or container (the
-DKMS + MOK setup mutates real system state — `/etc/dkms/`,
-`/var/lib/dkms/`, the running kernel's module tree — same reason the AUR
-README gives for not testing `pacman -U` on the authoring machine).
+`apt remove hypranticheat-dkms` cycle on a disposable VM (the DKMS + MOK
+setup mutates real system state — `/etc/dkms/`, `/var/lib/dkms/`, the
+running kernel's module tree — same reason the AUR README gives for not
+testing `pacman -U` on the authoring machine). A container isn't enough
+for the full cycle: it shares the host kernel, so it can't actually build
+against or load a real kernel module, and has no UEFI to enroll a MOK
+into — it only exercises package install/removal and the maintainer
+scripts' own logic (the dkms-status parsing, the `--force`/upgrade
+handling, the tty-gated MOK messaging), not the DKMS build or Secure Boot
+enrollment themselves.
