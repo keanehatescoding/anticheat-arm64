@@ -120,6 +120,18 @@ class Store:
 
     def __init__(self, db_path):
         self.db_path = db_path
+        # SQLite only ever allows one writer at a time, even in WAL mode --
+        # under ThreadingHTTPServer, every write-handling thread opens its
+        # own connection and would otherwise all race for that single
+        # writer lock at once, each polling/blocking inside SQLite's own
+        # busy_timeout. Under sustained high concurrency that busy-wait can
+        # still lose (a real stress run: 30 threads x 300s produced 36
+        # "database is locked" OperationalErrors past a 5s busy_timeout).
+        # Serializing writes through this lock instead means at most one
+        # thread ever has a write in flight against SQLite, so there is
+        # never any lock contention for busy_timeout to time out on --
+        # every writer just queues fairly in Python instead.
+        self._write_lock = threading.Lock()
         conn = self._connect()
         conn.execute(
             """CREATE TABLE IF NOT EXISTS reports (
@@ -151,16 +163,17 @@ class Store:
         return conn
 
     def add_report(self, client_id, event_type, detail, client_ts, source_addr):
-        conn = self._connect()
-        try:
-            conn.execute(
-                "INSERT INTO reports (client_id, event_type, detail, "
-                "client_ts, received_at, source_addr) VALUES (?,?,?,?,?,?)",
-                (client_id, event_type, detail, client_ts, now_ts(), source_addr),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    "INSERT INTO reports (client_id, event_type, detail, "
+                    "client_ts, received_at, source_addr) VALUES (?,?,?,?,?,?)",
+                    (client_id, event_type, detail, client_ts, now_ts(), source_addr),
+                )
+                conn.commit()
+            finally:
+                conn.close()
 
     def list_reports(self, client_id, limit=200):
         conn = self._connect()
@@ -184,26 +197,28 @@ class Store:
             conn.close()
 
     def ban(self, client_id, reason):
-        conn = self._connect()
-        try:
-            conn.execute(
-                "INSERT INTO bans (client_id, reason, banned_at) VALUES (?,?,?) "
-                "ON CONFLICT(client_id) DO UPDATE SET reason=excluded.reason, "
-                "banned_at=excluded.banned_at",
-                (client_id, reason, now_ts()),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    "INSERT INTO bans (client_id, reason, banned_at) VALUES (?,?,?) "
+                    "ON CONFLICT(client_id) DO UPDATE SET reason=excluded.reason, "
+                    "banned_at=excluded.banned_at",
+                    (client_id, reason, now_ts()),
+                )
+                conn.commit()
+            finally:
+                conn.close()
 
     def unban(self, client_id):
-        conn = self._connect()
-        try:
-            cur = conn.execute("DELETE FROM bans WHERE client_id = ?", (client_id,))
-            conn.commit()
-            return cur.rowcount > 0
-        finally:
-            conn.close()
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                cur = conn.execute("DELETE FROM bans WHERE client_id = ?", (client_id,))
+                conn.commit()
+                return cur.rowcount > 0
+            finally:
+                conn.close()
 
     def ban_status(self, client_id):
         conn = self._connect()
