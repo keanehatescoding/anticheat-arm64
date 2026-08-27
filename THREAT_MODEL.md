@@ -108,6 +108,31 @@ where the relevant code lives:
   of a separate, earlier lookup — a real architectural change to how
   these two kprobes enforce policy, not a one-line fix, and not attempted
   here.
+- **Registration lifetime shorter than a pre-existing thread group's.**
+  `protect --pid N` (`AC_IOCTL_ADD_PROC`) registers exactly the
+  `task_struct` for the pid given, and `ac_exit_pre()` deregisters that
+  same exact task on its own exit. `ac_is_protected_thread_group()`
+  recognises *any* thread in a registered group for the ptrace/
+  process_vm target checks — but only for as long as the registry still
+  holds an entry for that group at all. If `N` was one thread of an
+  *already multithreaded* process at protect time (siblings that existed
+  before protection was applied are never individually registered, only
+  new threads created afterward are, via the fork-inherit kretprobe),
+  and that specific registered thread later exits while its siblings
+  keep running, the sole registry entry for the whole group is deleted
+  with them — the surviving, still-running siblings silently lose
+  protection. The correct fix (migrate the registry entry to a live
+  sibling instead of deleting it, only deleting once the thread group's
+  last member exits) means walking the kernel's thread-group list from
+  `do_exit()` and getting the concurrency right when multiple threads in
+  a group exit around the same time — exactly the scenario the daemon's
+  own SIGKILL-offender policy can itself trigger. That's real ring-0
+  concurrency work this project can't currently validate against a live
+  loaded module in an automated way stronger than the nightly KASAN boot
+  test, so it isn't attempted here. Narrow in practice: `protect --pid N`
+  against a freshly-started, still-single-threaded process (the common
+  case) is unaffected, since every thread it later spawns is registered
+  individually by the fork-inherit kretprobe as it's created.
 - **DXVK/VKD3D-internal hooks and Vulkan loader dispatch-table hooks.**
   Render-hook detection verifies the exported symbol's own bytes in
   `libvulkan.so`/`libGL.so`/`libEGL.so`; a hook placed inside a
