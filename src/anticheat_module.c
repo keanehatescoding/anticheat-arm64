@@ -782,14 +782,38 @@ static int ac_process_vm_pre(struct kprobe *p, struct pt_regs *regs)
     bool is_compat = (p == &ac_kp_process_vm_readv32 ||
                        p == &ac_kp_process_vm_writev32);
     pid_t target = (pid_t)(is_compat ? args->bx : args->di);
+    struct task_struct *t;
     char tcomm[AC_MAX_COMM] = "?";
+    bool protected_target;
 
-    /* target <= 0 is not a valid pid to begin with (and target == current's
-     * own pid is a process reading/writing itself, not a bypass attempt);
-     * let those fall through to the syscall's own validation unchanged. */
-    if (target <= 0 || target == current->pid)
+    if (target <= 0)
         return 0;
-    if (!ac_is_protected_pid(target, tcomm))
+
+    /* Resolve the target once and compare thread groups directly, rather
+     * than comparing raw pid numbers against current->pid: current->pid is
+     * this *thread's* kernel-internal id, not what a non-leader thread's
+     * own getpid() returns (that's the thread-group id, current->tgid) --
+     * and either can additionally differ from the raw kernel id inside a
+     * nested pid namespace. A numeric self-check against current->pid
+     * would therefore mis-fire for a protected process's own worker
+     * thread reading its own memory: target (its getpid()) != current->pid
+     * (this thread's own tid), so it would fall through to the protection
+     * check below, match (same thread group), and get itself denied and,
+     * per the default kill policy, SIGKILLed by its own daemon. Comparing
+     * resolved task_structs sidesteps pid-namespace translation and thread
+     * vs. thread-group id entirely. */
+    t = ac_find_task(target);
+    if (!t)
+        return 0;
+    if (same_thread_group(t, current)) {
+        put_task_struct(t);
+        return 0;
+    }
+    protected_target = ac_is_protected_thread_group(t);
+    if (protected_target)
+        strscpy(tcomm, t->comm, sizeof(tcomm));
+    put_task_struct(t);
+    if (!protected_target)
         return 0;
 
     ac_emit(AC_EV_PROCESS_VM, target, tcomm,
