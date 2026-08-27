@@ -581,6 +581,34 @@ static bool ac_is_protected_task(struct task_struct *t)
     return prot;
 }
 
+/* Like ac_is_protected_task(), but recognises any thread in a protected
+ * thread group, not just the exact task_struct that was registered.
+ * process_vm_readv(2)/writev(2) (and ptrace(2)) accept any thread ID in a
+ * process, not just its tgid, and every thread shares the same mm_struct --
+ * so a target-permission check must follow suit or a sibling thread ID that
+ * pre-dates protection (never individually registered by the fork-inherit
+ * kretprobe) bypasses detection while reaching the exact same memory. Never
+ * used for the exit-cleanup path (ac_exit_pre): deregistering on any
+ * thread-group member's exit, rather than the exact registered task's own
+ * exit, would delist a still-alive process the moment an unrelated worker
+ * thread happens to exit. */
+static bool ac_is_protected_thread_group(struct task_struct *t)
+{
+    unsigned long flags;
+    int i;
+    bool prot = false;
+
+    spin_lock_irqsave(&ac_prot_lock, flags);
+    for (i = 0; i < AC_PROT_MAX; i++) {
+        if (ac_prots[i].task && same_thread_group(ac_prots[i].task, t)) {
+            prot = true;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&ac_prot_lock, flags);
+    return prot;
+}
+
 static bool ac_is_protected_pid(pid_t pid, char *comm_out)
 {
     struct task_struct *t = ac_find_task(pid);
@@ -588,7 +616,7 @@ static bool ac_is_protected_pid(pid_t pid, char *comm_out)
 
     if (!t)
         return false;
-    prot = ac_is_protected_task(t);
+    prot = ac_is_protected_thread_group(t);
     if (prot && comm_out)
         strscpy(comm_out, t->comm, AC_MAX_COMM);
     put_task_struct(t);
@@ -702,7 +730,7 @@ static int ac_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
         /* the protected process itself asks to be traced; PTRACE_TRACEME
          * ignores its arguments, so args->si holds whatever was in the
          * register — report current->pid, not stale garbage */
-        if (ac_is_protected_task(current)) {
+        if (ac_is_protected_thread_group(current)) {
             strscpy(tcomm, current->comm, sizeof(tcomm));
             target = current->pid;
             deny = true;
