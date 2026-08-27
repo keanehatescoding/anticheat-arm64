@@ -48,11 +48,12 @@ this project: no purely in-kernel detector can defend against an
 adversary operating at its own privilege level or higher.
 
 Everything this project detects follows from the middle case above:
-syscall-table hooks, hidden kernel modules, ptrace attaches, RWX/anon-exec
-memory regions, runtime code patching, and render-API inline hooks are
-all things a user-level-to-root-userspace attacker can attempt against a
-protected process without yet having kernel-level code execution of
-their own.
+syscall-table hooks, hidden kernel modules, ptrace attaches and
+`process_vm_readv`/`process_vm_writev` calls against a protected process,
+RWX/anon-exec memory regions, runtime code patching, and render-API inline
+hooks are all things a user-level-to-root-userspace attacker can attempt
+against a protected process without yet having kernel-level code execution
+of their own.
 
 ## Trust boundaries
 
@@ -88,10 +89,6 @@ where the relevant code lives:
   purely in-kernel detection scheme can defend against an adversary with
   equal or greater kernel privilege — this is a fundamental limit, not
   something more engineering effort closes.
-- **`process_vm_readv`-based ptrace bypass.** ptrace denial only covers
-  the standard `__x64_sys_ptrace`/`__ia32_sys_ptrace` entry points; a
-  cheat reading a protected process's memory through
-  `process_vm_readv` instead of `ptrace(2)` is out of scope for v1.
 - **DXVK/VKD3D-internal hooks and Vulkan loader dispatch-table hooks.**
   Render-hook detection verifies the exported symbol's own bytes in
   `libvulkan.so`/`libGL.so`/`libEGL.so`; a hook placed inside a

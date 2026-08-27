@@ -58,6 +58,10 @@ enum {
     AC_EV_EXEC,           /* protected process invoked execve */
     AC_EV_EXIT,           /* protected process exited */
     AC_EV_PTRACE,         /* ptrace attempt against a protected process (denied) */
+    AC_EV_PROCESS_VM,     /* process_vm_readv/writev against a protected process
+                            * (denied) -- the same memory access ptrace denial
+                            * covers, via the syscall that doesn't go through
+                            * ptrace(2) at all */
     AC_EV_SYSCALL_HOOK,   /* syscall table entry outside core kernel text */
     AC_EV_RWX,            /* executable+writable mapping detected in protected proc */
     AC_EV_ANON_EXEC,      /* executable mapping with no backing file (possible

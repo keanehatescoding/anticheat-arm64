@@ -59,6 +59,12 @@ userspace daemon/CLI that talks to it over a small ioctl interface
    with `-EIO` and has **no side effects** (the attach never happens). Per
    policy (`ac_policy` bit 0, default on) the offending tracer is also
    SIGKILLed from a private workqueue (safe from atomic kprobe context).
+   `process_vm_readv`/`process_vm_writev` — the standard way to read or
+   write another process's memory without ever calling `ptrace(2)` — get
+   the same treatment via their own kprobes (native and ia32 entries): the
+   pid argument is rewritten to an invalid value, so the syscall fails
+   cleanly with `-ESRCH` before touching a single byte of the protected
+   process's memory, and the same kill policy applies.
 
 5. **Fork / exec / exit tracing.** kretprobe on `kernel_clone` (inheritance +
    events), kprobe pre-handlers on `do_exit` and `__x64_sys_execve[at]`.
@@ -918,8 +924,8 @@ design).
   disabled, hard-capped at 1024 entries) but a worst-case snapshot may
   contain a torn entry or miss a module being unloaded at that instant.
 - `ac_policy` is read-only at runtime (module param, mode 0600): bit 0 = kill
-  ptrace offenders (default on). Use `sudo insmod anticheat.ko ac_policy=0`
-  to log-and-deny only.
+  ptrace/process_vm offenders (default on). Use
+  `sudo insmod anticheat.ko ac_policy=0` to log-and-deny only.
 - `lock` pins the module globally, not per-fd: the pin intentionally survives
   the locking process exiting or crashing (that is the point of the panic
   button). If the locking daemon crashes or is killed without unlocking,
@@ -934,9 +940,10 @@ design).
   the fd open, and confirms the next ioctl is rejected with `-EPERM`
   (`sudo ./test.sh` runs it as part of the live suite).
 - ptrace denial works on the standard `__x64_sys_ptrace` / `__ia32_sys_ptrace`
-  entries. A cheat that invokes the `ptrace` functionality through other
-  kernel paths (e.g., `process_vm_readv` on an attached victim) is out of
-  scope for v1.
+  entries; `process_vm_readv`/`process_vm_writev` are covered too, via their
+  own native/ia32 kprobes (see "ptrace denial" above). A cheat reaching
+  process memory through some other kernel path entirely (not `ptrace(2)`
+  or `process_vm_{read,write}v`) is still out of scope for v1.
 - Protected pids are matched via the caller's pid namespace by default:
   `protect --pid N` resolves `N` as seen by the daemon itself (normally the
   host/init namespace). This is already correct, with no extra flags, for
