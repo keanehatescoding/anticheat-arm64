@@ -12,7 +12,11 @@
  *  4. ptrace interception: attach/debug requests against protected processes
  *     are neutralised (request argument rewritten to an invalid value, so
  *     the syscall fails with -EIO and has no side effects) and, per policy,
- *     the offending tracer is SIGKILLed from a workqueue.
+ *     the offending tracer is SIGKILLed from a workqueue. process_vm_readv/
+ *     writev against a protected process -- the standard ptrace-free way to
+ *     read/write another process's memory -- gets the same treatment (pid
+ *     argument rewritten to -1, so the syscall fails with -ESRCH before
+ *     touching the target's memory).
  *  5. execve / exit monitoring of protected processes (kprobes).
  *  6. VMA-level memory scanning (RWX "code cave" detection, plus anonymous
  *     executable mappings -- catches the write-then-mprotect(R-X) injection
@@ -78,9 +82,11 @@ static void ac_emit(unsigned int type, int pid, const char *comm,
 /* ------------------------------------------------------------------ */
 /* policy / parameters                                                 */
 /* ------------------------------------------------------------------ */
-static unsigned int ac_policy = 0x1;   /* bit0: SIGKILL tracer that ptrace()s a protected proc */
+static unsigned int ac_policy = 0x1;   /* bit0: SIGKILL a process that attacks a
+                                         * protected proc via ptrace or
+                                         * process_vm_readv/writev */
 module_param(ac_policy, uint, 0600);
-MODULE_PARM_DESC(ac_policy, "policy bitmask: bit0 = kill ptrace offenders");
+MODULE_PARM_DESC(ac_policy, "policy bitmask: bit0 = kill ptrace/process_vm offenders");
 
 static bool ac_verbose = true;
 module_param(ac_verbose, bool, 0600);
@@ -575,6 +581,34 @@ static bool ac_is_protected_task(struct task_struct *t)
     return prot;
 }
 
+/* Like ac_is_protected_task(), but recognises any thread in a protected
+ * thread group, not just the exact task_struct that was registered.
+ * process_vm_readv(2)/writev(2) (and ptrace(2)) accept any thread ID in a
+ * process, not just its tgid, and every thread shares the same mm_struct --
+ * so a target-permission check must follow suit or a sibling thread ID that
+ * pre-dates protection (never individually registered by the fork-inherit
+ * kretprobe) bypasses detection while reaching the exact same memory. Never
+ * used for the exit-cleanup path (ac_exit_pre): deregistering on any
+ * thread-group member's exit, rather than the exact registered task's own
+ * exit, would delist a still-alive process the moment an unrelated worker
+ * thread happens to exit. */
+static bool ac_is_protected_thread_group(struct task_struct *t)
+{
+    unsigned long flags;
+    int i;
+    bool prot = false;
+
+    spin_lock_irqsave(&ac_prot_lock, flags);
+    for (i = 0; i < AC_PROT_MAX; i++) {
+        if (ac_prots[i].task && same_thread_group(ac_prots[i].task, t)) {
+            prot = true;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&ac_prot_lock, flags);
+    return prot;
+}
+
 static bool ac_is_protected_pid(pid_t pid, char *comm_out)
 {
     struct task_struct *t = ac_find_task(pid);
@@ -582,7 +616,7 @@ static bool ac_is_protected_pid(pid_t pid, char *comm_out)
 
     if (!t)
         return false;
-    prot = ac_is_protected_task(t);
+    prot = ac_is_protected_thread_group(t);
     if (prot && comm_out)
         strscpy(comm_out, t->comm, AC_MAX_COMM);
     put_task_struct(t);
@@ -640,7 +674,7 @@ static void ac_kill_worker(struct work_struct *w)
     struct task_struct *t = get_pid_task(r->pid, PIDTYPE_PID);
 
     if (t) {
-        pr_info("policy: SIGKILL tracer pid %d (ptrace against protected process)\n",
+        pr_info("policy: SIGKILL pid %d (attacked a protected process)\n",
                 t->pid);
         send_sig(SIGKILL, t, 0);
         put_task_struct(t);
@@ -696,7 +730,7 @@ static int ac_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
         /* the protected process itself asks to be traced; PTRACE_TRACEME
          * ignores its arguments, so args->si holds whatever was in the
          * register — report current->pid, not stale garbage */
-        if (ac_is_protected_task(current)) {
+        if (ac_is_protected_thread_group(current)) {
             strscpy(tcomm, current->comm, sizeof(tcomm));
             target = current->pid;
             deny = true;
@@ -724,6 +758,82 @@ static int ac_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
         args->bx = -1;
     else
         args->di = -1;
+    return 0;
+}
+
+/* process_vm_readv(2)/process_vm_writev(2): the standard way to read or
+ * write another process's memory without ever calling ptrace(2), so the
+ * ptrace kprobe above doesn't see it at all. Both syscalls take the target
+ * pid as their first argument (SYSCALL_DEFINE6(process_vm_read{v,writev},
+ * pid_t, pid, ...)); neither has a distinct COMPAT_SYSCALL_DEFINE (unlike
+ * ptrace, whose compat_long_t args need special handling), so the i386
+ * syscall table maps straight to the same sys_process_vm_{read,write}v --
+ * the standard wrapper-generation machinery still emits both a native
+ * (__x64_sys_*) and a compat (__ia32_sys_*) entry point from that one
+ * definition, unpacking the pid from the same register slot the ptrace
+ * probe above already established: di for native, bx for compat. */
+static struct kprobe ac_kp_process_vm_readv;
+static struct kprobe ac_kp_process_vm_readv32;
+static struct kprobe ac_kp_process_vm_writev32;
+
+static int ac_process_vm_pre(struct kprobe *p, struct pt_regs *regs)
+{
+    struct pt_regs *args = (struct pt_regs *)regs->di;
+    bool is_compat = (p == &ac_kp_process_vm_readv32 ||
+                       p == &ac_kp_process_vm_writev32);
+    pid_t target = (pid_t)(is_compat ? args->bx : args->di);
+    struct task_struct *t;
+    char tcomm[AC_MAX_COMM] = "?";
+    bool protected_target;
+
+    if (target <= 0)
+        return 0;
+
+    /* Resolve the target once and compare thread groups directly, rather
+     * than comparing raw pid numbers against current->pid: current->pid is
+     * this *thread's* kernel-internal id, not what a non-leader thread's
+     * own getpid() returns (that's the thread-group id, current->tgid) --
+     * and either can additionally differ from the raw kernel id inside a
+     * nested pid namespace. A numeric self-check against current->pid
+     * would therefore mis-fire for a protected process's own worker
+     * thread reading its own memory: target (its getpid()) != current->pid
+     * (this thread's own tid), so it would fall through to the protection
+     * check below, match (same thread group), and get itself denied and,
+     * per the default kill policy, SIGKILLed by its own daemon. Comparing
+     * resolved task_structs sidesteps pid-namespace translation and thread
+     * vs. thread-group id entirely. */
+    t = ac_find_task(target);
+    if (!t)
+        return 0;
+    if (same_thread_group(t, current)) {
+        put_task_struct(t);
+        return 0;
+    }
+    protected_target = ac_is_protected_thread_group(t);
+    if (protected_target)
+        strscpy(tcomm, t->comm, sizeof(tcomm));
+    put_task_struct(t);
+    if (!protected_target)
+        return 0;
+
+    ac_emit(AC_EV_PROCESS_VM, target, tcomm,
+            "process_vm_%s by pid %d (%s) DENIED",
+            (p == &ac_kp_process_vm_readv32 ||
+             p == &ac_kp_process_vm_readv) ? "readv" : "writev",
+            current->pid, current->comm);
+
+    if (ac_policy & 0x1)
+        ac_schedule_kill(current);
+
+    /* Neutralise the syscall: rewrite the pid slot in the frame to an
+     * invalid value. find_get_task_by_vpid() only runs after the iovecs
+     * are parsed but before any target memory is touched, so this fails
+     * cleanly with -ESRCH and never copies a single byte to/from the
+     * protected process. */
+    if (is_compat)
+        args->bx = (unsigned long)-1;
+    else
+        args->di = (unsigned long)-1;
     return 0;
 }
 
@@ -800,10 +910,28 @@ static struct kprobe ac_kp_execveat = {
     .symbol_name = "__x64_sys_execveat",
     .pre_handler = ac_exec_pre,
 };
+static struct kprobe ac_kp_process_vm_readv = {
+    .symbol_name = "__x64_sys_process_vm_readv",
+    .pre_handler = ac_process_vm_pre,
+};
+static struct kprobe ac_kp_process_vm_readv32 = {
+    .symbol_name = "__ia32_sys_process_vm_readv",
+    .pre_handler = ac_process_vm_pre,
+};
+static struct kprobe ac_kp_process_vm_writev = {
+    .symbol_name = "__x64_sys_process_vm_writev",
+    .pre_handler = ac_process_vm_pre,
+};
+static struct kprobe ac_kp_process_vm_writev32 = {
+    .symbol_name = "__ia32_sys_process_vm_writev",
+    .pre_handler = ac_process_vm_pre,
+};
 
 static struct kprobe *ac_kprobes[] = {
     &ac_kp_ptrace, &ac_kp_ptrace32,
     &ac_kp_exit, &ac_kp_execve, &ac_kp_execveat,
+    &ac_kp_process_vm_readv, &ac_kp_process_vm_readv32,
+    &ac_kp_process_vm_writev, &ac_kp_process_vm_writev32,
 };
 static bool ac_kp_ok[ARRAY_SIZE(ac_kprobes)];  /* per-slot registration state */
 static unsigned int ac_kprobes_registered;     /* count, for the log line */

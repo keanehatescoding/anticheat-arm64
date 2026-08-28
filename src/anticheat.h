@@ -69,6 +69,13 @@ enum {
                             * on the raw count, since vdso/vvar are present from
                             * process start and never change. */
     AC_EV_INFO,           /* informational (module load/unload, ...) */
+    AC_EV_PROCESS_VM,     /* process_vm_readv/writev against a protected process
+                            * (denied) -- the same memory access ptrace denial
+                            * covers, via the syscall that doesn't go through
+                            * ptrace(2) at all. Appended after the pre-existing
+                            * values (not inserted alongside AC_EV_PTRACE above)
+                            * so a module/daemon version mismatch can't silently
+                            * misclassify any event that already shipped. */
 };
 
 /* ------------------------------------------------------------------ */

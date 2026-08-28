@@ -48,11 +48,12 @@ this project: no purely in-kernel detector can defend against an
 adversary operating at its own privilege level or higher.
 
 Everything this project detects follows from the middle case above:
-syscall-table hooks, hidden kernel modules, ptrace attaches, RWX/anon-exec
-memory regions, runtime code patching, and render-API inline hooks are
-all things a user-level-to-root-userspace attacker can attempt against a
-protected process without yet having kernel-level code execution of
-their own.
+syscall-table hooks, hidden kernel modules, ptrace attaches and
+`process_vm_readv`/`process_vm_writev` calls against a protected process,
+RWX/anon-exec memory regions, runtime code patching, and render-API inline
+hooks are all things a user-level-to-root-userspace attacker can attempt
+against a protected process without yet having kernel-level code execution
+of their own.
 
 ## Trust boundaries
 
@@ -88,10 +89,50 @@ where the relevant code lives:
   purely in-kernel detection scheme can defend against an adversary with
   equal or greater kernel privilege — this is a fundamental limit, not
   something more engineering effort closes.
-- **`process_vm_readv`-based ptrace bypass.** ptrace denial only covers
-  the standard `__x64_sys_ptrace`/`__ia32_sys_ptrace` entry points; a
-  cheat reading a protected process's memory through
-  `process_vm_readv` instead of `ptrace(2)` is out of scope for v1.
+- **A PID-reuse race in the ptrace/process_vm kprobes.** Both kprobes
+  resolve the target pid to a `task_struct`, decide protected-or-not, and
+  release that reference *before* the real syscall body (`ptrace()`'s own
+  dispatch, `process_vm_rw_core()`'s `find_get_task_by_vpid()`) does its
+  own, separate lookup of the same pid number. If the target task exits
+  and that exact pid is reused by a newly-registered protected process
+  inside that window, the kprobe's "not protected" verdict was correct at
+  the time but stale by the time the real lookup runs. The window is a
+  single syscall's worth of ordinary (non-atomic, preemptible,
+  page-fault-capable) kernel C code, not a scheduler-atomic instant, so
+  this isn't purely theoretical — but it requires winning a race on a
+  specific pid being freed and immediately reused by a process the
+  operator happens to register as protected in that same window, which
+  is far outside attacker control. Fixing it properly means binding the
+  protection decision to the exact `task_struct` the real syscall body
+  resolves (or revalidating it immediately before memory access) instead
+  of a separate, earlier lookup — a real architectural change to how
+  these two kprobes enforce policy, not a one-line fix, and not attempted
+  here.
+- **Registration lifetime shorter than a pre-existing thread group's.**
+  `protect --pid N` (`AC_IOCTL_ADD_PROC`) registers exactly the
+  `task_struct` for the pid given, and `ac_exit_pre()` deregisters that
+  same exact task on its own exit. `ac_is_protected_thread_group()`
+  recognises *any* thread in a registered group for the ptrace/
+  process_vm target checks — but only for as long as the registry still
+  holds an entry for that group at all. If `N` was one thread of an
+  *already multithreaded* process at protect time (siblings that existed
+  before protection was applied are never individually registered, only
+  new threads created afterward are, via the fork-inherit kretprobe),
+  and that specific registered thread later exits while its siblings
+  keep running, the sole registry entry for the whole group is deleted
+  with them — the surviving, still-running siblings silently lose
+  protection. The correct fix (migrate the registry entry to a live
+  sibling instead of deleting it, only deleting once the thread group's
+  last member exits) means walking the kernel's thread-group list from
+  `do_exit()` and getting the concurrency right when multiple threads in
+  a group exit around the same time — exactly the scenario the daemon's
+  own SIGKILL-offender policy can itself trigger. That's real ring-0
+  concurrency work this project can't currently validate against a live
+  loaded module in an automated way stronger than the nightly KASAN boot
+  test, so it isn't attempted here. Narrow in practice: `protect --pid N`
+  against a freshly-started, still-single-threaded process (the common
+  case) is unaffected, since every thread it later spawns is registered
+  individually by the fork-inherit kretprobe as it's created.
 - **DXVK/VKD3D-internal hooks and Vulkan loader dispatch-table hooks.**
   Render-hook detection verifies the exported symbol's own bytes in
   `libvulkan.so`/`libGL.so`/`libEGL.so`; a hook placed inside a

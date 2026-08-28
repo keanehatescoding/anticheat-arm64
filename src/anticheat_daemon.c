@@ -148,6 +148,7 @@ static const char *ev_type_str(unsigned int t)
     case AC_EV_EXEC:        return "EXEC";
     case AC_EV_EXIT:        return "EXIT";
     case AC_EV_PTRACE:      return "PTRACE-DENIED";
+    case AC_EV_PROCESS_VM:  return "PROCESS-VM-DENIED";
     case AC_EV_SYSCALL_HOOK:return "SYSCALL-HOOK";
     case AC_EV_RWX:         return "RWX";
     case AC_EV_ANON_EXEC:   return "ANON-EXEC";
@@ -2950,7 +2951,7 @@ static int cmd_start(int argc, char **argv)
                 for (i = 0; i < (int)el.count; i++) {
                     struct ac_event *e = &el.events[i];
 
-                    if (e->type == AC_EV_PTRACE)
+                    if (e->type == AC_EV_PTRACE || e->type == AC_EV_PROCESS_VM)
                         logmsg(LOG_ALERT, "%s pid=%d comm=%s %s",
                                ev_type_str(e->type), e->pid, e->comm, e->data);
                     else if (e->type == AC_EV_SYSCALL_HOOK)
