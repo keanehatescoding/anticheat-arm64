@@ -543,37 +543,40 @@ static void ac_del_prot_task(struct task_struct *t)
     spin_unlock_irqrestore(&ac_prot_lock, flags);
 }
 
-/* Like ac_del_prot_task(), but removes whichever registry entry belongs to
+/* Like ac_del_prot_task(), but removes every registry entry belonging to
  * t's thread group rather than requiring t to be the exact task_struct a
  * registration was made for. AC_IOCTL_DEL_PROC resolves the caller-supplied
  * pid to a task_struct fresh via ac_find_task(), which is not necessarily
  * the task the registration was originally made for -- ac_exit_pre() /
- * ac_replace_prot_task() can have since migrated the entry to a live
+ * ac_replace_prot_task() can have since migrated an entry to a live
  * sibling thread, changing which task_struct (and which pid) the registry
  * actually holds for that group. Matching on thread-group membership, the
  * same way ac_is_protected_thread_group()/ac_is_protected_pid() already do
  * for the ptrace/process_vm target checks, means unprotect works via any
  * live thread of the group -- not only the exact pid last shown by
- * AC_IOCTL_LIST_PROTECTED for it. No-op (not an error) if t's group has no
- * registry entry at all. */
+ * AC_IOCTL_LIST_PROTECTED for it.
+ *
+ * Must not stop at the first match: ac_add_prot_task() only dedupes an
+ * exact task_struct, not a thread group, so a group can hold more than one
+ * entry at once -- e.g. every thread of an already-protected process gets
+ * its own entry via the fork-inherit kretprobe. Stopping early would let
+ * AC_IOCTL_DEL_PROC report success while a second entry kept the group
+ * protected. No-op (not an error) if t's group has no registry entry at
+ * all. */
 static void ac_del_prot_thread_group(struct task_struct *t)
 {
     unsigned long flags;
-    struct task_struct *old = NULL;
     int i;
 
     spin_lock_irqsave(&ac_prot_lock, flags);
     for (i = 0; i < AC_PROT_MAX; i++) {
         if (ac_prots[i].task && same_thread_group(ac_prots[i].task, t)) {
-            old = ac_prots[i].task;
+            put_task_struct(ac_prots[i].task);
             ac_prots[i].task = NULL;
             ac_prot_count--;
-            break;
         }
     }
     spin_unlock_irqrestore(&ac_prot_lock, flags);
-    if (old)
-        put_task_struct(old);
 }
 
 /* Re-point the registry entry tracking `old` at `replacement` instead of
