@@ -108,31 +108,35 @@ where the relevant code lives:
   of a separate, earlier lookup — a real architectural change to how
   these two kprobes enforce policy, not a one-line fix, and not attempted
   here.
-- **Registration lifetime shorter than a pre-existing thread group's.**
-  `protect --pid N` (`AC_IOCTL_ADD_PROC`) registers exactly the
-  `task_struct` for the pid given, and `ac_exit_pre()` deregisters that
-  same exact task on its own exit. `ac_is_protected_thread_group()`
-  recognises *any* thread in a registered group for the ptrace/
-  process_vm target checks — but only for as long as the registry still
-  holds an entry for that group at all. If `N` was one thread of an
-  *already multithreaded* process at protect time (siblings that existed
-  before protection was applied are never individually registered, only
-  new threads created afterward are, via the fork-inherit kretprobe),
-  and that specific registered thread later exits while its siblings
-  keep running, the sole registry entry for the whole group is deleted
-  with them — the surviving, still-running siblings silently lose
-  protection. The correct fix (migrate the registry entry to a live
-  sibling instead of deleting it, only deleting once the thread group's
-  last member exits) means walking the kernel's thread-group list from
-  `do_exit()` and getting the concurrency right when multiple threads in
-  a group exit around the same time — exactly the scenario the daemon's
-  own SIGKILL-offender policy can itself trigger. That's real ring-0
-  concurrency work this project can't currently validate against a live
-  loaded module in an automated way stronger than the nightly KASAN boot
-  test, so it isn't attempted here. Narrow in practice: `protect --pid N`
-  against a freshly-started, still-single-threaded process (the common
-  case) is unaffected, since every thread it later spawns is registered
-  individually by the fork-inherit kretprobe as it's created.
+- **A concurrent-sibling-exit race in the registry-migration path.**
+  `ac_exit_pre()` picks a live sibling as the registry entry's new
+  owner by checking `PF_EXITING` on it at selection time, then
+  installs that choice via `ac_replace_prot_task()`. `PF_EXITING` is
+  only set partway through the real `do_exit()` body, *after* the
+  point a kprobe on `do_exit()` fires for that candidate's own exit --
+  so a sibling can already be past its own `ac_exit_pre()` invocation
+  (which ran, saw that the task was not yet registered, and did
+  nothing, since a task's exit is only hooked once) while still
+  reading as live to the thread selecting it. The entry then ends up
+  pointing at a task finishing its exit independently on another CPU,
+  with no further hook left to clean it up: a permanently stale slot,
+  bounded to one lost `AC_PROT_MAX` entry per occurrence, not
+  removable via `AC_IOCTL_DEL_PROC` once every thread in that group is
+  gone (pid resolution returns `-ESRCH`) -- only a module reload
+  releases it. Not a protection bypass: this can only leave behind a
+  slot for a group that has already fully exited, never weaken
+  protection of one still running. Most likely to matter when several
+  threads of one protected group exit around the same moment (ordinary
+  process termination sends every thread into `do_exit()` together),
+  though the race window itself is a handful of instructions, not the
+  whole exit path, so it is rare in practice rather than deterministic.
+  Closing it fully needs a second, unconditional hook later in the
+  exit path (e.g. `release_task()`) to catch a task that raced past
+  `ac_exit_pre()` before being installed as someone else's replacement
+  -- the same class of cross-CPU ring-0 synchronization work as the
+  PID-reuse race above, and not attempted here for the same reason: it
+  can't be validated against a live loaded module under concurrent
+  multi-thread exit stronger than the nightly KASAN boot test.
 - **DXVK/VKD3D-internal hooks and Vulkan loader dispatch-table hooks.**
   Render-hook detection verifies the exported symbol's own bytes in
   `libvulkan.so`/`libGL.so`/`libEGL.so`; a hook placed inside a
