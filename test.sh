@@ -89,6 +89,16 @@ coproc MIGTEST { ./test/thread_exit_migration_test; }
 read -r _ MAIN_TID <&"${MIGTEST[0]}"
 read -r _ WORKER_TID <&"${MIGTEST[0]}"
 if [ -n "$MAIN_TID" ] && [ -n "$WORKER_TID" ]; then
+    # Baseline: confirm an attach to the worker actually succeeds before
+    # protection is in place. Without this, an unrelated strace failure
+    # (e.g. rc=127 for a missing binary) would be indistinguishable from a
+    # real denial in the post-migration check below and silently pass it.
+    timeout 3 strace -p "$WORKER_TID" -e trace=none >/dev/null 2>&1
+    baseline_rc=$?
+    if [ "$baseline_rc" -ne 0 ]; then
+        bad "ptrace baseline attach to worker tid $WORKER_TID failed before protection (rc=$baseline_rc); skipping migration ptrace-denial check"
+    fi
+
     if ./anticheat protect --pid "$MAIN_TID" >/dev/null; then
         ok "protected leader tid $MAIN_TID (worker tid $WORKER_TID stays alive after it exits)"
     else
@@ -108,12 +118,14 @@ if [ -n "$MAIN_TID" ] && [ -n "$WORKER_TID" ]; then
         bad "registry entry did not migrate to the live worker (list: $LISTED)"
     fi
 
-    timeout 3 strace -p "$WORKER_TID" -e trace=none >/dev/null 2>&1
-    rc=$?
-    if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
-        ok "ptrace attach to migrated (worker) thread still denied (rc=$rc)"
-    else
-        bad "protection lost after migration (rc=$rc; 124 = hung attached)"
+    if [ "$baseline_rc" -eq 0 ]; then
+        timeout 3 strace -p "$WORKER_TID" -e trace=none >/dev/null 2>&1
+        rc=$?
+        if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
+            ok "ptrace attach to migrated (worker) thread still denied (rc=$rc)"
+        else
+            bad "protection lost after migration (rc=$rc; 124 = hung attached)"
+        fi
     fi
 
     # DEL_PROC must match by thread group: unprotecting via whichever pid
