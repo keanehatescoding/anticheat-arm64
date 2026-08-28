@@ -543,6 +543,41 @@ static void ac_del_prot_task(struct task_struct *t)
     spin_unlock_irqrestore(&ac_prot_lock, flags);
 }
 
+/* Re-point the registry entry tracking `old` at `replacement` instead of
+ * deleting it -- used by ac_exit_pre() when the exact task a registration
+ * was made for exits but other threads in its group are still alive.
+ * ac_is_protected_thread_group() already recognises any thread in a
+ * registered group, but only for as long as the registry holds an entry
+ * for that group at all; migrating the entry to a live sibling instead of
+ * dropping it keeps protection alive for the group's actual lifetime
+ * rather than the specific thread that happened to be named at protect
+ * time. Takes ownership of the caller's reference on `replacement` (the
+ * caller must have already get_task_struct()'d it); drops the reference
+ * on `old`. */
+static void ac_replace_prot_task(struct task_struct *old,
+                                  struct task_struct *replacement)
+{
+    unsigned long flags;
+    int i;
+    bool found = false;
+
+    spin_lock_irqsave(&ac_prot_lock, flags);
+    for (i = 0; i < AC_PROT_MAX; i++) {
+        if (ac_prots[i].task == old) {
+            put_task_struct(old);
+            ac_prots[i].task = replacement;
+            ac_prots[i].pid = replacement->pid;
+            strscpy(ac_prots[i].comm, replacement->comm,
+                    sizeof(ac_prots[i].comm));
+            found = true;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&ac_prot_lock, flags);
+    if (!found)
+        put_task_struct(replacement);
+}
+
 /* Fork inheritance already extends *protection* itself to children (see
  * ac_clone_ret()); mirror that for jit_allowed too, so a legitimate
  * JIT-marked process's child processes don't generate false anon-exec
@@ -873,11 +908,41 @@ static bool ac_kp_clone_ok;
 
 static int ac_exit_pre(struct kprobe *p, struct pt_regs *regs)
 {
+    struct task_struct *replacement = NULL;
+
     if (!ac_is_protected_task(current))
         return 0;
     ac_emit(AC_EV_EXIT, current->pid, current->comm,
             "protected process exited");
-    ac_del_prot_task(current);
+
+    /* current is the exact task this registry entry was made for. If
+     * another thread in its group is still alive, the group as a whole
+     * isn't done -- re-point the entry at that sibling instead of
+     * deleting it, so ac_is_protected_thread_group() keeps recognising
+     * the group for as long as it actually lives, not just until
+     * whichever thread happened to be named at protect time exits.
+     * do_exit() hasn't cleared current's own thread_group linkage yet
+     * at this pre-handler point, so for_each_thread() still sees every
+     * live sibling; PF_EXITING on a candidate means it's already
+     * mid-exit itself, so skip it in favour of one that isn't. */
+    rcu_read_lock();
+    {
+        struct task_struct *t2;
+
+        for_each_thread(current, t2) {
+            if (t2 != current && !(t2->flags & PF_EXITING)) {
+                get_task_struct(t2);
+                replacement = t2;
+                break;
+            }
+        }
+    }
+    rcu_read_unlock();
+
+    if (replacement)
+        ac_replace_prot_task(current, replacement);
+    else
+        ac_del_prot_task(current);
     return 0;
 }
 
