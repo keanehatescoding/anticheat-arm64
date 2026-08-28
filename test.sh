@@ -93,9 +93,14 @@ if [ -n "$MAIN_TID" ] && [ -n "$WORKER_TID" ]; then
     # protection is in place. Without this, an unrelated strace failure
     # (e.g. rc=127 for a missing binary) would be indistinguishable from a
     # real denial in the post-migration check below and silently pass it.
+    # A successful attach to a live, unprotected process doesn't return on
+    # its own -- strace stays attached tracing until the target exits -- so
+    # `timeout` kills it and rc=124 is the expected (not a failure) result
+    # here, same as everywhere else in this file that reads rc=124 as
+    # "hung attached".
     timeout 3 strace -p "$WORKER_TID" -e trace=none >/dev/null 2>&1
     baseline_rc=$?
-    if [ "$baseline_rc" -ne 0 ]; then
+    if [ "$baseline_rc" -ne 0 ] && [ "$baseline_rc" -ne 124 ]; then
         bad "ptrace baseline attach to worker tid $WORKER_TID failed before protection (rc=$baseline_rc); skipping migration ptrace-denial check"
     fi
 
@@ -118,7 +123,7 @@ if [ -n "$MAIN_TID" ] && [ -n "$WORKER_TID" ]; then
         bad "registry entry did not migrate to the live worker (list: $LISTED)"
     fi
 
-    if [ "$baseline_rc" -eq 0 ]; then
+    if [ "$baseline_rc" -eq 0 ] || [ "$baseline_rc" -eq 124 ]; then
         timeout 3 strace -p "$WORKER_TID" -e trace=none >/dev/null 2>&1
         rc=$?
         if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
