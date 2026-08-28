@@ -1015,6 +1015,11 @@ test/render_hook_test.c  live test: self-hooks vkQueuePresentKHR or (given
 test/mount_ns_probe.c    live test: proves render-hook detection resolves a
                          target's real mount-namespace view of a path, not
                          the host's (root, real module -- run via test.sh)
+test/thread_exit_migration_test.c  live test: leader thread exits via
+                         pthread_exit() while a worker thread lives on,
+                         proves the registry entry migrates instead of
+                         dropping protection (root, real module -- run
+                         via test.sh)
 test/ioctl_fuzz.c        fuzzes every AC_IOCTL_* (malformed sizes, bad
                          pointers): `make ioctl-fuzz` -- mock dry run
                          no-root/CI, full run needs root + a real module

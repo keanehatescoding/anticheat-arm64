@@ -93,6 +93,16 @@ anon-exec-test: test/anon_exec_test
 test/anon_exec_test: test/anon_exec_test.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
+# thread-exit-migration live test helper: single leader thread + one
+# worker, protected by the leader's tid, then the leader alone exits via
+# pthread_exit() while the worker keeps running -- exercises
+# ac_exit_pre()'s registry-migration path (ac_replace_prot_task()). Needs
+# root and the module loaded -- see test.sh.
+thread-exit-migration-test: test/thread_exit_migration_test
+
+test/thread_exit_migration_test: test/thread_exit_migration_test.c src/anticheat.h
+	$(CC) $(CFLAGS) -pthread -o $@ $< $(LDFLAGS)
+
 # ioctl fuzz harness: hammers every AC_IOCTL_* with malformed sizes,
 # boundary values, and null/wild/unmapped pointers -- the actual attack
 # surface any local process holding an open fd can reach. Against the
@@ -118,7 +128,7 @@ ci:
 
 clean:
 	@if [ -d $(KDIR) ]; then $(MAKE) -C $(KDIR) M=$(PWD) clean; fi
-	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test test/mount_ns_probe test/anon_exec_test test/ioctl_fuzz
+	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test test/mount_ns_probe test/anon_exec_test test/thread_exit_migration_test test/ioctl_fuzz
 
 install: all
 	install -D -m 0755 anticheat /usr/local/sbin/anticheat
@@ -147,4 +157,4 @@ install-deck: all
 uninstall-deck:
 	rm -rf $(DECK_PREFIX)
 
-.PHONY: all module daemon mock test-mock priv-drop-test render-hook-test mount-ns-test ioctl-fuzz ci clean install uninstall install-deck uninstall-deck
+.PHONY: all module daemon mock test-mock priv-drop-test render-hook-test mount-ns-test thread-exit-migration-test ioctl-fuzz ci clean install uninstall install-deck uninstall-deck
