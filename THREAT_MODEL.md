@@ -108,32 +108,6 @@ where the relevant code lives:
   of a separate, earlier lookup — a real architectural change to how
   these two kprobes enforce policy, not a one-line fix, and not attempted
   here.
-- **`DEL_PROC` can't always unprotect by the pid originally given.**
-  `protect --pid N` (`AC_IOCTL_ADD_PROC`) registers exactly the
-  `task_struct` for the pid given. Previously, `ac_exit_pre()`
-  deregistered that same exact task on its own exit even if other
-  threads in its group were still running, silently dropping protection
-  for the whole group the moment the originally-named thread exited —
-  fixed now: `ac_exit_pre()` re-points the registry entry at a live
-  sibling instead (`ac_replace_prot_task()`), only deleting the entry
-  once the thread group's last member actually exits, so
-  `ac_is_protected_thread_group()` keeps recognising the group for its
-  real lifetime.
-  That migration is asymmetric with how removal works, though:
-  `AC_IOCTL_DEL_PROC`/`ac_del_prot_task()` still matches by the exact
-  `task_struct` resolved from the pid the caller passes in, not by
-  thread-group membership the way the protection checks do. If `N`'s
-  task has since been migrated away (its original thread exited, a
-  sibling took over the entry, and the registry's displayed pid changed
-  to that sibling's), `unprotect --pid N` resolves a pid that either no
-  longer exists or belongs to an unrelated task, and fails with
-  `-ESRCH` — the caller has to `list` first to find the group's current
-  representative pid before it can unprotect it. Narrow in practice
-  (it only bites a thread group whose originally-registered thread has
-  since exited while siblings live on) and not a protection bypass —
-  the process stays protected either way — but a rough operational edge
-  worth closing by having `ac_del_prot_task()` match on thread-group
-  membership too.
 - **DXVK/VKD3D-internal hooks and Vulkan loader dispatch-table hooks.**
   Render-hook detection verifies the exported symbol's own bytes in
   `libvulkan.so`/`libGL.so`/`libEGL.so`; a hook placed inside a
