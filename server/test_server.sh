@@ -116,6 +116,18 @@ else
     fail "invalid client_id should be 400 (got $CODE)"
 fi
 
+# 4b. client_id with a trailing newline -> 400 (regression: `$` without
+# re.MULTILINE matches just before a trailing \n, so .match() alone would
+# accept "foo\n" and desync it from lookups by the plain id)
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/report" \
+    -H "Authorization: Bearer $REPORT_KEY" -H 'Content-Type: application/json' \
+    -d "{\"client_id\":\"${CID}\\n\",\"event_type\":\"X\",\"detail\":\"x\",\"ts\":1}")
+if [ "$CODE" = "400" ]; then
+    pass "client_id with trailing newline rejected -> 400"
+else
+    fail "client_id with trailing newline should be 400 (got $CODE)"
+fi
+
 # 5. oversized body (> MAX_BODY_BYTES) -> 400
 BIG_DETAIL=$(python3 -c "print('x' * 5000)")
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/report" \

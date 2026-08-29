@@ -411,7 +411,7 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
 
         @staticmethod
         def _valid_client_id(v):
-            return isinstance(v, str) and CLIENT_ID_RE.match(v) is not None
+            return isinstance(v, str) and CLIENT_ID_RE.fullmatch(v) is not None
 
         def _require_valid_client_id(self, v):
             """Shared by every handler below that takes a client_id
