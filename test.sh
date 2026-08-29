@@ -8,6 +8,7 @@ VICTIM_PID=""
 DAEMON_PID=""
 REPORT_SERVER_PID=""
 MIGTEST_PID=""
+SPAWNTEST_PID=""
 FAILED=0
 
 say()  { printf '\033[1;34m[TEST]\033[0m %s\n' "$*"; }
@@ -21,6 +22,7 @@ cleanup() {
     [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null
     [ -n "$REPORT_SERVER_PID" ] && kill "$REPORT_SERVER_PID" 2>/dev/null
     [ -n "$MIGTEST_PID" ] && kill -9 "$MIGTEST_PID" 2>/dev/null
+    [ -n "$SPAWNTEST_PID" ] && kill -9 "$SPAWNTEST_PID" 2>/dev/null
     sleep 0.2
     rmmod anticheat 2>/dev/null
 }
@@ -32,6 +34,7 @@ say "building"
 make >/dev/null 2>&1 || { echo "build failed"; exit 1; }
 make priv-drop-test >/dev/null 2>&1 || { echo "priv-drop-test build failed"; exit 1; }
 make thread-exit-migration-test >/dev/null 2>&1 || { echo "thread-exit-migration-test build failed"; exit 1; }
+make thread-spawn-after-protect-test >/dev/null 2>&1 || { echo "thread-spawn-after-protect-test build failed"; exit 1; }
 
 say "loading anticheat.ko"
 rmmod anticheat 2>/dev/null
@@ -83,6 +86,43 @@ if [ -n "$CHILD_PID" ] && ./anticheat list | grep -q "$CHILD_PID"; then
 else
     bad "fork inheritance (child pid was '$CHILD_PID')"
 fi
+
+say "registry dedup: pthread_create() after protection must not add a second entry (ac_clone_ret)"
+coproc SPAWNTEST { ./test/thread_spawn_after_protect_test; }
+read -r _ SPAWN_MAIN_TID <&"${SPAWNTEST[0]}"
+if [ -n "$SPAWN_MAIN_TID" ]; then
+    if ./anticheat protect --pid "$SPAWN_MAIN_TID" >/dev/null; then
+        ok "protected leader tid $SPAWN_MAIN_TID (worker spawns after this)"
+    else
+        bad "protect leader tid $SPAWN_MAIN_TID"
+    fi
+
+    # unblock the leader now that protection is in place; it spawns the
+    # worker thread (a CLONE_THREAD clone of an already-protected task)
+    # only after this point.
+    echo go >&"${SPAWNTEST[1]}"
+    read -r _ SPAWN_WORKER_TID <&"${SPAWNTEST[0]}"
+    sleep 0.3
+
+    if [ -n "$SPAWN_WORKER_TID" ]; then
+        LISTED=$(./anticheat list)
+        WORKER_LISTED=$(printf '%s' "$LISTED" | grep -c "$SPAWN_WORKER_TID")
+        if [ "$WORKER_LISTED" -eq 0 ]; then
+            ok "worker tid $SPAWN_WORKER_TID got no independent registry entry"
+        else
+            bad "worker tid $SPAWN_WORKER_TID has its own registry entry (duplicate; list: $LISTED)"
+        fi
+    else
+        bad "thread_spawn_after_protect_test did not report WORKER_TID"
+    fi
+
+    ./anticheat unprotect --pid "$SPAWN_MAIN_TID" >/dev/null 2>&1
+else
+    bad "thread_spawn_after_protect_test did not report MAIN_TID"
+fi
+kill -9 "$SPAWNTEST_PID" 2>/dev/null
+wait "$SPAWNTEST_PID" 2>/dev/null
+SPAWNTEST_PID=""
 
 say "registry migration: leader thread exits, worker lives on (ac_replace_prot_task)"
 coproc MIGTEST { ./test/thread_exit_migration_test; }

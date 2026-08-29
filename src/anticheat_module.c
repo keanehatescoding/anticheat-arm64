@@ -926,6 +926,20 @@ static int ac_clone_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
     child = ac_find_task((pid_t)child_pid);
     if (!child)
         return 0;
+
+    /* CLONE_THREAD (e.g. pthread_create()) makes child share current's
+     * thread group rather than start a new one. ac_is_protected_thread_group()
+     * already recognises any live thread of an already-registered group, so
+     * the group's existing registry entry already covers this child -- an
+     * extra entry here would just be a second slot (and a second held
+     * task_struct ref) for the same protected process, exhausting
+     * AC_PROT_MAX under ordinary thread-pool usage. Only give a genuinely
+     * new thread group (real fork()) its own entry. */
+    if (same_thread_group(current, child)) {
+        put_task_struct(child);
+        return 0;
+    }
+
     strscpy(pcomm, current->comm, sizeof(pcomm));
     ac_add_prot_task(child, ac_task_jit_allowed(current));
     ac_emit(AC_EV_FORK, child->pid, child->comm,
