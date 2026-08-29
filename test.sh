@@ -7,6 +7,7 @@ cd "$(dirname "$0")" || exit 1
 VICTIM_PID=""
 DAEMON_PID=""
 REPORT_SERVER_PID=""
+MIGTEST_PID=""
 FAILED=0
 
 say()  { printf '\033[1;34m[TEST]\033[0m %s\n' "$*"; }
@@ -19,6 +20,7 @@ cleanup() {
     [ -n "$VICTIM_PID" ] && kill "$VICTIM_PID" 2>/dev/null
     [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null
     [ -n "$REPORT_SERVER_PID" ] && kill "$REPORT_SERVER_PID" 2>/dev/null
+    [ -n "$MIGTEST_PID" ] && kill -9 "$MIGTEST_PID" 2>/dev/null
     sleep 0.2
     rmmod anticheat 2>/dev/null
 }
@@ -29,6 +31,7 @@ trap cleanup EXIT
 say "building"
 make >/dev/null 2>&1 || { echo "build failed"; exit 1; }
 make priv-drop-test >/dev/null 2>&1 || { echo "priv-drop-test build failed"; exit 1; }
+make thread-exit-migration-test >/dev/null 2>&1 || { echo "thread-exit-migration-test build failed"; exit 1; }
 
 say "loading anticheat.ko"
 rmmod anticheat 2>/dev/null
@@ -80,6 +83,76 @@ if [ -n "$CHILD_PID" ] && ./anticheat list | grep -q "$CHILD_PID"; then
 else
     bad "fork inheritance (child pid was '$CHILD_PID')"
 fi
+
+say "registry migration: leader thread exits, worker lives on (ac_replace_prot_task)"
+coproc MIGTEST { ./test/thread_exit_migration_test; }
+read -r _ MAIN_TID <&"${MIGTEST[0]}"
+read -r _ WORKER_TID <&"${MIGTEST[0]}"
+if [ -n "$MAIN_TID" ] && [ -n "$WORKER_TID" ]; then
+    # Baseline: confirm an attach to the worker actually succeeds before
+    # protection is in place. Without this, an unrelated strace failure
+    # (e.g. rc=127 for a missing binary) would be indistinguishable from a
+    # real denial in the post-migration check below and silently pass it.
+    # A successful attach to a live, unprotected process doesn't return on
+    # its own -- strace stays attached tracing until the target exits -- so
+    # `timeout` kills it and rc=124 is the expected (not a failure) result
+    # here, same as everywhere else in this file that reads rc=124 as
+    # "hung attached".
+    timeout 3 strace -p "$WORKER_TID" -e trace=none >/dev/null 2>&1
+    baseline_rc=$?
+    if [ "$baseline_rc" -ne 0 ] && [ "$baseline_rc" -ne 124 ]; then
+        bad "ptrace baseline attach to worker tid $WORKER_TID failed before protection (rc=$baseline_rc); skipping migration ptrace-denial check"
+    fi
+
+    if ./anticheat protect --pid "$MAIN_TID" >/dev/null; then
+        ok "protected leader tid $MAIN_TID (worker tid $WORKER_TID stays alive after it exits)"
+    else
+        bad "protect leader tid $MAIN_TID"
+    fi
+
+    # unblock the leader thread now that protection is in place; it calls
+    # pthread_exit() (not exit()/exit_group()), so only it exits while the
+    # worker thread -- and the process -- keep running.
+    echo go >&"${MIGTEST[1]}"
+    sleep 0.5
+
+    LISTED=$(./anticheat list)
+    if printf '%s' "$LISTED" | grep -q "$WORKER_TID"; then
+        ok "registry entry migrated to worker tid $WORKER_TID after leader exited"
+    else
+        bad "registry entry did not migrate to the live worker (list: $LISTED)"
+    fi
+
+    if [ "$baseline_rc" -eq 0 ] || [ "$baseline_rc" -eq 124 ]; then
+        timeout 3 strace -p "$WORKER_TID" -e trace=none >/dev/null 2>&1
+        rc=$?
+        if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
+            ok "ptrace attach to migrated (worker) thread still denied (rc=$rc)"
+        else
+            bad "protection lost after migration (rc=$rc; 124 = hung attached)"
+        fi
+    fi
+
+    # DEL_PROC must match by thread group: unprotecting via whichever pid
+    # is currently listed (the migrated worker tid, not the original
+    # leader pid) must actually clear the entry.
+    if ./anticheat unprotect --pid "$WORKER_TID" >/dev/null; then
+        ok "unprotect via migrated pid succeeded"
+    else
+        bad "unprotect via migrated pid"
+    fi
+    sleep 0.2
+    if ./anticheat list | grep -q "$WORKER_TID"; then
+        bad "still listed as protected after unprotect"
+    else
+        ok "no longer listed as protected after unprotect"
+    fi
+else
+    bad "thread_exit_migration_test did not report MAIN_TID/WORKER_TID (got MAIN_TID='$MAIN_TID' WORKER_TID='$WORKER_TID')"
+fi
+kill -9 "$MIGTEST_PID" 2>/dev/null
+wait "$MIGTEST_PID" 2>/dev/null
+MIGTEST_PID=""
 
 say "ptrace denial: attempting to attach to the protected process"
 # rc=124 means strace stayed attached until the timeout (denial FAILED).
