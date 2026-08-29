@@ -51,6 +51,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Force a permissive umask before launching the server below, so the DB
+# mode check that follows actually exercises Store's own 0600 guarantee
+# (both for $DB itself and its -wal/-shm siblings, all newly created by
+# this launch) instead of passing by luck under whatever umask happened
+# to be inherited (e.g. a caller already running under 077).
+umask 022
+
 # Explicit --rate-limit here (well above the CLI's own default of 60) so
 # the sequential functional tests plus the concurrent-write test below
 # (~40+ requests total against this one instance/IP) never risk tripping
@@ -74,6 +81,104 @@ done
 if [ "$READY" -ne 1 ]; then
     fail "server never became ready on $BASE (port collision with another service?)"
     exit 1
+fi
+
+# 0. DB file must be private (0600) regardless of the launching shell's
+# umask (forced to 022 above) -- this is the umask-at-creation path for
+# the persistent, non-ephemeral main file, exercised end-to-end against
+# the real running server.
+DB_MODE=$(stat -c '%a' "$DB")
+if [ "$DB_MODE" = "600" ]; then
+    pass "DB file created with private mode 0600"
+else
+    fail "DB file should be 0600 regardless of umask (got $DB_MODE)"
+fi
+
+# 0b. Both the umask-at-creation path and the chmod-existing-files path,
+# for the DB *and* its -wal/-shm siblings, exercised directly against
+# Store rather than the live server above: -wal/-shm only exist while
+# some connection is open (SQLite deletes them once the last one closes,
+# as Store's own does at the end of __init__), so this patches
+# Connection.close to a no-op to keep them around long enough to stat.
+if python3 - "$$" <<'PYEOF'
+import gc
+import os
+import sqlite3
+import sys
+
+# Overriding close() (below) only suppresses *explicit* close calls --
+# once Store()'s local connection variable goes out of scope, closing it
+# for real is left to the cyclic GC's finalizer, which calls into the C
+# extension's own teardown rather than this subclass's close(), and
+# still checkpoints + deletes -wal/-shm out from under us. Since that GC
+# pass isn't tied to refcount reaching zero, it can fire at any point
+# (verified: allocating enough garbage between the two check() calls
+# below triggers it), making a bare close() override flaky rather than
+# reliably wrong. Disabling the cyclic GC for this whole short-lived,
+# one-off process sidesteps it deterministically instead.
+gc.disable()
+
+
+# sqlite3.Connection is an immutable C type, so close() can't be patched
+# on it directly -- route new connections through a subclass instead,
+# via the documented `factory=` hook, to keep -wal/-shm from being
+# auto-removed when Store's own connection closes.
+class _NoCloseConnection(sqlite3.Connection):
+    def close(self):
+        pass
+
+
+_real_connect = sqlite3.connect
+sqlite3.connect = lambda *a, **kw: _real_connect(*a, factory=_NoCloseConnection, **kw)
+
+sys.path.insert(0, ".")
+from ac_server import Store
+
+pid = sys.argv[1]
+ok = True
+
+
+def check(path, pre_create):
+    for p in (path, path + "-wal", path + "-shm"):
+        try:
+            os.remove(p)
+        except FileNotFoundError:
+            pass
+    if pre_create:
+        seed = sqlite3.connect(path)
+        seed.execute("PRAGMA journal_mode=WAL")
+        seed.execute("CREATE TABLE seed(x)")
+        seed.commit()
+        for p in (path, path + "-wal", path + "-shm"):
+            if os.path.exists(p):
+                os.chmod(p, 0o644)
+    Store(path)
+    result = True
+    for p in (path, path + "-wal", path + "-shm"):
+        if not os.path.exists(p):
+            print(f"FAIL {p} missing")
+            result = False
+            continue
+        mode = oct(os.stat(p).st_mode & 0o777)[2:]
+        if mode != "600":
+            print(f"FAIL {p} mode={mode}")
+            result = False
+    for p in (path, path + "-wal", path + "-shm"):
+        try:
+            os.remove(p)
+        except FileNotFoundError:
+            pass
+    return result
+
+
+ok &= check(f"/tmp/ac_server_test_fresh_{pid}.db", pre_create=False)
+ok &= check(f"/tmp/ac_server_test_existing_{pid}.db", pre_create=True)
+sys.exit(0 if ok else 1)
+PYEOF
+then
+    pass "DB and -wal/-shm private (0600) both freshly created and normalized from 0644"
+else
+    fail "DB/-wal/-shm permission check failed (see FAIL lines above)"
 fi
 
 # 1. report with correct key -> 201

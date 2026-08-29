@@ -82,8 +82,9 @@ ReadWritePaths=/var/lib/anticheat
 # Matches the 0700 state directory above: sqlite3's default create mode
 # is world-readable, and ReadWritePaths= only grants filesystem access --
 # it does nothing to the Unix permission bits new files are created
-# with. Without this, the DB (and its WAL/SHM files) would be readable by
-# any local user despite the directory itself being locked down.
+# with. ac_server.py also sets its own process umask before creating the
+# DB, so this is defense-in-depth rather than the sole guarantee -- but
+# still worth keeping in case that ever regresses.
 UMask=0077
 ProtectSystem=strict
 ProtectHome=true
