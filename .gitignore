@@ -18,6 +18,7 @@ test/render_hook_test
 test/mount_ns_probe
 test/anon_exec_test
 test/thread_exit_migration_test
+test/thread_spawn_after_protect_test
 test/ioctl_fuzz
 
 # runtime state
