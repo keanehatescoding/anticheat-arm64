@@ -51,6 +51,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Force a permissive umask before launching the server below, so the DB
+# mode check that follows actually exercises Store's own 0600 guarantee
+# instead of passing by luck under whatever umask happened to be
+# inherited (e.g. a caller already running under 077).
+umask 022
+
+# Also pre-create the DB at 0644, standing in for a pre-fix deployment's
+# already-world-readable file, so the check below also exercises the
+# chmod-existing-files path on top of the launch-time umask.
+: >"$DB" && chmod 644 "$DB"
+
 # Explicit --rate-limit here (well above the CLI's own default of 60) so
 # the sequential functional tests plus the concurrent-write test below
 # (~40+ requests total against this one instance/IP) never risk tripping
@@ -77,7 +88,8 @@ if [ "$READY" -ne 1 ]; then
 fi
 
 # 0. DB file must be private (0600) regardless of the launching shell's
-# umask -- this test's own umask is left at its default on purpose.
+# umask (forced to 022 above) and even though it pre-existed at 0644,
+# simulating an upgrade from a pre-fix deployment.
 DB_MODE=$(stat -c '%a' "$DB")
 if [ "$DB_MODE" = "600" ]; then
     pass "DB file created with private mode 0600"
