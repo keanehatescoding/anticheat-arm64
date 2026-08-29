@@ -192,6 +192,28 @@ static int cmd_status(void)
 /* ------------------------------------------------------------------ */
 /* command: protect / unprotect / list                                */
 /* ------------------------------------------------------------------ */
+/* Returns the trimmed contents of /proc/pid/comm in buf (bufsz >=
+ * AC_MAX_COMM + 1), or -1 if the pid doesn't exist / isn't readable. */
+static int read_comm(int pid, char *buf, size_t bufsz)
+{
+    char path[64];
+    int fd;
+    ssize_t r;
+
+    snprintf(path, sizeof(path), "/proc/%d/comm", pid);
+    fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return -1;
+    r = read(fd, buf, bufsz - 1);
+    close(fd);
+    if (r <= 0)
+        return -1;
+    buf[r] = '\0';
+    while (r > 0 && (buf[r - 1] == '\n' || buf[r - 1] == ' '))
+        buf[--r] = '\0';
+    return (int)r;
+}
+
 static int pid_of_comm(const char *comm, int *pids, int max)
 {
     DIR *d;
@@ -202,26 +224,16 @@ static int pid_of_comm(const char *comm, int *pids, int max)
     if (!d)
         die("opendir /proc: %s", strerror(errno));
     while ((de = readdir(d)) != NULL) {
-        char path[64], buf[AC_MAX_COMM + 1];
-        int pid, fd;
-        ssize_t r;
+        char buf[AC_MAX_COMM + 1];
+        int pid;
 
         if (de->d_name[0] < '0' || de->d_name[0] > '9')
             continue;
         pid = atoi(de->d_name);
         if (pid <= 0)
             continue;
-        snprintf(path, sizeof(path), "/proc/%d/comm", pid);
-        fd = open(path, O_RDONLY);
-        if (fd < 0)
+        if (read_comm(pid, buf, sizeof(buf)) < 0)
             continue;
-        r = read(fd, buf, sizeof(buf) - 1);
-        close(fd);
-        if (r <= 0)
-            continue;
-        buf[r] = '\0';
-        while (r > 0 && (buf[r - 1] == '\n' || buf[r - 1] == ' '))
-            buf[--r] = '\0';
         if (strcmp(buf, comm) == 0 && n < max)
             pids[n++] = pid;
     }
@@ -256,19 +268,36 @@ static int cmd_protect(int argc, char **argv)
     ac_open();
     if (comm) {
         int pids[256];
+        int protected_count = 0;
+
         n = pid_of_comm(comm, pids, 256);
         if (n == 0) {
             fprintf(stderr, "no process with comm '%s'\n", comm);
             return 1;
         }
         for (i = 0; i < n; i++) {
+            char cur_comm[AC_MAX_COMM + 1];
+
+            /* Re-check comm right before the ioctl, not just at scan time:
+             * pids[i] may have exited and been reused by an unrelated
+             * process in between, and this is our last chance to catch
+             * that before silently protecting the wrong process. */
+            if (read_comm(pids[i], cur_comm, sizeof(cur_comm)) < 0 ||
+                strcmp(cur_comm, comm) != 0) {
+                fprintf(stderr,
+                        "skipping pid %d: comm no longer matches '%s' (exited/reused?)\n",
+                        pids[i], comm);
+                continue;
+            }
             memset(&id, 0, sizeof(id));
             id.pid = pids[i];
             id.jit_allowed = jit;
-            if (ioctl_ok(AC_IOCTL_ADD_PROC, &id) == 0)
+            if (ioctl_ok(AC_IOCTL_ADD_PROC, &id) == 0) {
                 printf("protected pid %d (%s)\n", pids[i], id.comm);
+                protected_count++;
+            }
         }
-        printf("%d process(es) protected\n", n);
+        printf("%d process(es) protected\n", protected_count);
     } else {
         memset(&id, 0, sizeof(id));
         id.pid = pid;
