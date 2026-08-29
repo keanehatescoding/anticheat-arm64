@@ -101,10 +101,27 @@ if [ -n "$SPAWN_MAIN_TID" ]; then
     # worker thread (a CLONE_THREAD clone of an already-protected task)
     # only after this point.
     echo go >&"${SPAWNTEST[1]}"
-    read -r _ SPAWN_WORKER_TID <&"${SPAWNTEST[0]}"
-    sleep 0.3
 
-    if [ -n "$SPAWN_WORKER_TID" ]; then
+    # Two independent lines follow, in either order: WORKER_TID (printed by
+    # the new thread, which can start running before the parent's clone()
+    # syscall -- and thus ac_clone_ret() -- has actually returned) and
+    # SPAWN_DONE (printed by the parent strictly after pthread_create()
+    # returns, which cannot happen until ac_clone_ret() already ran). Only
+    # SPAWN_DONE proves the registry decision has landed; wait for both
+    # rather than sleeping a fixed amount.
+    SPAWN_WORKER_TID=""
+    SPAWN_DONE_SEEN=0
+    for _ in 1 2; do
+        read -r tag val <&"${SPAWNTEST[0]}"
+        case "$tag" in
+            WORKER_TID) SPAWN_WORKER_TID="$val" ;;
+            SPAWN_DONE) SPAWN_DONE_SEEN=1 ;;
+        esac
+    done
+
+    if [ "$SPAWN_DONE_SEEN" -ne 1 ]; then
+        bad "thread_spawn_after_protect_test never reported SPAWN_DONE; registry check would be unsynchronized"
+    elif [ -n "$SPAWN_WORKER_TID" ]; then
         LISTED=$(./anticheat list)
         WORKER_LISTED=$(printf '%s' "$LISTED" | grep -c "$SPAWN_WORKER_TID")
         if [ "$WORKER_LISTED" -eq 0 ]; then

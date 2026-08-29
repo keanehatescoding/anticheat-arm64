@@ -14,6 +14,16 @@
  * is already in place -- prints its tid as WORKER_TID, and both threads
  * then park until the driver kills the whole process during cleanup.
  *
+ * The worker's own WORKER_TID print races the parent's ac_clone_ret()
+ * kretprobe: the child can start running on another CPU before
+ * kernel_clone() actually returns in the parent (and thus before the
+ * kretprobe, attached to that return, has run). So the driver also waits
+ * for SPAWN_DONE, printed by the parent strictly after pthread_create()
+ * returns -- pthread_create() cannot return until its underlying clone()
+ * syscall has, which is strictly after ac_clone_ret() already ran. Seeing
+ * SPAWN_DONE is therefore a real happens-after guarantee that the
+ * registry decision has already landed, unlike a fixed sleep.
+ *
  * Needs root and the module loaded -- see test.sh.
  */
 #define _GNU_SOURCE
@@ -59,6 +69,8 @@ int main(void)
                 "thread_spawn_after_protect_test: pthread_create failed\n");
         return 2;
     }
+    printf("SPAWN_DONE\n");
+    fflush(stdout);
 
     for (;;)
         pause();
