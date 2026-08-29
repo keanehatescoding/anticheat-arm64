@@ -2317,6 +2317,14 @@ static void check_implicit_layers_periodic(void)
             noff += (size_t)snprintf(names + noff,
                                       noff < sizeof(names) ? sizeof(names) - noff : 0,
                                       "%s%s", unknown ? ", " : "", nm);
+            /* snprintf() returns the length it would have written, not the
+             * length actually written -- clamp so noff never grows past
+             * sizeof(names), which would otherwise make `names + noff`
+             * (formed unconditionally next iteration) point more than one
+             * element past the array's end: UB per C11 6.5.6p8 even without
+             * a dereference. */
+            if (noff > sizeof(names))
+                noff = sizeof(names);
             unknown++;
         }
 
