@@ -1576,10 +1576,11 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         }
         return -EBUSY;
     case AC_IOCTL_UNLOCK:
-        if (atomic_read(&ac_lock_count) > 0) {
-            atomic_dec(&ac_lock_count);
+        /* atomic_dec_if_positive() makes the check-and-decrement a single
+         * atomic step, so two concurrent UNLOCKs racing a single LOCK can't
+         * both observe a positive count and both call module_put(). */
+        if (atomic_dec_if_positive(&ac_lock_count) >= 0)
             module_put(THIS_MODULE);
-        }
         return 0;
     default:
         return -ENOTTY;
