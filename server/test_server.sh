@@ -101,9 +101,23 @@ fi
 # as Store's own does at the end of __init__), so this patches
 # Connection.close to a no-op to keep them around long enough to stat.
 if python3 - "$$" <<'PYEOF'
+import gc
 import os
 import sqlite3
 import sys
+
+# Overriding close() (below) only suppresses *explicit* close calls --
+# once Store()'s local connection variable goes out of scope, closing it
+# for real is left to the cyclic GC's finalizer, which calls into the C
+# extension's own teardown rather than this subclass's close(), and
+# still checkpoints + deletes -wal/-shm out from under us. Since that GC
+# pass isn't tied to refcount reaching zero, it can fire at any point
+# (verified: allocating enough garbage between the two check() calls
+# below triggers it), making a bare close() override flaky rather than
+# reliably wrong. Disabling the cyclic GC for this whole short-lived,
+# one-off process sidesteps it deterministically instead.
+gc.disable()
+
 
 # sqlite3.Connection is an immutable C type, so close() can't be patched
 # on it directly -- route new connections through a subclass instead,
