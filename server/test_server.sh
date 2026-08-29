@@ -76,6 +76,15 @@ if [ "$READY" -ne 1 ]; then
     exit 1
 fi
 
+# 0. DB file must be private (0600) regardless of the launching shell's
+# umask -- this test's own umask is left at its default on purpose.
+DB_MODE=$(stat -c '%a' "$DB")
+if [ "$DB_MODE" = "600" ]; then
+    pass "DB file created with private mode 0600"
+else
+    fail "DB file should be 0600 regardless of umask (got $DB_MODE)"
+fi
+
 # 1. report with correct key -> 201
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/report" \
     -H "Authorization: Bearer $REPORT_KEY" -H 'Content-Type: application/json' \

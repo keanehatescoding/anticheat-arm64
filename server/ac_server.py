@@ -36,6 +36,7 @@ import hmac
 import http.server
 import ipaddress
 import json
+import os
 import re
 import signal
 import socket
@@ -120,6 +121,11 @@ class Store:
 
     def __init__(self, db_path):
         self.db_path = db_path
+        # The DB (and its -wal/-shm siblings, recreated on every checkpoint)
+        # hold raw report detail text, source IPs, and ban reasons -- private
+        # regardless of the launching environment's umask, not just under the
+        # exact systemd unit that happens to set UMask=0077.
+        os.umask(0o077)
         # SQLite only ever allows one writer at a time, even in WAL mode --
         # under ThreadingHTTPServer, every write-handling thread opens its
         # own connection and would otherwise all race for that single
