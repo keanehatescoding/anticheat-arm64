@@ -100,7 +100,7 @@ fi
 # some connection is open (SQLite deletes them once the last one closes,
 # as Store's own does at the end of __init__), so this patches
 # Connection.close to a no-op to keep them around long enough to stat.
-python3 - "$$" <<'PYEOF'
+if python3 - "$$" <<'PYEOF'
 import os
 import sqlite3
 import sys
@@ -161,7 +161,7 @@ ok &= check(f"/tmp/ac_server_test_fresh_{pid}.db", pre_create=False)
 ok &= check(f"/tmp/ac_server_test_existing_{pid}.db", pre_create=True)
 sys.exit(0 if ok else 1)
 PYEOF
-if [ "$?" -eq 0 ]; then
+then
     pass "DB and -wal/-shm private (0600) both freshly created and normalized from 0644"
 else
     fail "DB/-wal/-shm permission check failed (see FAIL lines above)"
