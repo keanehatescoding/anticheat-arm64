@@ -89,7 +89,10 @@ fi
 
 say "registry dedup: pthread_create() after protection must not add a second entry (ac_clone_ret)"
 coproc SPAWNTEST { ./test/thread_spawn_after_protect_test; }
-read -r _ SPAWN_MAIN_TID <&"${SPAWNTEST[0]}"
+# -t bounds every read below: if the helper hangs instead of writing the
+# expected protocol line, a plain read would block test.sh forever instead
+# of reaching the failure checks and cleanup path further down.
+read -r -t 5 _ SPAWN_MAIN_TID <&"${SPAWNTEST[0]}" || SPAWN_MAIN_TID=""
 if [ -n "$SPAWN_MAIN_TID" ]; then
     if ./anticheat protect --pid "$SPAWN_MAIN_TID" >/dev/null; then
         ok "protected leader tid $SPAWN_MAIN_TID (worker spawns after this)"
@@ -112,7 +115,7 @@ if [ -n "$SPAWN_MAIN_TID" ]; then
     SPAWN_WORKER_TID=""
     SPAWN_DONE_SEEN=0
     for _ in 1 2; do
-        read -r tag val <&"${SPAWNTEST[0]}"
+        read -r -t 5 tag val <&"${SPAWNTEST[0]}" || break
         case "$tag" in
             WORKER_TID) SPAWN_WORKER_TID="$val" ;;
             SPAWN_DONE) SPAWN_DONE_SEEN=1 ;;
