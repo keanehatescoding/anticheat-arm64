@@ -292,6 +292,8 @@ static int cmd_protect(int argc, char **argv)
             memset(&id, 0, sizeof(id));
             id.pid = pids[i];
             id.jit_allowed = jit;
+            snprintf(id.comm, sizeof(id.comm), "%.*s",
+                     (int)sizeof(id.comm) - 1, cur_comm);
             if (ioctl_ok(AC_IOCTL_ADD_PROC, &id) == 0) {
                 printf("protected pid %d (%s)\n", pids[i], id.comm);
                 protected_count++;
