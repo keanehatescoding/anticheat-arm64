@@ -9,6 +9,7 @@ DAEMON_PID=""
 REPORT_SERVER_PID=""
 MIGTEST_PID=""
 SPAWNTEST_PID=""
+CHILD_PIDFILE=""
 FAILED=0
 
 say()  { printf '\033[1;34m[TEST]\033[0m %s\n' "$*"; }
@@ -23,6 +24,7 @@ cleanup() {
     [ -n "$REPORT_SERVER_PID" ] && kill "$REPORT_SERVER_PID" 2>/dev/null
     [ -n "$MIGTEST_PID" ] && kill -9 "$MIGTEST_PID" 2>/dev/null
     [ -n "$SPAWNTEST_PID" ] && kill -9 "$SPAWNTEST_PID" 2>/dev/null
+    [ -n "$CHILD_PIDFILE" ] && rm -f "$CHILD_PIDFILE"
     sleep 0.2
     rmmod anticheat 2>/dev/null
 }
@@ -69,7 +71,10 @@ say "protecting a victim process (a bash that will fork a child)"
 # expiring mid-run as the suite grew -- give real headroom instead of
 # re-tuning this number every time a new section is added. The exit trap
 # (line 19) kills it regardless of how far the script gets.
-bash -c 'sleep 1800 & echo $! > /tmp/ac_child.pid; wait' &
+# mktemp, not a fixed /tmp/ac_child.pid path: a predictable name in
+# world-writable /tmp is a symlink-race hazard for this root-owned redirect.
+CHILD_PIDFILE="$(mktemp)" || { echo "mktemp failed"; exit 1; }
+bash -c 'sleep 1800 & echo $! > "$1"; wait' _ "$CHILD_PIDFILE" &
 VICTIM_PID=$!
 if ./anticheat protect --pid "$VICTIM_PID" >/dev/null; then
     ok "protected pid $VICTIM_PID"
@@ -79,8 +84,8 @@ fi
 
 say "fork inheritance: child of protected process should inherit"
 sleep 0.5
-CHILD_PID=$(cat /tmp/ac_child.pid 2>/dev/null)
-rm -f /tmp/ac_child.pid
+CHILD_PID=$(cat "$CHILD_PIDFILE" 2>/dev/null)
+rm -f "$CHILD_PIDFILE"
 if [ -n "$CHILD_PID" ] && ./anticheat list | grep -q "$CHILD_PID"; then
     ok "child pid $CHILD_PID inherited protection"
 else
