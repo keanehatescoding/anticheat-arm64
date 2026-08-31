@@ -129,6 +129,21 @@ else
     fail "start: no hidden-module alert"
 fi
 
+# Syscall-hook alerts should be logged once per rising edge (via the ring
+# drain), not once per 5s poll -- see #52. The 4s run above only crosses
+# one 5s poll boundary at most, so a single CRIT line here is enough to
+# both prove the alert still fires end-to-end through the ring and catch
+# a regression back to logging it directly (which produced two lines: one
+# from the direct log, one from the ring drain, on the very first poll).
+hooked_out=$(timeout -k 2 --preserve-status 4 \
+    env AC_MOCK_HOOKED=1 ./anticheat start --foreground 2>&1)
+hooked_crit_count=$(printf '%s' "$hooked_out" | grep -c "SYSCALL-HOOK")
+if [ "$hooked_crit_count" -eq 1 ]; then
+    pass "start: syscall-hook alert logged exactly once"
+else
+    fail "start: expected exactly 1 SYSCALL-HOOK log line, got $hooked_crit_count"
+fi
+
 echo
 if [ "$FAIL" -eq 0 ]; then
     printf '\033[1;32mALL MOCK TESTS PASSED\033[0m\n'

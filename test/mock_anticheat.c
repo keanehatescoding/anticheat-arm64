@@ -350,6 +350,12 @@ static int do_ioctl(unsigned long req, void *arg)
             c->hooked = 0;
             c->ok = 1;
         }
+        /* Mirrors the real module's rising-edge gating (see #52): only
+         * push a ring event on the clean->hooked transition, not on
+         * every poll that still finds the same hook. */
+        if (c->hooked && !last_hook_count)
+            push_event(AC_EV_SYSCALL_HOOK, 0, "?",
+                       "mock: syscall[57] -> 0xdeadbeef outside core kernel text");
         last_hook_count = c->hooked;
         return 0;
     }

@@ -57,6 +57,7 @@
 #include <linux/capability.h>
 #include <linux/ptrace.h>
 #include <linux/err.h>
+#include <linux/bitops.h>
 #include <asm/unistd.h>
 
 #include "anticheat.h"
@@ -324,6 +325,11 @@ static unsigned long ac_find_syscall_table(void)
     return 0;
 }
 
+/* Per-slot "already reported" state so a persistent hook is emitted once
+ * on the rising edge instead of on every AC_IOCTL_CHECK_SYSCALLS call
+ * (the daemon polls this every 5s); see #52. */
+static unsigned long ac_hooked_bitmap[BITS_TO_LONGS(__NR_syscalls)];
+
 static int ac_check_syscalls(struct ac_syscall_check *out)
 {
     unsigned long base = ac_syscall_table;
@@ -337,17 +343,22 @@ static int ac_check_syscalls(struct ac_syscall_check *out)
     out->nr_syscalls = __NR_syscalls;
     for (i = 0; i < __NR_syscalls; i++) {
         unsigned long e = 0;
+        bool bad;
 
         if (ac_kread(&e, (void *)(base + i * sizeof(e)), sizeof(e)))
             continue;
         if (!e)
             continue;
         out->total++;
-        if (ac_entry_bad(e)) {
+        bad = ac_entry_bad(e);
+        if (bad) {
             out->non_text++;
             out->hooked++;
-            ac_emit(AC_EV_SYSCALL_HOOK, 0, "?",
-                    "syscall[%u] -> 0x%lx outside core kernel text", i, e);
+            if (!test_and_set_bit(i, ac_hooked_bitmap))
+                ac_emit(AC_EV_SYSCALL_HOOK, 0, "?",
+                        "syscall[%u] -> 0x%lx outside core kernel text", i, e);
+        } else {
+            clear_bit(i, ac_hooked_bitmap);
         }
     }
     out->ok = (out->hooked == 0);

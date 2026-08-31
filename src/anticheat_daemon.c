@@ -1546,9 +1546,11 @@ static int check_syscalls_periodic(void)
     memset(&c, 0, sizeof(c));
     if (ioctl(dev_fd, AC_IOCTL_CHECK_SYSCALLS, &c) < 0)
         return -1;
-    if (c.hooked)
-        logmsg(LOG_CRIT, "SYSCALL TABLE COMPROMISED: %u hooked entries "
-               "(table @ %#llx)", c.hooked, c.table_addr);
+    /* Don't log here: the kernel only emits AC_EV_SYSCALL_HOOK into the
+     * event ring on a rising edge (new hook, not a still-hooked slot), and
+     * the main loop's ring drain already logs it at LOG_CRIT. Logging here
+     * too would re-report the same persistent hook at CRIT on every poll
+     * (see #52). */
     return c.hooked;
 }
 
