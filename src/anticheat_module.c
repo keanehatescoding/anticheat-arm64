@@ -783,8 +783,8 @@ static int ac_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
      *
      * The native (__x64_sys_ptrace) wrapper unpacks its first two
      * arguments from args->di/args->si (the x86-64 argument registers).
-     * The compat (__ia32_sys_ptrace) wrapper instead unpacks them from
-     * args->bx/args->cx, since ia32 syscall entry passes arguments in
+     * The compat (__ia32_compat_sys_ptrace) wrapper instead unpacks them
+     * from args->bx/args->cx, since ia32 syscall entry passes arguments in
      * ebx, ecx, edx, esi, edi, ebp rather than the native ABI's rdi,
      * rsi, rdx, r10, r8, r9. Reading di/si for the compat probe would
      * pick up the wrong register (ia32 arg5/arg4), silently mismatching
@@ -1010,7 +1010,13 @@ static struct kprobe ac_kp_ptrace = {
     .pre_handler = ac_ptrace_pre,
 };
 static struct kprobe ac_kp_ptrace32 = {
-    .symbol_name = "__ia32_sys_ptrace",
+    /* ptrace has a distinct COMPAT_SYSCALL_DEFINE (unlike process_vm_readv/
+     * writev below), so arch/x86/entry/syscalls/syscall_32.tbl wires the
+     * ia32 ptrace slot to the compat entry point, not the generic
+     * __ia32_sys_ptrace stub the plain SYSCALL_DEFINE also emits but that
+     * no syscall table ever references -- a kprobe there would silently
+     * never fire for a real 32-bit ptrace() call. */
+    .symbol_name = "__ia32_compat_sys_ptrace",
     .pre_handler = ac_ptrace_pre,
 };
 static struct kprobe ac_kp_exit = {
@@ -1026,11 +1032,15 @@ static struct kprobe ac_kp_execveat = {
     .pre_handler = ac_exec_pre,
 };
 static struct kprobe ac_kp_execve32 = {
-    .symbol_name = "__ia32_sys_execve",
+    /* Same reasoning as ac_kp_ptrace32 above: execve/execveat have distinct
+     * COMPAT_SYSCALL_DEFINEs, so the ia32 syscall table entries resolve to
+     * __ia32_compat_sys_execve[at], not the unused generic __ia32_sys_*
+     * stub. */
+    .symbol_name = "__ia32_compat_sys_execve",
     .pre_handler = ac_exec_pre,
 };
 static struct kprobe ac_kp_execveat32 = {
-    .symbol_name = "__ia32_sys_execveat",
+    .symbol_name = "__ia32_compat_sys_execveat",
     .pre_handler = ac_exec_pre,
 };
 static struct kprobe ac_kp_process_vm_readv = {
