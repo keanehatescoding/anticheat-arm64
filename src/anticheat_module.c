@@ -589,50 +589,91 @@ static void ac_del_prot_thread_group(struct task_struct *t)
  * rather than the specific thread that happened to be named at protect
  * time. Takes ownership of the caller's reference on `replacement` (the
  * caller must have already get_task_struct()'d it); drops the reference
- * on `old`. */
+ * on `old`.
+ *
+ * `replacement` can already own a separate registry entry of its own --
+ * e.g. an operator separately protected two TIDs of the same thread group
+ * (ac_add_prot_task() only dedupes an exact task_struct, not a thread
+ * group; see ac_task_jit_allowed()'s comment for the same root cause).
+ * Re-pointing `old`'s entry onto `replacement` in that case would leave two
+ * entries for the same exact task, each holding its own reference.
+ * AC_IOCTL_DEL_PROC's ac_del_prot_thread_group() would still clean up both
+ * together, but ac_exit_pre()'s own cleanup path uses the exact-match
+ * ac_del_prot_task(), which stops at the first entry it finds for a task --
+ * by design, so a sibling's exit can't delete a different thread's entry.
+ * If `replacement` itself later exits with two entries pointing at it,
+ * that single-match delete leaves the second one permanently dangling
+ * (stale AC_PROT_MAX slot, leaked task_struct reference). Detect the
+ * duplicate here and retire `old`'s entry outright instead: `replacement`'s
+ * own entry already keeps the group protected, so nothing is lost. */
 static void ac_replace_prot_task(struct task_struct *old,
                                   struct task_struct *replacement)
 {
     unsigned long flags;
     int i;
     bool found = false;
+    bool dup = false;
 
     spin_lock_irqsave(&ac_prot_lock, flags);
     for (i = 0; i < AC_PROT_MAX; i++) {
+        if (ac_prots[i].task == replacement) {
+            dup = true;
+            break;
+        }
+    }
+    for (i = 0; i < AC_PROT_MAX; i++) {
         if (ac_prots[i].task == old) {
             put_task_struct(old);
-            ac_prots[i].task = replacement;
-            ac_prots[i].pid = replacement->pid;
-            strscpy(ac_prots[i].comm, replacement->comm,
-                    sizeof(ac_prots[i].comm));
+            if (dup) {
+                ac_prots[i].task = NULL;
+                ac_prot_count--;
+            } else {
+                ac_prots[i].task = replacement;
+                ac_prots[i].pid = replacement->pid;
+                strscpy(ac_prots[i].comm, replacement->comm,
+                        sizeof(ac_prots[i].comm));
+            }
             found = true;
             break;
         }
     }
     spin_unlock_irqrestore(&ac_prot_lock, flags);
-    if (!found)
+    if (!found || dup)
         put_task_struct(replacement);
 }
 
 /* Fork inheritance already extends *protection* itself to children (see
  * ac_clone_ret()); mirror that for jit_allowed too, so a legitimate
  * JIT-marked process's child processes don't generate false anon-exec
- * reports just because the flag reset to false on them. */
+ * reports just because the flag reset to false on them.
+ *
+ * AC_IOCTL_ADD_PROC resolves its pid via a plain PIDTYPE_PID lookup, not
+ * necessarily the thread-group leader, and ac_add_prot_task() only dedupes
+ * an exact task_struct -- so an operator protecting two different TIDs of
+ * the same thread group with different --jit flags leaves two registry
+ * entries for one group that disagree on jit_allowed. Pick the first match
+ * would make the result depend on scan order (registration/slot-reuse
+ * history), which is exactly as arbitrary as it sounds. AND-reduce across
+ * every matching entry instead: the group is jit_allowed only if *every*
+ * entry for it agrees, so a stray non-jit registration can't be silently
+ * shadowed by an earlier jit one -- fail toward the safer (more likely to
+ * report) state rather than an arbitrary one. */
 static bool ac_task_jit_allowed(struct task_struct *t)
 {
     unsigned long flags;
     int i;
-    bool jit_allowed = false;
+    bool jit_allowed = true;
+    bool found = false;
 
     spin_lock_irqsave(&ac_prot_lock, flags);
     for (i = 0; i < AC_PROT_MAX; i++) {
-        if (ac_prots[i].task == t) {
-            jit_allowed = ac_prots[i].jit_allowed;
-            break;
+        if (ac_prots[i].task && same_thread_group(ac_prots[i].task, t)) {
+            found = true;
+            jit_allowed = jit_allowed && ac_prots[i].jit_allowed;
         }
     }
     spin_unlock_irqrestore(&ac_prot_lock, flags);
-    return jit_allowed;
+    return found && jit_allowed;
 }
 
 static bool ac_is_protected_task(struct task_struct *t)
@@ -783,8 +824,8 @@ static int ac_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
      *
      * The native (__x64_sys_ptrace) wrapper unpacks its first two
      * arguments from args->di/args->si (the x86-64 argument registers).
-     * The compat (__ia32_sys_ptrace) wrapper instead unpacks them from
-     * args->bx/args->cx, since ia32 syscall entry passes arguments in
+     * The compat (__ia32_compat_sys_ptrace) wrapper instead unpacks them
+     * from args->bx/args->cx, since ia32 syscall entry passes arguments in
      * ebx, ecx, edx, esi, edi, ebp rather than the native ABI's rdi,
      * rsi, rdx, r10, r8, r9. Reading di/si for the compat probe would
      * pick up the wrong register (ia32 arg5/arg4), silently mismatching
@@ -920,7 +961,7 @@ static int ac_clone_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 
     if (child_pid <= 0)
         return 0;
-    if (!ac_is_protected_task(current))
+    if (!ac_is_protected_thread_group(current))
         return 0;
 
     child = ac_find_task((pid_t)child_pid);
@@ -941,7 +982,19 @@ static int ac_clone_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
     }
 
     strscpy(pcomm, current->comm, sizeof(pcomm));
-    ac_add_prot_task(child, ac_task_jit_allowed(current));
+    if (ac_add_prot_task(child, ac_task_jit_allowed(current)) != 0) {
+        /* AC_PROT_MAX full (-ENOSPC): the child is NOT actually in the
+         * registry, so it must not be reported as protected -- an
+         * AC_EV_FORK "protection inherited" here would be a false claim
+         * an operator could rely on. AC_EV_INFO logs at the same LOG_INFO
+         * level AC_EV_FORK would have, so this doesn't change alerting
+         * behaviour, only the message's accuracy. */
+        ac_emit(AC_EV_INFO, child->pid, child->comm,
+                "child of protected pid %d (%s) NOT protected: registry full",
+                current->pid, pcomm);
+        put_task_struct(child);
+        return 0;
+    }
     ac_emit(AC_EV_FORK, child->pid, child->comm,
             "child of protected pid %d (%s); protection inherited",
             current->pid, pcomm);
@@ -998,7 +1051,7 @@ static int ac_exit_pre(struct kprobe *p, struct pt_regs *regs)
 
 static int ac_exec_pre(struct kprobe *p, struct pt_regs *regs)
 {
-    if (!ac_is_protected_task(current))
+    if (!ac_is_protected_thread_group(current))
         return 0;
     ac_emit(AC_EV_EXEC, current->pid, current->comm,
             "execve() invoked (path is a user pointer, not resolved)");
@@ -1010,7 +1063,13 @@ static struct kprobe ac_kp_ptrace = {
     .pre_handler = ac_ptrace_pre,
 };
 static struct kprobe ac_kp_ptrace32 = {
-    .symbol_name = "__ia32_sys_ptrace",
+    /* ptrace has a distinct COMPAT_SYSCALL_DEFINE (unlike process_vm_readv/
+     * writev below), so arch/x86/entry/syscalls/syscall_32.tbl wires the
+     * ia32 ptrace slot to the compat entry point, not the generic
+     * __ia32_sys_ptrace stub the plain SYSCALL_DEFINE also emits but that
+     * no syscall table ever references -- a kprobe there would silently
+     * never fire for a real 32-bit ptrace() call. */
+    .symbol_name = "__ia32_compat_sys_ptrace",
     .pre_handler = ac_ptrace_pre,
 };
 static struct kprobe ac_kp_exit = {
@@ -1023,6 +1082,18 @@ static struct kprobe ac_kp_execve = {
 };
 static struct kprobe ac_kp_execveat = {
     .symbol_name = "__x64_sys_execveat",
+    .pre_handler = ac_exec_pre,
+};
+static struct kprobe ac_kp_execve32 = {
+    /* Same reasoning as ac_kp_ptrace32 above: execve/execveat have distinct
+     * COMPAT_SYSCALL_DEFINEs, so the ia32 syscall table entries resolve to
+     * __ia32_compat_sys_execve[at], not the unused generic __ia32_sys_*
+     * stub. */
+    .symbol_name = "__ia32_compat_sys_execve",
+    .pre_handler = ac_exec_pre,
+};
+static struct kprobe ac_kp_execveat32 = {
+    .symbol_name = "__ia32_compat_sys_execveat",
     .pre_handler = ac_exec_pre,
 };
 static struct kprobe ac_kp_process_vm_readv = {
@@ -1045,6 +1116,7 @@ static struct kprobe ac_kp_process_vm_writev32 = {
 static struct kprobe *ac_kprobes[] = {
     &ac_kp_ptrace, &ac_kp_ptrace32,
     &ac_kp_exit, &ac_kp_execve, &ac_kp_execveat,
+    &ac_kp_execve32, &ac_kp_execveat32,
     &ac_kp_process_vm_readv, &ac_kp_process_vm_readv32,
     &ac_kp_process_vm_writev, &ac_kp_process_vm_writev32,
 };

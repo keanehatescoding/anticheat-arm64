@@ -67,7 +67,13 @@ userspace daemon/CLI that talks to it over a small ioctl interface
    process's memory, and the same kill policy applies.
 
 5. **Fork / exec / exit tracing.** kretprobe on `kernel_clone` (inheritance +
-   events), kprobe pre-handlers on `do_exit` and `__x64_sys_execve[at]`.
+   events), kprobe pre-handlers on `do_exit` and `__x64_sys_execve[at]`/
+   `__ia32_compat_sys_execve[at]` (execve/execveat have distinct compat
+   syscall definitions, so the ia32 syscall table entry is the compat
+   wrapper, not the generic ia32 stub). Fork inheritance and exec tracing
+   key off thread-group membership, not the exact registered `task_struct`,
+   so a worker thread of a protected process that calls `fork()`/`execve()`
+   is covered too.
 
 6. **VMA memory scan.** A snapshot of the process address space is built
    under the mmap read lock (maple-tree iterator) and served to userspace
@@ -939,8 +945,9 @@ design).
   device as root, drops all privileges on the same process while keeping
   the fd open, and confirms the next ioctl is rejected with `-EPERM`
   (`sudo ./test.sh` runs it as part of the live suite).
-- ptrace denial works on the standard `__x64_sys_ptrace` / `__ia32_sys_ptrace`
-  entries; `process_vm_readv`/`process_vm_writev` are covered too, via their
+- ptrace denial works on the standard `__x64_sys_ptrace` /
+  `__ia32_compat_sys_ptrace` entries; `process_vm_readv`/`process_vm_writev`
+  are covered too, via their
   own native/ia32 kprobes (see "ptrace denial" above). A cheat reaching
   process memory through some other kernel path entirely (not `ptrace(2)`
   or `process_vm_{read,write}v`) is still out of scope for v1.
