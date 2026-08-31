@@ -67,7 +67,11 @@ userspace daemon/CLI that talks to it over a small ioctl interface
    process's memory, and the same kill policy applies.
 
 5. **Fork / exec / exit tracing.** kretprobe on `kernel_clone` (inheritance +
-   events), kprobe pre-handlers on `do_exit` and `__x64_sys_execve[at]`.
+   events), kprobe pre-handlers on `do_exit` and `__x64_sys_execve[at]`/
+   `__ia32_sys_execve[at]`. Fork inheritance and exec tracing key off thread-
+   group membership, not the exact registered `task_struct`, so a worker
+   thread of a protected process that calls `fork()`/`execve()` is covered
+   too.
 
 6. **VMA memory scan.** A snapshot of the process address space is built
    under the mmap read lock (maple-tree iterator) and served to userspace

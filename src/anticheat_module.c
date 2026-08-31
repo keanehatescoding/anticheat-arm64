@@ -626,7 +626,7 @@ static bool ac_task_jit_allowed(struct task_struct *t)
 
     spin_lock_irqsave(&ac_prot_lock, flags);
     for (i = 0; i < AC_PROT_MAX; i++) {
-        if (ac_prots[i].task == t) {
+        if (ac_prots[i].task && same_thread_group(ac_prots[i].task, t)) {
             jit_allowed = ac_prots[i].jit_allowed;
             break;
         }
@@ -920,7 +920,7 @@ static int ac_clone_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 
     if (child_pid <= 0)
         return 0;
-    if (!ac_is_protected_task(current))
+    if (!ac_is_protected_thread_group(current))
         return 0;
 
     child = ac_find_task((pid_t)child_pid);
@@ -998,7 +998,7 @@ static int ac_exit_pre(struct kprobe *p, struct pt_regs *regs)
 
 static int ac_exec_pre(struct kprobe *p, struct pt_regs *regs)
 {
-    if (!ac_is_protected_task(current))
+    if (!ac_is_protected_thread_group(current))
         return 0;
     ac_emit(AC_EV_EXEC, current->pid, current->comm,
             "execve() invoked (path is a user pointer, not resolved)");
@@ -1025,6 +1025,14 @@ static struct kprobe ac_kp_execveat = {
     .symbol_name = "__x64_sys_execveat",
     .pre_handler = ac_exec_pre,
 };
+static struct kprobe ac_kp_execve32 = {
+    .symbol_name = "__ia32_sys_execve",
+    .pre_handler = ac_exec_pre,
+};
+static struct kprobe ac_kp_execveat32 = {
+    .symbol_name = "__ia32_sys_execveat",
+    .pre_handler = ac_exec_pre,
+};
 static struct kprobe ac_kp_process_vm_readv = {
     .symbol_name = "__x64_sys_process_vm_readv",
     .pre_handler = ac_process_vm_pre,
@@ -1045,6 +1053,7 @@ static struct kprobe ac_kp_process_vm_writev32 = {
 static struct kprobe *ac_kprobes[] = {
     &ac_kp_ptrace, &ac_kp_ptrace32,
     &ac_kp_exit, &ac_kp_execve, &ac_kp_execveat,
+    &ac_kp_execve32, &ac_kp_execveat32,
     &ac_kp_process_vm_readv, &ac_kp_process_vm_readv32,
     &ac_kp_process_vm_writev, &ac_kp_process_vm_writev32,
 };
