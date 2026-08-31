@@ -589,28 +589,56 @@ static void ac_del_prot_thread_group(struct task_struct *t)
  * rather than the specific thread that happened to be named at protect
  * time. Takes ownership of the caller's reference on `replacement` (the
  * caller must have already get_task_struct()'d it); drops the reference
- * on `old`. */
+ * on `old`.
+ *
+ * `replacement` can already own a separate registry entry of its own --
+ * e.g. an operator separately protected two TIDs of the same thread group
+ * (ac_add_prot_task() only dedupes an exact task_struct, not a thread
+ * group; see ac_task_jit_allowed()'s comment for the same root cause).
+ * Re-pointing `old`'s entry onto `replacement` in that case would leave two
+ * entries for the same exact task, each holding its own reference.
+ * AC_IOCTL_DEL_PROC's ac_del_prot_thread_group() would still clean up both
+ * together, but ac_exit_pre()'s own cleanup path uses the exact-match
+ * ac_del_prot_task(), which stops at the first entry it finds for a task --
+ * by design, so a sibling's exit can't delete a different thread's entry.
+ * If `replacement` itself later exits with two entries pointing at it,
+ * that single-match delete leaves the second one permanently dangling
+ * (stale AC_PROT_MAX slot, leaked task_struct reference). Detect the
+ * duplicate here and retire `old`'s entry outright instead: `replacement`'s
+ * own entry already keeps the group protected, so nothing is lost. */
 static void ac_replace_prot_task(struct task_struct *old,
                                   struct task_struct *replacement)
 {
     unsigned long flags;
     int i;
     bool found = false;
+    bool dup = false;
 
     spin_lock_irqsave(&ac_prot_lock, flags);
     for (i = 0; i < AC_PROT_MAX; i++) {
+        if (ac_prots[i].task == replacement) {
+            dup = true;
+            break;
+        }
+    }
+    for (i = 0; i < AC_PROT_MAX; i++) {
         if (ac_prots[i].task == old) {
             put_task_struct(old);
-            ac_prots[i].task = replacement;
-            ac_prots[i].pid = replacement->pid;
-            strscpy(ac_prots[i].comm, replacement->comm,
-                    sizeof(ac_prots[i].comm));
+            if (dup) {
+                ac_prots[i].task = NULL;
+                ac_prot_count--;
+            } else {
+                ac_prots[i].task = replacement;
+                ac_prots[i].pid = replacement->pid;
+                strscpy(ac_prots[i].comm, replacement->comm,
+                        sizeof(ac_prots[i].comm));
+            }
             found = true;
             break;
         }
     }
     spin_unlock_irqrestore(&ac_prot_lock, flags);
-    if (!found)
+    if (!found || dup)
         put_task_struct(replacement);
 }
 
@@ -954,7 +982,19 @@ static int ac_clone_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
     }
 
     strscpy(pcomm, current->comm, sizeof(pcomm));
-    ac_add_prot_task(child, ac_task_jit_allowed(current));
+    if (ac_add_prot_task(child, ac_task_jit_allowed(current)) != 0) {
+        /* AC_PROT_MAX full (-ENOSPC): the child is NOT actually in the
+         * registry, so it must not be reported as protected -- an
+         * AC_EV_FORK "protection inherited" here would be a false claim
+         * an operator could rely on. AC_EV_INFO logs at the same LOG_INFO
+         * level AC_EV_FORK would have, so this doesn't change alerting
+         * behaviour, only the message's accuracy. */
+        ac_emit(AC_EV_INFO, child->pid, child->comm,
+                "child of protected pid %d (%s) NOT protected: registry full",
+                current->pid, pcomm);
+        put_task_struct(child);
+        return 0;
+    }
     ac_emit(AC_EV_FORK, child->pid, child->comm,
             "child of protected pid %d (%s); protection inherited",
             current->pid, pcomm);
