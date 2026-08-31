@@ -617,22 +617,35 @@ static void ac_replace_prot_task(struct task_struct *old,
 /* Fork inheritance already extends *protection* itself to children (see
  * ac_clone_ret()); mirror that for jit_allowed too, so a legitimate
  * JIT-marked process's child processes don't generate false anon-exec
- * reports just because the flag reset to false on them. */
+ * reports just because the flag reset to false on them.
+ *
+ * AC_IOCTL_ADD_PROC resolves its pid via a plain PIDTYPE_PID lookup, not
+ * necessarily the thread-group leader, and ac_add_prot_task() only dedupes
+ * an exact task_struct -- so an operator protecting two different TIDs of
+ * the same thread group with different --jit flags leaves two registry
+ * entries for one group that disagree on jit_allowed. Pick the first match
+ * would make the result depend on scan order (registration/slot-reuse
+ * history), which is exactly as arbitrary as it sounds. AND-reduce across
+ * every matching entry instead: the group is jit_allowed only if *every*
+ * entry for it agrees, so a stray non-jit registration can't be silently
+ * shadowed by an earlier jit one -- fail toward the safer (more likely to
+ * report) state rather than an arbitrary one. */
 static bool ac_task_jit_allowed(struct task_struct *t)
 {
     unsigned long flags;
     int i;
-    bool jit_allowed = false;
+    bool jit_allowed = true;
+    bool found = false;
 
     spin_lock_irqsave(&ac_prot_lock, flags);
     for (i = 0; i < AC_PROT_MAX; i++) {
         if (ac_prots[i].task && same_thread_group(ac_prots[i].task, t)) {
-            jit_allowed = ac_prots[i].jit_allowed;
-            break;
+            found = true;
+            jit_allowed = jit_allowed && ac_prots[i].jit_allowed;
         }
     }
     spin_unlock_irqrestore(&ac_prot_lock, flags);
-    return jit_allowed;
+    return found && jit_allowed;
 }
 
 static bool ac_is_protected_task(struct task_struct *t)
