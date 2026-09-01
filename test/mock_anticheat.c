@@ -299,6 +299,9 @@ static int do_ioctl(unsigned long req, void *arg)
         unsigned int i;
 
         do_scan(b->pid);
+        /* Mock has no real pid-namespace resolution -- mirror the input
+         * pid, same as the real module's ref_pid<=0 (default) case. */
+        b->resolved_pid = b->pid;
         b->n_vmas = snap_n;
         b->rwx_count = 0;
         b->exec_count = 0;

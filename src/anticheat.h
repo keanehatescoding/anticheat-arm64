@@ -132,6 +132,13 @@ struct ac_scan_begin {
                                   * ref_pid lives in (see --ns-of), same
                                   * semantics as ac_proc_id.ref_pid. */
     int          emit_events;   /* 1 = also push AC_EV_RWX events */
+    int          resolved_pid;  /* out: `pid` as seen in the *caller's*
+                                  * (host) pid namespace -- identical to
+                                  * `pid` when ref_pid was <=0, otherwise
+                                  * the host pid the ns-of lookup landed
+                                  * on. Use this, not the input `pid`, for
+                                  * any /proc/<pid>/... access on the host
+                                  * side after a namespace-relative scan. */
     unsigned int n_vmas;        /* out */
     unsigned int rwx_count;     /* out */
     unsigned int exec_count;    /* out */

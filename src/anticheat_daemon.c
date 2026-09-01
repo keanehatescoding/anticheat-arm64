@@ -272,13 +272,19 @@ static int cmd_protect(int argc, char **argv)
     const char *comm = NULL;
 
     for (i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc)
+        if (strcmp(argv[i], "--pid") == 0) {
+            if (i + 1 >= argc)
+                die("usage: --pid requires a value");
             pid = ac_parse_pid(argv[++i], "--pid");
-        else if (strcmp(argv[i], "--comm") == 0 && i + 1 < argc)
+        } else if (strcmp(argv[i], "--comm") == 0) {
+            if (i + 1 >= argc)
+                die("usage: --comm requires a value");
             comm = argv[++i];
-        else if (strcmp(argv[i], "--ns-of") == 0 && i + 1 < argc)
+        } else if (strcmp(argv[i], "--ns-of") == 0) {
+            if (i + 1 >= argc)
+                die("usage: --ns-of requires a value");
             ref_pid = ac_parse_pid(argv[++i], "--ns-of");
-        else if (strcmp(argv[i], "--jit") == 0)
+        } else if (strcmp(argv[i], "--jit") == 0)
             jit = 1;
     }
     if (pid < 0 && !comm)
@@ -343,10 +349,15 @@ static int cmd_unprotect(int argc, char **argv)
     int pid = -1, ref_pid = -1, i;
 
     for (i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc)
+        if (strcmp(argv[i], "--pid") == 0) {
+            if (i + 1 >= argc)
+                die("usage: --pid requires a value");
             pid = ac_parse_pid(argv[++i], "--pid");
-        else if (strcmp(argv[i], "--ns-of") == 0 && i + 1 < argc)
+        } else if (strcmp(argv[i], "--ns-of") == 0) {
+            if (i + 1 >= argc)
+                die("usage: --ns-of requires a value");
             ref_pid = ac_parse_pid(argv[++i], "--ns-of");
+        }
     }
     if (pid < 0)
         die("usage: anticheat unprotect --pid N [--ns-of REFPID]");
@@ -1062,7 +1073,7 @@ static int check_implicit_layers(int pid);
 static int cmd_scan(int argc, char **argv)
 {
     struct ac_scan_begin b;
-    int pid = -1, ref_pid = -1, i;
+    int pid = -1, ref_pid = -1, host_pid, i;
     int do_hash = 0, do_save = 0, do_check = 0, do_hooks = 0, do_preload = 0;
     int do_vklayers = 0, do_implicit = 0;
     char exe[PATH_MAX] = "";
@@ -1071,11 +1082,15 @@ static int cmd_scan(int argc, char **argv)
     int mem_fd = -1;
 
     for (i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc)
+        if (strcmp(argv[i], "--pid") == 0) {
+            if (i + 1 >= argc)
+                die("usage: --pid requires a value");
             pid = ac_parse_pid(argv[++i], "--pid");
-        else if (strcmp(argv[i], "--ns-of") == 0 && i + 1 < argc)
+        } else if (strcmp(argv[i], "--ns-of") == 0) {
+            if (i + 1 >= argc)
+                die("usage: --ns-of requires a value");
             ref_pid = ac_parse_pid(argv[++i], "--ns-of");
-        else if (strcmp(argv[i], "--hash") == 0)
+        } else if (strcmp(argv[i], "--hash") == 0)
             do_hash = 1;
         else if (strcmp(argv[i], "--save") == 0)
             do_save = 1;
@@ -1103,6 +1118,12 @@ static int cmd_scan(int argc, char **argv)
     if (ioctl_ok(AC_IOCTL_SCAN_BEGIN, &b) < 0)
         return 1;
 
+    /* b.resolved_pid, not `pid`, for every /proc/<pid>/... access below:
+     * with --ns-of, `pid` is namespace-relative and doesn't name anything
+     * in the daemon's (host) /proc at all. Equal to `pid` when --ns-of
+     * wasn't given. */
+    host_pid = b.resolved_pid;
+
     printf("scan of pid %d: %u VMA(s), %u executable, %u RWX, %u anon-exec\n",
            pid, b.n_vmas, b.exec_count, b.rwx_count, b.anon_exec_count);
     if (b.anon_exec_count)
@@ -1115,14 +1136,14 @@ static int cmd_scan(int argc, char **argv)
     if (do_hash) {
         char mem_path[64];
 
-        exe_link = proc_exe_path(pid);
+        exe_link = proc_exe_path(host_pid);
         if (exe_link)
             snprintf(exe, sizeof(exe), "%s", exe_link);
 
         /* Opened once here rather than once per VMA inside the loop
          * below: a process can have many executable file-backed VMAs,
          * and they all read through the same /proc/<pid>/mem fd. */
-        snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem", pid);
+        snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem", host_pid);
         mem_fd = open(mem_path, O_RDONLY);
         if (mem_fd < 0)
             fprintf(stderr, "cannot open %s: %s\n", mem_path, strerror(errno));
@@ -1213,16 +1234,16 @@ static int cmd_scan(int argc, char **argv)
         close(mem_fd);
 
     if (do_hooks)
-        check_render_hooks(pid);
+        check_render_hooks(host_pid);
 
     if (do_preload)
-        check_ld_preload(pid);
+        check_ld_preload(host_pid);
 
     if (do_vklayers)
-        check_vk_layer_env(pid);
+        check_vk_layer_env(host_pid);
 
     if (do_implicit)
-        check_implicit_layers(pid);
+        check_implicit_layers(host_pid);
 
     ac_close();
     return 0;
