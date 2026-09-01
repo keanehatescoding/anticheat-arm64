@@ -3046,6 +3046,42 @@ static void ac_report_client_id(char *out, size_t outsz)
     snprintf(out, outsz, "unknown");
 }
 
+/* Strict HTTP status-line parser: "HTTP/<major>.<minor> <code> <reason>",
+ * where <code> must be exactly three decimal digits. sscanf()'s "%d"
+ * would also accept a leading sign or extra digits -- e.g. a malformed
+ * "HTTP/1.1 +200 OK" is not a valid status line, but "%d" happily parses
+ * it as a real 200 and reports success anyway. Returns the parsed code,
+ * or -1 if resp isn't a well-formed status line (fails closed: -1 is
+ * never inside the accepted 2xx range). */
+static int ac_http_status_code(const char *resp)
+{
+    const char *p = resp;
+
+    if (strncmp(p, "HTTP/", 5) != 0)
+        return -1;
+    p += 5;
+    if (!isdigit((unsigned char)*p))
+        return -1;
+    while (isdigit((unsigned char)*p))
+        p++;
+    if (*p != '.')
+        return -1;
+    p++;
+    if (!isdigit((unsigned char)*p))
+        return -1;
+    while (isdigit((unsigned char)*p))
+        p++;
+    if (*p != ' ')
+        return -1;
+    p++;
+    if (!isdigit((unsigned char)p[0]) || !isdigit((unsigned char)p[1]) ||
+        !isdigit((unsigned char)p[2]))
+        return -1;
+    if (isdigit((unsigned char)p[3]))
+        return -1;   /* more than three digits -- not a valid status code */
+    return (p[0] - '0') * 100 + (p[1] - '0') * 10 + (p[2] - '0');
+}
+
 static void ac_report(const char *event_type, const char *detail)
 {
     const char *url = getenv("AC_REPORT_URL");
@@ -3167,18 +3203,15 @@ static void ac_report(const char *event_type, const char *detail)
     }
     n = read(fd, resp, sizeof(resp) - 1);
     if (n > 0) {
-        int code = -1;
+        int code;
 
         resp[n] = '\0';
-        /* Parse the numeric status code from the status line
-         * ("HTTP/1.x <code> <reason>") only -- scanning the whole raw
-         * response for " 200"/" 201" as substrings would also match
-         * those digits inside a header value (e.g. "Content-Length:
-         * 200") on an actual error response and misreport a failed
-         * delivery as successful. sscanf() leaves code at -1, which
-         * fails closed, if the response doesn't even start with a
-         * well-formed status line. */
-        sscanf(resp, "HTTP/%*d.%*d %d", &code);
+        /* Parse the numeric status code from the status line only --
+         * scanning the whole raw response for " 200"/" 201" as
+         * substrings would also match those digits inside a header
+         * value (e.g. "Content-Length: 200") on an actual error
+         * response and misreport a failed delivery as successful. */
+        code = ac_http_status_code(resp);
         if (code < 200 || code >= 300)
             fprintf(stderr, "ac_report: server response status %d: %.60s\n",
                     code, resp);
