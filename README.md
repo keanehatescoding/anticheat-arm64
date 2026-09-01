@@ -164,11 +164,15 @@ unrecognized-layer count for a pid, same baseline-delta design as
 anon-exec detection above. Alerts go to syslog (`LOG_AUTH`) and
 `/var/log/anticheat.log`.
 
-Baselines are stored in `/var/lib/anticheat/baselines/` (one SHA-256 per
-file-backed executable mapping; override the directory with the
-`AC_BASELINE_DIR` environment variable). `--check` reports mappings whose
-runtime content differs from the baseline — a strong signal of runtime code
-patching.
+Baselines are stored in `/var/lib/anticheat/baselines/` (one file per path,
+named by a SHA-256 of the path; override the directory with the
+`AC_BASELINE_DIR` environment variable). Within that file, each
+file-backed executable mapping gets its own record, keyed by
+`(inode, file offset)` rather than path alone — a library with more than
+one executable `PT_LOAD` segment gets one independently-tracked record per
+segment instead of the last `--save` silently overwriting the others.
+`--check` reports mappings whose runtime content differs from their
+segment's baseline — a strong signal of runtime code patching.
 
 ### Render-hook detection (Vulkan + GLX/OpenGL + EGL present-call)
 

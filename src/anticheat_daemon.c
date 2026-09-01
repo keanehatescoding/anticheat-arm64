@@ -527,6 +527,85 @@ static void baseline_path_for(const char *path, char out[PATH_MAX])
     snprintf(out, PATH_MAX, "%s/%s.txt", ac_baseline_dir(), hex);
 }
 
+/* One baseline file per path (see baseline_path_for()) can hold multiple
+ * records: a shared library with more than one executable PT_LOAD segment
+ * maps as several distinct file-backed VMAs of the same path, each at its
+ * own file offset. Keying/matching on (inode, offset) rather than path
+ * alone -- and appending instead of truncating on --save -- keeps every
+ * segment's baseline independent instead of the last --save silently
+ * overwriting the others (#51). inode is redundant with the path hash in
+ * the filename but is cheap to double check and free from path/rename
+ * ambiguity within a single file's records. */
+#define AC_BASELINE_MAX_RECORDS 256
+
+struct ac_baseline_rec {
+    unsigned long long inode;
+    unsigned long long offset;
+    unsigned long long size;
+    char hex[65];
+};
+
+static int baseline_load_records(const char *blpath, struct ac_baseline_rec *out)
+{
+    FILE *f = fopen(blpath, "r");
+    char line[512];
+    int n = 0;
+
+    if (!f)
+        return 0;
+    while (n < AC_BASELINE_MAX_RECORDS && fgets(line, sizeof(line), f)) {
+        struct ac_baseline_rec *r = &out[n];
+
+        if (sscanf(line, "%llx %llx %llx %64s",
+                   &r->inode, &r->offset, &r->size, r->hex) == 4)
+            n++;
+    }
+    fclose(f);
+    return n;
+}
+
+static int baseline_find_record(const struct ac_baseline_rec *recs, int n,
+                                 unsigned long long inode, unsigned long long offset,
+                                 char hex_out[65])
+{
+    int i;
+
+    for (i = 0; i < n; i++) {
+        if (recs[i].inode == inode && recs[i].offset == offset) {
+            snprintf(hex_out, 65, "%s", recs[i].hex);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Replaces this (inode, offset) segment's record in place, leaving every
+ * other segment's record already saved for this path untouched. */
+static int baseline_save_record(const char *blpath, unsigned long long inode,
+                                 unsigned long long offset, unsigned long long size,
+                                 const char *hex)
+{
+    struct ac_baseline_rec recs[AC_BASELINE_MAX_RECORDS];
+    int n = baseline_load_records(blpath, recs);
+    int i, kept = 0;
+    FILE *f;
+
+    for (i = 0; i < n; i++)
+        if (recs[i].inode != inode || recs[i].offset != offset)
+            recs[kept++] = recs[i];
+
+    f = fopen(blpath, "w");
+    if (!f)
+        return -1;
+    for (i = 0; i < kept; i++)
+        fprintf(f, "%llx %llx %llx %s\n", recs[i].inode, recs[i].offset,
+                recs[i].size, recs[i].hex);
+    if (kept < AC_BASELINE_MAX_RECORDS)
+        fprintf(f, "%llx %llx %llx %s\n", inode, offset, size, hex);
+    fclose(f);
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* render-hook detection (frame-present-call inline-hook check)        */
 /*                                                                      */
@@ -1175,10 +1254,8 @@ static int cmd_scan(int argc, char **argv)
                    vi->start, vi->end, vi->path[0] ? vi->path : "(anonymous)");
 
         if (do_hash && (vi->flags & AC_VM_EXEC) && vi->is_file) {
-            char hex[65], blpath[PATH_MAX], line[512];
+            char hex[65], blpath[PATH_MAX];
             uint64_t size;
-            FILE *f;
-            int changed = 0;
 
             size = vi->end - vi->start;
             if (size > AC_HASH_CAP)
@@ -1188,40 +1265,29 @@ static int cmd_scan(int argc, char **argv)
                 continue;
             }
             baseline_path_for(vi->path, blpath);
-            printf("  %s [%#llx..%#llx] %s\n",
-                   vi->path, vi->start, vi->start + size, hex);
+            printf("  %s [%#llx..%#llx] (offset %#llx) %s\n",
+                   vi->path, vi->start, vi->start + size, vi->offset, hex);
 
             if (do_save) {
                 ac_mkdir_baselines();
-                f = fopen(blpath, "w");
-                if (!f) {
+                if (baseline_save_record(blpath, vi->inode, vi->offset,
+                                          size, hex) < 0)
                     fprintf(stderr, "cannot write baseline %s: %s\n",
                             blpath, strerror(errno));
-                    continue;
-                }
-                fprintf(f, "%llx %llx %s\n",
-                        (unsigned long long)vi->start,
-                        (unsigned long long)size, hex);
-                fclose(f);
-                printf("    baseline saved: %s\n", blpath);
+                else
+                    printf("    baseline saved: %s\n", blpath);
             }
             if (do_check) {
-                f = fopen(blpath, "r");
-                if (!f) {
-                    printf("    no baseline for %s (run with --save first)\n",
-                           vi->path);
+                struct ac_baseline_rec recs[AC_BASELINE_MAX_RECORDS];
+                char bhex[65];
+                int n = baseline_load_records(blpath, recs);
+
+                if (!baseline_find_record(recs, n, vi->inode, vi->offset, bhex)) {
+                    printf("    no baseline for %s at offset %#llx"
+                           " (run with --save first)\n", vi->path, vi->offset);
                     continue;
                 }
-                if (fgets(line, sizeof(line), f)) {
-                    unsigned long long bs, bsz;
-                    char bhex[65];
-                    if (sscanf(line, "%llx %llx %64s", &bs, &bsz, bhex) == 3) {
-                        if (strcmp(bhex, hex) != 0)
-                            changed = 1;
-                    }
-                }
-                fclose(f);
-                if (changed)
+                if (strcmp(bhex, hex) != 0)
                     printf("    [ALERT] memory content differs from baseline"
                            " (possible runtime patching)\n");
                 else
@@ -2500,10 +2566,10 @@ static int check_baselines_periodic(void)
         for (v = 0; v < b.n_vmas; v++) {
             struct ac_scan_get g;
             struct ac_vma_info *vi;
-            char blpath[PATH_MAX], line[512], hex[65], bhex[65];
-            unsigned long long bs, bsz;
+            char blpath[PATH_MAX], hex[65], bhex[65];
+            struct ac_baseline_rec recs[AC_BASELINE_MAX_RECORDS];
             uint64_t size;
-            FILE *f;
+            int n;
 
             memset(&g, 0, sizeof(g));
             g.pid = pl.items[i].pid;
@@ -2515,16 +2581,9 @@ static int check_baselines_periodic(void)
                 continue;
 
             baseline_path_for(vi->path, blpath);
-            f = fopen(blpath, "r");
-            if (!f)
-                continue; /* nothing saved for this file -- nothing to check */
-            if (!fgets(line, sizeof(line), f)) {
-                fclose(f);
-                continue;
-            }
-            fclose(f);
-            if (sscanf(line, "%llx %llx %64s", &bs, &bsz, bhex) != 3)
-                continue;
+            n = baseline_load_records(blpath, recs);
+            if (!baseline_find_record(recs, n, vi->inode, vi->offset, bhex))
+                continue; /* nothing saved for this segment -- nothing to check */
 
             /* Opened lazily on the first VMA that actually has a saved
              * baseline, and reused for the rest of this pid's VMAs --
