@@ -3167,9 +3167,21 @@ static void ac_report(const char *event_type, const char *detail)
     }
     n = read(fd, resp, sizeof(resp) - 1);
     if (n > 0) {
+        int code = -1;
+
         resp[n] = '\0';
-        if (!strstr(resp, " 200") && !strstr(resp, " 201"))
-            fprintf(stderr, "ac_report: server response: %.60s\n", resp);
+        /* Parse the numeric status code from the status line
+         * ("HTTP/1.x <code> <reason>") only -- scanning the whole raw
+         * response for " 200"/" 201" as substrings would also match
+         * those digits inside a header value (e.g. "Content-Length:
+         * 200") on an actual error response and misreport a failed
+         * delivery as successful. sscanf() leaves code at -1, which
+         * fails closed, if the response doesn't even start with a
+         * well-formed status line. */
+        sscanf(resp, "HTTP/%*d.%*d %d", &code);
+        if (code < 200 || code >= 300)
+            fprintf(stderr, "ac_report: server response status %d: %.60s\n",
+                    code, resp);
     }
     close(fd);
 }
