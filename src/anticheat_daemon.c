@@ -60,6 +60,7 @@
 #include <netdb.h>
 #include <poll.h>
 #include <pwd.h>
+#include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -628,35 +629,118 @@ static int baseline_find_record(const struct ac_baseline_rec *recs, int n,
     return 0;
 }
 
+/* baseline_save_record()'s "file already holds AC_BASELINE_MAX_RECORDS
+ * *other* segments' records" case -- distinct from a plain I/O failure
+ * (errno-bearing, return -1) so cmd_scan can tell the operator what
+ * actually happened instead of a generic "cannot write baseline". */
+#define AC_BASELINE_SAVE_FULL (-2)
+
 /* Replaces this (inode, offset, size) segment's record in place, leaving
  * every other segment's record already saved for this path untouched --
  * including one at the same (inode, offset) but a different size, since
  * two distinct file-backed VMAs can legitimately share a starting file
  * offset while covering different lengths (e.g. the same region mapped
- * twice at different addresses). */
+ * twice at different addresses).
+ *
+ * The whole read-modify-write is done under an flock() held on blpath
+ * itself, and written out via a same-directory temp file + rename()
+ * rather than truncating blpath in place: without the lock, two
+ * concurrent `scan --hash --save` runs against the same path (e.g. two
+ * segments of one library scanned back to back mid-race) could each
+ * load the same old contents and have the second's rename silently
+ * discard the first's new record; without the temp file, a write error
+ * or a process killed mid-fprintf() loop leaves blpath truncated with
+ * only some of the previously-valid records rewritten -- exactly the
+ * kind of silent baseline-coverage loss this file exists to prevent
+ * (#51). rename() within the same directory is atomic, so a reader
+ * (baseline_load_records()) never observes a half-written file. */
 static int baseline_save_record(const char *blpath, unsigned long long inode,
                                  unsigned long long offset, unsigned long long size,
                                  const char *hex)
 {
     struct ac_baseline_rec recs[AC_BASELINE_MAX_RECORDS];
-    int n = baseline_load_records(blpath, recs, NULL);
-    int i, kept = 0;
+    char tmp_path[PATH_MAX];
+    int i, kept = 0, n, lock_fd, tmp_fd, saved_errno;
     FILE *f;
 
+    lock_fd = open(blpath, O_RDWR | O_CREAT, 0644);
+    if (lock_fd < 0)
+        return -1;
+    if (flock(lock_fd, LOCK_EX) < 0) {
+        saved_errno = errno;
+        close(lock_fd);
+        errno = saved_errno;
+        return -1;
+    }
+
+    n = baseline_load_records(blpath, recs, NULL);
     for (i = 0; i < n; i++)
         if (recs[i].inode != inode || recs[i].offset != offset ||
             recs[i].size != size)
             recs[kept++] = recs[i];
 
-    f = fopen(blpath, "w");
-    if (!f)
+    if (kept == AC_BASELINE_MAX_RECORDS) {
+        /* Every slot already belongs to some other segment of this same
+         * path -- there's no room for this one without dropping one of
+         * them. Fail loudly rather than quietly writing back the same
+         * `kept` records and claiming success while this segment ends
+         * up with no baseline at all. */
+        flock(lock_fd, LOCK_UN);
+        close(lock_fd);
+        return AC_BASELINE_SAVE_FULL;
+    }
+
+    if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmpXXXXXX", blpath) >=
+        (int)sizeof(tmp_path)) {
+        flock(lock_fd, LOCK_UN);
+        close(lock_fd);
+        errno = ENAMETOOLONG;
         return -1;
+    }
+    tmp_fd = mkstemp(tmp_path);
+    if (tmp_fd < 0) {
+        saved_errno = errno;
+        flock(lock_fd, LOCK_UN);
+        close(lock_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    fchmod(tmp_fd, 0644);
+    f = fdopen(tmp_fd, "w");
+    if (!f) {
+        saved_errno = errno;
+        close(tmp_fd);
+        unlink(tmp_path);
+        flock(lock_fd, LOCK_UN);
+        close(lock_fd);
+        errno = saved_errno;
+        return -1;
+    }
+
     for (i = 0; i < kept; i++)
         fprintf(f, "%llx %llx %llx %s\n", recs[i].inode, recs[i].offset,
                 recs[i].size, recs[i].hex);
-    if (kept < AC_BASELINE_MAX_RECORDS)
-        fprintf(f, "%llx %llx %llx %s\n", inode, offset, size, hex);
-    fclose(f);
+    fprintf(f, "%llx %llx %llx %s\n", inode, offset, size, hex);
+
+    if (fflush(f) != 0 || fsync(tmp_fd) != 0 || fclose(f) != 0) {
+        saved_errno = errno;
+        unlink(tmp_path);
+        flock(lock_fd, LOCK_UN);
+        close(lock_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    if (rename(tmp_path, blpath) < 0) {
+        saved_errno = errno;
+        unlink(tmp_path);
+        flock(lock_fd, LOCK_UN);
+        close(lock_fd);
+        errno = saved_errno;
+        return -1;
+    }
+
+    flock(lock_fd, LOCK_UN);
+    close(lock_fd);
     return 0;
 }
 
@@ -1323,9 +1407,16 @@ static int cmd_scan(int argc, char **argv)
                    vi->path, vi->start, vi->start + size, vi->offset, hex);
 
             if (do_save) {
+                int rc;
+
                 ac_mkdir_baselines();
-                if (baseline_save_record(blpath, vi->inode, vi->offset,
-                                          size, hex) < 0)
+                rc = baseline_save_record(blpath, vi->inode, vi->offset,
+                                           size, hex);
+                if (rc == AC_BASELINE_SAVE_FULL)
+                    fprintf(stderr, "cannot save baseline for %s: %s already"
+                            " holds the maximum %d segment records\n",
+                            vi->path, blpath, AC_BASELINE_MAX_RECORDS);
+                else if (rc < 0)
                     fprintf(stderr, "cannot write baseline %s: %s\n",
                             blpath, strerror(errno));
                 else

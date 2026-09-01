@@ -19,6 +19,13 @@
  *     apart from "nothing saved", so callers can point the operator at
  *     re-running --save instead of reporting it identically to "never
  *     baselined".
+ *   - baseline_save_record() must fail loudly (AC_BASELINE_SAVE_FULL)
+ *     rather than silently no-op when the file already holds
+ *     AC_BASELINE_MAX_RECORDS *other* segments' records.
+ *   - baseline_save_record()'s read-modify-write must actually land: a
+ *     successful call must be immediately visible to a fresh
+ *     baseline_load_records() (covers the atomic-rename path, though
+ *     not the concurrent-writer locking itself).
  *
  * Pulls anticheat_daemon.c in as-is (renaming its main() out of the way)
  * rather than re-implementing the record format, so this test breaks if
@@ -49,7 +56,7 @@ int main(void)
     char blpath[PATH_MAX];
     struct ac_baseline_rec recs[AC_BASELINE_MAX_RECORDS];
     char hex[65];
-    int n, legacy, size_mismatch;
+    int n, i, legacy, size_mismatch;
 
     if (!mkdtemp(tmpdir)) {
         perror("mkdtemp");
@@ -155,6 +162,38 @@ int main(void)
         n = baseline_load_records(legacy_path, recs, &legacy);
         CHECK(n == 0, "a legacy 3-field line yields no usable records");
         CHECK(legacy, "a legacy 3-field line is flagged via out_legacy");
+    }
+
+    /* A file already holding AC_BASELINE_MAX_RECORDS *other* segments'
+     * records must fail a save for one more, rather than silently
+     * dropping it while still reporting success. */
+    {
+        char full_path[PATH_MAX];
+        int rc;
+
+        baseline_path_for("/usr/lib/libfull.so", full_path);
+        for (i = 0; i < AC_BASELINE_MAX_RECORDS; i++) {
+            char digest[65];
+
+            snprintf(digest, sizeof(digest),
+                     "%064x", (unsigned int)i);
+            rc = baseline_save_record(full_path, 7, (unsigned long long)i * 0x1000,
+                                       0x1000, digest);
+            if (rc != 0)
+                break;
+        }
+        CHECK(i == AC_BASELINE_MAX_RECORDS,
+              "fill the baseline file to AC_BASELINE_MAX_RECORDS records");
+
+        rc = baseline_save_record(full_path, 7,
+                                   (unsigned long long)AC_BASELINE_MAX_RECORDS * 0x1000,
+                                   0x1000, "deadbeef");
+        CHECK(rc == AC_BASELINE_SAVE_FULL,
+              "saving one more record into a full baseline file fails loudly");
+
+        n = baseline_load_records(full_path, recs, &legacy);
+        CHECK(n == AC_BASELINE_MAX_RECORDS,
+              "the file still holds exactly the records it had before the failed save");
     }
 
     if (failures) {
