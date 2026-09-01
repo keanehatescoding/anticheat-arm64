@@ -5,10 +5,16 @@
  * substrings (which a header like "Content-Length: 200" on an actual
  * error response could satisfy).
  *
- * Also covers a coderabbit finding on the #57 fix itself: the strict
- * status-line parser must reject a malformed line like "HTTP/1.1 +200 OK"
- * (a leading sign on the status code, which plain sscanf("%d") would
- * still happily parse as a real 200) rather than reporting it as success.
+ * Also covers coderabbit findings on the #57 fix itself:
+ *   - the strict status-line parser must reject a malformed line like
+ *     "HTTP/1.1 +200 OK" (a leading sign on the status code, which plain
+ *     sscanf("%d") would still happily parse as a real 200);
+ *   - ...and "HTTP/1.1 200X OK" (a stray byte glued onto the status
+ *     code with no delimiter);
+ *   - ...and anything other than HTTP/1.x with exactly one minor-version
+ *     digit, e.g. "HTTP/2.0 200 OK" or "HTTP/01.1 200 OK" -- ac_report()
+ *     only ever speaks plain HTTP/1.x, so those can't be genuine
+ *     responses from the configured report server.
  *
  * Pulls anticheat_daemon.c in as-is (renaming its main() out of the way)
  * to test the real ac_http_status_code(), not a duplicated copy.
@@ -65,6 +71,16 @@ int main(void)
     CHECK(ac_http_status_code("garbage 200 not a status line\r\n") == -1,
           "a response not starting with 'HTTP/' is rejected");
     CHECK(ac_http_status_code("") == -1, "an empty response is rejected");
+
+    /* a coderabbit finding on the #57 fix: only HTTP/1.x with exactly
+     * one minor-version digit is a genuine response ac_report() could
+     * actually receive; anything else must fail closed too */
+    CHECK(ac_http_status_code("HTTP/2.0 200 OK\r\n") == -1,
+          "HTTP/2.0 is rejected, not treated as an HTTP/1.x response");
+    CHECK(ac_http_status_code("HTTP/01.1 200 OK\r\n") == -1,
+          "a multi-digit (zero-padded) major version is rejected");
+    CHECK(ac_http_status_code("HTTP/1.11 200 OK\r\n") == -1,
+          "a multi-digit minor version is rejected");
 
     /* a second coderabbit finding on the #57 fix: a non-space byte glued
      * directly onto the three status-code digits (no delimiter) must not
