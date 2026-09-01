@@ -6,6 +6,14 @@
  * are pure file I/O), by simulating a library with two executable
  * PT_LOAD segments: same inode/path, two different file offsets.
  *
+ * Also covers two coderabbit findings on the #51 fix itself:
+ *   - baseline_find_record() must treat a size mismatch at the same
+ *     (inode, offset) as an incompatible baseline, not a content diff.
+ *   - baseline_load_records() must tell a legacy pre-#51 3-field record
+ *     apart from "nothing saved", so callers can point the operator at
+ *     re-running --save instead of reporting it identically to "never
+ *     baselined".
+ *
  * Pulls anticheat_daemon.c in as-is (renaming its main() out of the way)
  * rather than re-implementing the record format, so this test breaks if
  * the real functions regress, not just if a duplicated copy does.
@@ -35,7 +43,7 @@ int main(void)
     char blpath[PATH_MAX];
     struct ac_baseline_rec recs[AC_BASELINE_MAX_RECORDS];
     char hex[65];
-    int n;
+    int n, legacy;
 
     if (!mkdtemp(tmpdir)) {
         perror("mkdtemp");
@@ -46,7 +54,7 @@ int main(void)
 
     baseline_path_for("/usr/lib/libmultiseg.so", blpath);
 
-    /* Segment 1: inode 42, file offset 0x1000 */
+    /* Segment 1: inode 42, file offset 0x1000, size 0x2000 */
     CHECK(baseline_save_record(blpath, 42, 0x1000, 0x2000,
                                 "1111111111111111111111111111111111111111111111111111111111111111") == 0,
           "save segment 1");
@@ -58,34 +66,61 @@ int main(void)
                                 "2222222222222222222222222222222222222222222222222222222222222222") == 0,
           "save segment 2");
 
-    n = baseline_load_records(blpath, recs);
+    n = baseline_load_records(blpath, recs, &legacy);
     CHECK(n == 2, "both segments' records survive in the baseline file");
+    CHECK(!legacy, "no legacy-format lines flagged for a fresh file");
 
-    CHECK(baseline_find_record(recs, n, 42, 0x1000, hex) &&
+    CHECK(baseline_find_record(recs, n, 42, 0x1000, 0x2000, hex) &&
           strncmp(hex, "1111", 4) == 0,
           "segment 1's record is still intact after segment 2 was saved");
-    CHECK(baseline_find_record(recs, n, 42, 0x5000, hex) &&
+    CHECK(baseline_find_record(recs, n, 42, 0x5000, 0x1000, hex) &&
           strncmp(hex, "2222", 4) == 0,
           "segment 2's record is present");
+
+    /* Same (inode, offset) as segment 1, but a different size (e.g. the
+     * file at this path was rebuilt) -- must NOT match segment 1's
+     * record and be hashed against a stale digest. */
+    CHECK(!baseline_find_record(recs, n, 42, 0x1000, 0x9999, hex),
+          "a size mismatch at a known (inode, offset) is not treated as a match");
 
     /* Re-saving segment 1 (e.g. after a legitimate update) replaces only
      * its own record, still without touching segment 2's. */
     CHECK(baseline_save_record(blpath, 42, 0x1000, 0x2000,
                                 "3333333333333333333333333333333333333333333333333333333333333333") == 0,
           "re-save segment 1");
-    n = baseline_load_records(blpath, recs);
+    n = baseline_load_records(blpath, recs, &legacy);
     CHECK(n == 2, "record count unchanged after re-saving an existing segment");
-    CHECK(baseline_find_record(recs, n, 42, 0x1000, hex) &&
+    CHECK(baseline_find_record(recs, n, 42, 0x1000, 0x2000, hex) &&
           strncmp(hex, "3333", 4) == 0,
           "segment 1's record was updated in place");
-    CHECK(baseline_find_record(recs, n, 42, 0x5000, hex) &&
+    CHECK(baseline_find_record(recs, n, 42, 0x5000, 0x1000, hex) &&
           strncmp(hex, "2222", 4) == 0,
           "segment 2's record is untouched by re-saving segment 1");
 
     /* A segment nobody ever saved a baseline for is correctly reported
      * as absent, not confused with an unrelated offset's record. */
-    CHECK(!baseline_find_record(recs, n, 42, 0x9000, hex),
+    CHECK(!baseline_find_record(recs, n, 42, 0x9000, 0x1000, hex),
           "an offset with no saved record is not found");
+
+    /* A pre-#51 baseline file (single "start size hex" line, no
+     * inode/offset) is recognized as legacy rather than silently
+     * yielding zero records indistinguishable from "never baselined". */
+    {
+        char legacy_path[PATH_MAX];
+        FILE *f;
+
+        baseline_path_for("/usr/lib/liblegacy.so", legacy_path);
+        f = fopen(legacy_path, "w");
+        CHECK(f != NULL, "create a synthetic legacy-format baseline file");
+        if (f) {
+            fprintf(f, "%llx %llx %s\n", 0x1000ULL, 0x2000ULL,
+                    "4444444444444444444444444444444444444444444444444444444444444444");
+            fclose(f);
+        }
+        n = baseline_load_records(legacy_path, recs, &legacy);
+        CHECK(n == 0, "a legacy 3-field line yields no usable records");
+        CHECK(legacy, "a legacy 3-field line is flagged via out_legacy");
+    }
 
     if (failures) {
         fprintf(stderr, "%d check(s) FAILED\n", failures);

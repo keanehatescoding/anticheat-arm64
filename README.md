@@ -170,9 +170,16 @@ named by a SHA-256 of the path; override the directory with the
 file-backed executable mapping gets its own record, keyed by
 `(inode, file offset)` rather than path alone — a library with more than
 one executable `PT_LOAD` segment gets one independently-tracked record per
-segment instead of the last `--save` silently overwriting the others.
-`--check` reports mappings whose runtime content differs from their
-segment's baseline — a strong signal of runtime code patching.
+segment instead of the last `--save` silently overwriting the others. A
+record's saved size is checked too: a mapping at a known `(inode, offset)`
+whose size no longer matches (e.g. the file was rebuilt at the same path)
+is treated as having no compatible baseline rather than hashed against a
+stale digest. `--check` reports mappings whose runtime content differs
+from their segment's baseline — a strong signal of runtime code patching.
+A baseline saved by a daemon build predating per-segment records
+(pre-#51) is detected as a legacy, unreadable format and reported as
+such — re-run `--save` to regenerate it — rather than being silently
+treated as "never baselined".
 
 ### Render-hook detection (Vulkan + GLX/OpenGL + EGL present-call)
 

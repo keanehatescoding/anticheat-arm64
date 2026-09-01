@@ -545,36 +545,67 @@ struct ac_baseline_rec {
     char hex[65];
 };
 
-static int baseline_load_records(const char *blpath, struct ac_baseline_rec *out)
+/* out_legacy (may be NULL) is set to 1 if a line failed the current
+ * 4-field (inode, offset, size, hex) parse but matches the pre-#51
+ * 3-field (start, size, hex) format -- i.e. a baseline saved by a daemon
+ * build predating per-segment records. Those lines are otherwise
+ * silently unreadable now (they carry no inode/offset to match against),
+ * so callers use this to tell "never baselined" apart from "baselined by
+ * an old daemon build, needs --save again" instead of reporting both
+ * identically. NULL when the caller is about to overwrite the file
+ * anyway (baseline_save_record()'s own reload below) since a legacy line
+ * there just needs dropping, not reporting. */
+static int baseline_load_records(const char *blpath, struct ac_baseline_rec *out,
+                                  int *out_legacy)
 {
     FILE *f = fopen(blpath, "r");
     char line[512];
     int n = 0;
 
+    if (out_legacy)
+        *out_legacy = 0;
     if (!f)
         return 0;
     while (n < AC_BASELINE_MAX_RECORDS && fgets(line, sizeof(line), f)) {
         struct ac_baseline_rec *r = &out[n];
 
         if (sscanf(line, "%llx %llx %llx %64s",
-                   &r->inode, &r->offset, &r->size, r->hex) == 4)
+                   &r->inode, &r->offset, &r->size, r->hex) == 4) {
             n++;
+            continue;
+        }
+        if (out_legacy) {
+            unsigned long long a, b;
+            char hex[65];
+
+            if (sscanf(line, "%llx %llx %64s", &a, &b, hex) == 3)
+                *out_legacy = 1;
+        }
     }
     fclose(f);
     return n;
 }
 
+/* size must be the same capped hash length the caller is about to hash
+ * (or already hashed) -- a mapping that keeps the same (inode, offset)
+ * but changes size (e.g. a rebuilt library at the same install path,
+ * loaded before its updated baseline was saved) would otherwise have its
+ * *old* record matched by inode/offset alone and hashed over a different
+ * byte range than what was saved, reporting a content-mismatch ALERT for
+ * what is really just a stale/incompatible baseline. */
 static int baseline_find_record(const struct ac_baseline_rec *recs, int n,
                                  unsigned long long inode, unsigned long long offset,
-                                 char hex_out[65])
+                                 unsigned long long size, char hex_out[65])
 {
     int i;
 
     for (i = 0; i < n; i++) {
-        if (recs[i].inode == inode && recs[i].offset == offset) {
-            snprintf(hex_out, 65, "%s", recs[i].hex);
-            return 1;
-        }
+        if (recs[i].inode != inode || recs[i].offset != offset)
+            continue;
+        if (recs[i].size != size)
+            return 0;       /* same segment, but a stale/incompatible baseline */
+        snprintf(hex_out, 65, "%s", recs[i].hex);
+        return 1;
     }
     return 0;
 }
@@ -586,7 +617,7 @@ static int baseline_save_record(const char *blpath, unsigned long long inode,
                                  const char *hex)
 {
     struct ac_baseline_rec recs[AC_BASELINE_MAX_RECORDS];
-    int n = baseline_load_records(blpath, recs);
+    int n = baseline_load_records(blpath, recs, NULL);
     int i, kept = 0;
     FILE *f;
 
@@ -1280,11 +1311,16 @@ static int cmd_scan(int argc, char **argv)
             if (do_check) {
                 struct ac_baseline_rec recs[AC_BASELINE_MAX_RECORDS];
                 char bhex[65];
-                int n = baseline_load_records(blpath, recs);
+                int legacy = 0;
+                int n = baseline_load_records(blpath, recs, &legacy);
 
-                if (!baseline_find_record(recs, n, vi->inode, vi->offset, bhex)) {
-                    printf("    no baseline for %s at offset %#llx"
-                           " (run with --save first)\n", vi->path, vi->offset);
+                if (!baseline_find_record(recs, n, vi->inode, vi->offset, size, bhex)) {
+                    if (legacy)
+                        printf("    legacy-format baseline for %s"
+                               " -- re-run --save to regenerate\n", vi->path);
+                    else
+                        printf("    no baseline for %s at offset %#llx"
+                               " (run with --save first)\n", vi->path, vi->offset);
                     continue;
                 }
                 if (strcmp(bhex, hex) != 0)
@@ -2569,7 +2605,7 @@ static int check_baselines_periodic(void)
             char blpath[PATH_MAX], hex[65], bhex[65];
             struct ac_baseline_rec recs[AC_BASELINE_MAX_RECORDS];
             uint64_t size;
-            int n;
+            int n, legacy = 0;
 
             memset(&g, 0, sizeof(g));
             g.pid = pl.items[i].pid;
@@ -2580,10 +2616,19 @@ static int check_baselines_periodic(void)
             if (!(vi->flags & AC_VM_EXEC) || !vi->is_file)
                 continue;
 
+            size = vi->end - vi->start;
+            if (size > AC_HASH_CAP)
+                size = AC_HASH_CAP;
+
             baseline_path_for(vi->path, blpath);
-            n = baseline_load_records(blpath, recs);
-            if (!baseline_find_record(recs, n, vi->inode, vi->offset, bhex))
-                continue; /* nothing saved for this segment -- nothing to check */
+            n = baseline_load_records(blpath, recs, &legacy);
+            if (!baseline_find_record(recs, n, vi->inode, vi->offset, size, bhex)) {
+                if (legacy)
+                    logmsg(LOG_WARNING, "pid %d (%s): legacy-format baseline"
+                           " for %s -- run `scan --hash --save` to regenerate",
+                           pl.items[i].pid, pl.items[i].comm, vi->path);
+                continue; /* nothing (compatible) saved for this segment */
+            }
 
             /* Opened lazily on the first VMA that actually has a saved
              * baseline, and reused for the rest of this pid's VMAs --
@@ -2608,9 +2653,6 @@ static int check_baselines_periodic(void)
                 }
             }
 
-            size = vi->end - vi->start;
-            if (size > AC_HASH_CAP)
-                size = AC_HASH_CAP;
             if (hash_proc_mem(mem_fd, vi->start, size, hex) < 0)
                 continue;
             if (strcmp(bhex, hex) != 0)
