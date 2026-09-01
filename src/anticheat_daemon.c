@@ -19,8 +19,13 @@
  *                           works combined with --comm)
  *   protect --comm NAME    protect all processes whose comm == NAME
  *   unprotect --pid N      remove protection
+ *   unprotect --pid N --ns-of REFPID   remove protection from a pid as
+ *                           seen inside the pid namespace that host-pid
+ *                           REFPID lives in (same targeting as protect)
  *   list                   list protected processes
  *   scan --pid N           VMA scan (RWX detection)
+ *   scan --pid N --ns-of REFPID   scan a pid as seen inside the pid
+ *                           namespace that host-pid REFPID lives in
  *   scan --pid N --hash [--save|--check]   memory integrity baselines
  *   scan --pid N --check-hooks             Vulkan present-call hook check
  *   scan --pid N --check-preload           LD_PRELOAD check (heuristic)
@@ -241,6 +246,25 @@ static int pid_of_comm(const char *comm, int *pids, int max)
     return n;
 }
 
+/* Strict positive-pid parse for --pid/--ns-of CLI arguments, same
+ * rationale as ac_env_interval() above: atoi() silently truncates
+ * trailing garbage ("12foo" -> 12) instead of rejecting it, so an
+ * operator typo acts on the wrong pid with no error at all. Unlike
+ * ac_env_interval()'s env-var fallback-to-default behavior, a bad CLI
+ * argument is fatal -- die() rather than silently substituting a
+ * default pid. */
+static int ac_parse_pid(const char *s, const char *what)
+{
+    char *end;
+    long v;
+
+    errno = 0;
+    v = strtol(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0' || v <= 0 || v > INT_MAX)
+        die("invalid %s '%s': must be a positive integer pid", what, s);
+    return (int)v;
+}
+
 static int cmd_protect(int argc, char **argv)
 {
     struct ac_proc_id id;
@@ -249,11 +273,11 @@ static int cmd_protect(int argc, char **argv)
 
     for (i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc)
-            pid = atoi(argv[++i]);
+            pid = ac_parse_pid(argv[++i], "--pid");
         else if (strcmp(argv[i], "--comm") == 0 && i + 1 < argc)
             comm = argv[++i];
         else if (strcmp(argv[i], "--ns-of") == 0 && i + 1 < argc)
-            ref_pid = atoi(argv[++i]);
+            ref_pid = ac_parse_pid(argv[++i], "--ns-of");
         else if (strcmp(argv[i], "--jit") == 0)
             jit = 1;
     }
@@ -316,17 +340,21 @@ static int cmd_protect(int argc, char **argv)
 static int cmd_unprotect(int argc, char **argv)
 {
     struct ac_proc_id id;
-    int pid = -1, i;
+    int pid = -1, ref_pid = -1, i;
 
-    for (i = 0; i < argc; i++)
+    for (i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc)
-            pid = atoi(argv[++i]);
+            pid = ac_parse_pid(argv[++i], "--pid");
+        else if (strcmp(argv[i], "--ns-of") == 0 && i + 1 < argc)
+            ref_pid = ac_parse_pid(argv[++i], "--ns-of");
+    }
     if (pid < 0)
-        die("usage: anticheat unprotect --pid N");
+        die("usage: anticheat unprotect --pid N [--ns-of REFPID]");
 
     ac_open();
     memset(&id, 0, sizeof(id));
     id.pid = pid;
+    id.ref_pid = ref_pid;
     if (ioctl_ok(AC_IOCTL_DEL_PROC, &id) < 0)
         return 1;
     printf("protection removed from pid %d\n", pid);
@@ -1034,7 +1062,7 @@ static int check_implicit_layers(int pid);
 static int cmd_scan(int argc, char **argv)
 {
     struct ac_scan_begin b;
-    int pid = -1, i;
+    int pid = -1, ref_pid = -1, i;
     int do_hash = 0, do_save = 0, do_check = 0, do_hooks = 0, do_preload = 0;
     int do_vklayers = 0, do_implicit = 0;
     char exe[PATH_MAX] = "";
@@ -1044,7 +1072,9 @@ static int cmd_scan(int argc, char **argv)
 
     for (i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc)
-            pid = atoi(argv[++i]);
+            pid = ac_parse_pid(argv[++i], "--pid");
+        else if (strcmp(argv[i], "--ns-of") == 0 && i + 1 < argc)
+            ref_pid = ac_parse_pid(argv[++i], "--ns-of");
         else if (strcmp(argv[i], "--hash") == 0)
             do_hash = 1;
         else if (strcmp(argv[i], "--save") == 0)
@@ -1061,13 +1091,14 @@ static int cmd_scan(int argc, char **argv)
             do_implicit = 1;
     }
     if (pid < 0)
-        die("usage: anticheat scan --pid N [--hash [--save|--check]] "
+        die("usage: anticheat scan --pid N [--ns-of REFPID] [--hash [--save|--check]] "
             "[--check-hooks] [--check-preload] [--check-vklayers] "
             "[--check-implicit-layers]");
 
     ac_open();
     memset(&b, 0, sizeof(b));
     b.pid = pid;
+    b.ref_pid = ref_pid;
     b.emit_events = 1;
     if (ioctl_ok(AC_IOCTL_SCAN_BEGIN, &b) < 0)
         return 1;
@@ -3050,9 +3081,9 @@ static void usage(const char *prog)
            "\n"
            "  status                     kernel module status\n"
            "  protect --pid N [--ns-of REFPID] [--jit] | --comm NAME [--jit]\n"
-           "  unprotect --pid N\n"
+           "  unprotect --pid N [--ns-of REFPID]\n"
            "  list                       list protected processes\n"
-           "  scan --pid N [--hash [--save|--check]] [--check-hooks] "
+           "  scan --pid N [--ns-of REFPID] [--hash [--save|--check]] [--check-hooks] "
            "[--check-preload]\n"
            "           [--check-vklayers] [--check-implicit-layers]\n"
            "  syscalls                   verify syscall table integrity\n"

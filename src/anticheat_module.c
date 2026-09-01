@@ -422,6 +422,47 @@ static int ac_drain_events(struct ac_event_list *out)
     return 0;
 }
 
+/* Copies up to AC_MAX_EVENTS oldest ring entries into *out without
+ * removing them from the ring. Paired with ac_commit_events() below so
+ * AC_IOCTL_GET_EVENTS can copy_to_user() the snapshot first and only
+ * remove entries from the ring once that copy actually lands -- a
+ * copy_to_user() fault must not lose events that were never successfully
+ * handed to userspace. */
+static void ac_peek_events(struct ac_event_list *out)
+{
+    unsigned long flags;
+    unsigned int idx;
+
+    spin_lock_irqsave(&ac_ring_lock, flags);
+    out->dropped = ac_dropped;
+    out->count = 0;
+    idx = ac_ring_tail;
+    while (out->count < ac_ring_count && out->count < AC_MAX_EVENTS) {
+        out->events[out->count] = ac_ring[idx];
+        idx = (idx + 1) % AC_RING_SIZE;
+        out->count++;
+    }
+    spin_unlock_irqrestore(&ac_ring_lock, flags);
+}
+
+/* Removes up to `n` oldest entries from the ring -- the entries a prior
+ * ac_peek_events() returned and that the caller has now safely copied to
+ * userspace. `n` is clamped to the current ring count, so entries already
+ * evicted by ac_emit()'s overflow handling in the meantime (tail already
+ * advanced past them) are simply skipped rather than double-removed: the
+ * tail only ever moves forward, whether by eviction or by this commit. */
+static void ac_commit_events(unsigned int n)
+{
+    unsigned long flags;
+
+    spin_lock_irqsave(&ac_ring_lock, flags);
+    if (n > ac_ring_count)
+        n = ac_ring_count;
+    ac_ring_tail = (ac_ring_tail + n) % AC_RING_SIZE;
+    ac_ring_count -= n;
+    spin_unlock_irqrestore(&ac_ring_lock, flags);
+}
+
 /* ------------------------------------------------------------------ */
 /* protected process registry (task-pointer based; namespace-safe)     */
 /* ------------------------------------------------------------------ */
@@ -1289,18 +1330,20 @@ static bool ac_module_sane(const struct module *m)
 }
 
 static int ac_build_vma_snapshot(struct ac_fd_state *st, int pid,
-                                 int emit_events)
+                                 int ref_pid, int emit_events)
 {
     struct task_struct *task;
     struct mm_struct *mm;
     struct vm_area_struct *vma;
     unsigned int n = 0;
+    char *pathbuf;
 
     kvfree(st->vmas);
     st->vmas = NULL;
     st->n_vmas = st->rwx_count = st->exec_count = st->anon_exec_count = st->truncated = 0;
 
-    task = ac_find_task(pid);
+    task = ref_pid > 0 ? ac_find_task_in_ns_of(pid, ref_pid)
+                        : ac_find_task(pid);
     if (!task)
         return -ESRCH;
     mm = get_task_mm(task);
@@ -1317,11 +1360,19 @@ static int ac_build_vma_snapshot(struct ac_fd_state *st, int pid,
         return -ENOMEM;
     }
 
+    /* Allocated once, before mmap_read_lock(), and reused for every
+     * file-backed VMA's d_path() below. A per-VMA GFP_KERNEL kmalloc while
+     * holding the *target* process's mmap_read_lock is a sleeping
+     * allocation under another task's lock -- a lockdep/reclaim footgun,
+     * and it needlessly extends how long that lock is held on a process
+     * with many VMAs. Missing this buffer just means that VMA's path is
+     * left empty; it never fails the whole scan. */
+    pathbuf = kmalloc(PATH_MAX, GFP_KERNEL);
+
     mmap_read_lock(mm);
     VMA_ITERATOR(vmi, mm, 0);
     for_each_vma(vmi, vma) {
         struct ac_vma_info *vi;
-        char *buf;
         char *p;
 
         if (n >= AC_MAX_VMAS) {
@@ -1340,12 +1391,10 @@ static int ac_build_vma_snapshot(struct ac_fd_state *st, int pid,
             vi->is_file = 1;
             if (f->f_inode)
                 vi->inode = f->f_inode->i_ino;
-            buf = kmalloc(PATH_MAX, GFP_KERNEL);
-            if (buf) {
-                p = d_path(&f->f_path, buf, PATH_MAX);
+            if (pathbuf) {
+                p = d_path(&f->f_path, pathbuf, PATH_MAX);
                 if (!IS_ERR(p))
                     strscpy(vi->path, p, sizeof(vi->path));
-                kfree(buf);
             }
         }
         if ((vma->vm_flags & (VM_EXEC | VM_WRITE)) == (VM_EXEC | VM_WRITE)) {
@@ -1379,6 +1428,7 @@ static int ac_build_vma_snapshot(struct ac_fd_state *st, int pid,
     vma_iter_invalidate(&vmi);
     mmap_read_unlock(mm);
     mmput(mm);
+    kfree(pathbuf);
     st->n_vmas = n;
     return 0;
 }
@@ -1479,7 +1529,8 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
         if (copy_from_user(&d, uarg, sizeof(d)))
             return -EFAULT;
-        t = ac_find_task(d.pid);
+        t = d.ref_pid > 0 ? ac_find_task_in_ns_of(d.pid, d.ref_pid)
+                           : ac_find_task(d.pid);
         if (!t)
             return -ESRCH;
         ac_del_prot_thread_group(t);
@@ -1498,7 +1549,7 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             return -ENOMEM;
         }
         mutex_lock(&st->lock);
-        ret = ac_build_vma_snapshot(st, b.pid, b.emit_events);
+        ret = ac_build_vma_snapshot(st, b.pid, b.ref_pid, b.emit_events);
         if (!ret) {
             b.n_vmas = st->n_vmas;
             b.rwx_count = st->rwx_count;
@@ -1626,11 +1677,14 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
         if (!el)
             return -ENOMEM;
-        ret = ac_drain_events(el);
-        if (!ret && copy_to_user(uarg, el, sizeof(*el)))
-            ret = -EFAULT;
+        ac_peek_events(el);
+        if (copy_to_user(uarg, el, sizeof(*el))) {
+            kfree(el);
+            return -EFAULT;
+        }
+        ac_commit_events(el->count);
         kfree(el);
-        return ret;
+        return 0;
     }
     case AC_IOCTL_FLUSH_EVENTS:
         ac_drain_events(NULL);

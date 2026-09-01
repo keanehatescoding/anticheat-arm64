@@ -125,6 +125,12 @@ struct ac_vma_info {
 
 struct ac_scan_begin {
     int          pid;
+    int          ref_pid;       /* <=0: resolve `pid` in the caller's own
+                                  * (host) pid namespace -- default,
+                                  * current behavior. >0: resolve `pid`
+                                  * within the pid namespace that host-pid
+                                  * ref_pid lives in (see --ns-of), same
+                                  * semantics as ac_proc_id.ref_pid. */
     int          emit_events;   /* 1 = also push AC_EV_RWX events */
     unsigned int n_vmas;        /* out */
     unsigned int rwx_count;     /* out */
