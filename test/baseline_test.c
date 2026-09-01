@@ -102,6 +102,26 @@ int main(void)
     CHECK(!baseline_find_record(recs, n, 42, 0x9000, 0x1000, hex),
           "an offset with no saved record is not found");
 
+    /* Two distinct file-backed VMAs can legitimately share a starting
+     * file offset while covering different lengths (the same region
+     * mapped twice at different addresses) -- coderabbit finding on the
+     * prior fix: saving the second must not evict the first's record
+     * just because they share (inode, offset). */
+    CHECK(baseline_save_record(blpath, 99, 0x2000, 0x1000,
+                                "5555555555555555555555555555555555555555555555555555555555555555") == 0,
+          "save a same-(inode,offset), size-0x1000 mapping");
+    CHECK(baseline_save_record(blpath, 99, 0x2000, 0x3000,
+                                "6666666666666666666666666666666666666666666666666666666666666666") == 0,
+          "save a same-(inode,offset), size-0x3000 mapping");
+    n = baseline_load_records(blpath, recs, &legacy);
+    CHECK(n == 4, "both same-(inode,offset) different-size records are kept");
+    CHECK(baseline_find_record(recs, n, 99, 0x2000, 0x1000, hex) &&
+          strncmp(hex, "5555", 4) == 0,
+          "the size-0x1000 mapping's own record is found");
+    CHECK(baseline_find_record(recs, n, 99, 0x2000, 0x3000, hex) &&
+          strncmp(hex, "6666", 4) == 0,
+          "the size-0x3000 mapping's own record is found, not evicted by the other");
+
     /* A pre-#51 baseline file (single "start size hex" line, no
      * inode/offset) is recognized as legacy rather than silently
      * yielding zero records indistinguishable from "never baselined". */

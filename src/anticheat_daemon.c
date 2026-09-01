@@ -603,15 +603,21 @@ static int baseline_find_record(const struct ac_baseline_rec *recs, int n,
         if (recs[i].inode != inode || recs[i].offset != offset)
             continue;
         if (recs[i].size != size)
-            return 0;       /* same segment, but a stale/incompatible baseline */
+            continue;       /* same (inode, offset), but a different-sized
+                              * segment's record -- keep looking rather than
+                              * treating it as this segment's, stale */
         snprintf(hex_out, 65, "%s", recs[i].hex);
         return 1;
     }
     return 0;
 }
 
-/* Replaces this (inode, offset) segment's record in place, leaving every
- * other segment's record already saved for this path untouched. */
+/* Replaces this (inode, offset, size) segment's record in place, leaving
+ * every other segment's record already saved for this path untouched --
+ * including one at the same (inode, offset) but a different size, since
+ * two distinct file-backed VMAs can legitimately share a starting file
+ * offset while covering different lengths (e.g. the same region mapped
+ * twice at different addresses). */
 static int baseline_save_record(const char *blpath, unsigned long long inode,
                                  unsigned long long offset, unsigned long long size,
                                  const char *hex)
@@ -622,7 +628,8 @@ static int baseline_save_record(const char *blpath, unsigned long long inode,
     FILE *f;
 
     for (i = 0; i < n; i++)
-        if (recs[i].inode != inode || recs[i].offset != offset)
+        if (recs[i].inode != inode || recs[i].offset != offset ||
+            recs[i].size != size)
             recs[kept++] = recs[i];
 
     f = fopen(blpath, "w");
