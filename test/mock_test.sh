@@ -129,6 +129,22 @@ else
     fail "start: no hidden-module alert"
 fi
 
+# Syscall-hook alerts should be logged once per rising edge (via the ring
+# drain), not once per 5s poll -- see #52. The daemon's periodic syscall
+# check runs immediately, then again every 5s, so a 7s run crosses that
+# second poll with margin. A single CRIT line here proves the alert both
+# fires end-to-end through the ring AND stays deduplicated across more
+# than one poll -- a 4s run would exit before the second poll and pass
+# even if the old per-poll re-emit regressed.
+hooked_out=$(timeout -k 2 --preserve-status 7 \
+    env AC_MOCK_HOOKED=1 ./anticheat start --foreground 2>&1)
+hooked_crit_count=$(printf '%s' "$hooked_out" | grep -c "SYSCALL-HOOK")
+if [ "$hooked_crit_count" -eq 1 ]; then
+    pass "start: syscall-hook alert logged exactly once"
+else
+    fail "start: expected exactly 1 SYSCALL-HOOK log line, got $hooked_crit_count"
+fi
+
 echo
 if [ "$FAIL" -eq 0 ]; then
     printf '\033[1;32mALL MOCK TESTS PASSED\033[0m\n'

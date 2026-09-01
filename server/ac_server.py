@@ -119,8 +119,15 @@ class Store:
     be correct under ThreadingHTTPServer without sharing a connection
     across threads."""
 
-    def __init__(self, db_path):
+    def __init__(self, db_path, max_reports_per_client=1000):
         self.db_path = db_path
+        # Bounds how many rows a single client_id can hold in `reports`,
+        # trimmed on every insert (see add_report). Without this, a single
+        # spammy or misbehaving daemon has no limit on how much it can grow
+        # the SQLite file, since `list_reports`'s LIMIT only bounds what a
+        # query returns, not what accumulates on disk (#60). 0/None disables
+        # the cap.
+        self.max_reports_per_client = max_reports_per_client
         # The DB (and its -wal/-shm siblings, recreated on every checkpoint)
         # hold raw report detail text, source IPs, and ban reasons -- private
         # regardless of the launching environment's umask, not just under the
@@ -185,6 +192,13 @@ class Store:
                     "client_ts, received_at, source_addr) VALUES (?,?,?,?,?,?)",
                     (client_id, event_type, detail, client_ts, now_ts(), source_addr),
                 )
+                if self.max_reports_per_client:
+                    conn.execute(
+                        "DELETE FROM reports WHERE client_id = ? AND id NOT IN ("
+                        "SELECT id FROM reports WHERE client_id = ? "
+                        "ORDER BY id DESC LIMIT ?)",
+                        (client_id, client_id, self.max_reports_per_client),
+                    )
                 conn.commit()
             finally:
                 conn.close()
@@ -535,6 +549,15 @@ def main():
     ap.add_argument("--port", type=int, default=8787)
     ap.add_argument("--db", default="ac_server.db")
     ap.add_argument(
+        "--max-reports-per-client",
+        type=int,
+        default=1000,
+        help="cap on stored rows in `reports` per client_id, oldest "
+        "trimmed on insert; keeps a single spammy or misbehaving daemon "
+        "from growing the SQLite file without bound (default: 1000, "
+        "0 disables the cap)",
+    )
+    ap.add_argument(
         "--report-key",
         default=None,
         help="bearer token daemons use for POST /report "
@@ -634,7 +657,13 @@ def main():
         sys.stderr.write("ac_server: --rate-limit/--rate-window must be positive\n")
         sys.exit(1)
 
-    store = Store(args.db)
+    if args.max_reports_per_client < 0:
+        sys.stderr.write(
+            "ac_server: --max-reports-per-client must be >= 0 (0 disables the cap)\n"
+        )
+        sys.exit(1)
+
+    store = Store(args.db, max_reports_per_client=args.max_reports_per_client)
     rate_limiter = RateLimiter(args.rate_limit, args.rate_window)
     handler = make_handler(
         store, report_keys, admin_keys, rate_limiter, args.trust_proxy
