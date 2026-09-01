@@ -3077,8 +3077,14 @@ static int ac_http_status_code(const char *resp)
     if (!isdigit((unsigned char)p[0]) || !isdigit((unsigned char)p[1]) ||
         !isdigit((unsigned char)p[2]))
         return -1;
-    if (isdigit((unsigned char)p[3]))
-        return -1;   /* more than three digits -- not a valid status code */
+    /* The three digits must end at a proper status-line delimiter: a
+     * space before the reason-phrase, a line ending if the reason
+     * phrase is empty, or end-of-buffer if the response was cut off
+     * exactly there. Anything else -- a fourth digit, or a stray
+     * non-space byte glued onto the code like "200X" -- means these
+     * three digits aren't actually the whole status code. */
+    if (p[3] != ' ' && p[3] != '\r' && p[3] != '\n' && p[3] != '\0')
+        return -1;
     return (p[0] - '0') * 100 + (p[1] - '0') * 10 + (p[2] - '0');
 }
 

@@ -66,6 +66,18 @@ int main(void)
           "a response not starting with 'HTTP/' is rejected");
     CHECK(ac_http_status_code("") == -1, "an empty response is rejected");
 
+    /* a second coderabbit finding on the #57 fix: a non-space byte glued
+     * directly onto the three status-code digits (no delimiter) must not
+     * be silently accepted as if that byte weren't there */
+    CHECK(ac_http_status_code("HTTP/1.1 200X OK\r\n") == -1,
+          "a non-space suffix glued onto the status code is rejected");
+    CHECK(ac_http_status_code("HTTP/1.1 200") == 200,
+          "a status code with no reason phrase or trailing CRLF "
+          "(end-of-buffer right after the code) is still accepted");
+    CHECK(ac_http_status_code("HTTP/1.1 200\r\n") == 200,
+          "a status code immediately followed by CRLF (empty reason "
+          "phrase) is still accepted");
+
     if (failures) {
         fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;
