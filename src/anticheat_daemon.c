@@ -60,6 +60,7 @@
 #include <netdb.h>
 #include <poll.h>
 #include <pwd.h>
+#include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -525,6 +526,222 @@ static void baseline_path_for(const char *path, char out[PATH_MAX])
 
     ac_sha256_hex(path, strlen(path), hex);
     snprintf(out, PATH_MAX, "%s/%s.txt", ac_baseline_dir(), hex);
+}
+
+/* One baseline file per path (see baseline_path_for()) can hold multiple
+ * records: a shared library with more than one executable PT_LOAD segment
+ * maps as several distinct file-backed VMAs of the same path, each at its
+ * own file offset. Keying/matching on (inode, offset) rather than path
+ * alone -- and appending instead of truncating on --save -- keeps every
+ * segment's baseline independent instead of the last --save silently
+ * overwriting the others (#51). inode is redundant with the path hash in
+ * the filename but is cheap to double check and free from path/rename
+ * ambiguity within a single file's records. */
+#define AC_BASELINE_MAX_RECORDS 256
+
+struct ac_baseline_rec {
+    unsigned long long inode;
+    unsigned long long offset;
+    unsigned long long size;
+    char hex[65];
+};
+
+/* out_legacy (may be NULL) is set to 1 if a line failed the current
+ * 4-field (inode, offset, size, hex) parse but matches the pre-#51
+ * 3-field (start, size, hex) format -- i.e. a baseline saved by a daemon
+ * build predating per-segment records. Those lines are otherwise
+ * silently unreadable now (they carry no inode/offset to match against),
+ * so callers use this to tell "never baselined" apart from "baselined by
+ * an old daemon build, needs --save again" instead of reporting both
+ * identically. NULL when the caller is about to overwrite the file
+ * anyway (baseline_save_record()'s own reload below) since a legacy line
+ * there just needs dropping, not reporting. */
+static int baseline_load_records(const char *blpath, struct ac_baseline_rec *out,
+                                  int *out_legacy)
+{
+    FILE *f = fopen(blpath, "r");
+    char line[512];
+    int n = 0;
+
+    if (out_legacy)
+        *out_legacy = 0;
+    if (!f)
+        return 0;
+    while (n < AC_BASELINE_MAX_RECORDS && fgets(line, sizeof(line), f)) {
+        struct ac_baseline_rec *r = &out[n];
+
+        if (sscanf(line, "%llx %llx %llx %64s",
+                   &r->inode, &r->offset, &r->size, r->hex) == 4) {
+            n++;
+            continue;
+        }
+        if (out_legacy) {
+            unsigned long long a, b;
+            char hex[65];
+
+            if (sscanf(line, "%llx %llx %64s", &a, &b, hex) == 3)
+                *out_legacy = 1;
+        }
+    }
+    fclose(f);
+    return n;
+}
+
+/* size must be the same capped hash length the caller is about to hash
+ * (or already hashed) -- a mapping that keeps the same (inode, offset)
+ * but changes size (e.g. a rebuilt library at the same install path,
+ * loaded before its updated baseline was saved) would otherwise have its
+ * *old* record matched by inode/offset alone and hashed over a different
+ * byte range than what was saved, reporting a content-mismatch ALERT for
+ * what is really just a stale/incompatible baseline.
+ *
+ * out_size_mismatch (may be NULL) is set to 1 on a "not found" return if
+ * some record at this exact (inode, offset) exists but none of them match
+ * `size` -- as opposed to no record at this (inode, offset) at all.
+ * Without this, "never baselined" and "baselined, but for a size that no
+ * longer matches (rebuilt/remapped since)" would be indistinguishable to
+ * the caller, silently dropping integrity coverage after a rebuild
+ * without ever telling the operator to re-run --save. */
+static int baseline_find_record(const struct ac_baseline_rec *recs, int n,
+                                 unsigned long long inode, unsigned long long offset,
+                                 unsigned long long size, char hex_out[65],
+                                 int *out_size_mismatch)
+{
+    int i;
+    int saw_offset_match = 0;
+
+    if (out_size_mismatch)
+        *out_size_mismatch = 0;
+    for (i = 0; i < n; i++) {
+        if (recs[i].inode != inode || recs[i].offset != offset)
+            continue;
+        if (recs[i].size != size) {
+            saw_offset_match = 1;  /* keep looking -- a same-(inode,offset)
+                                     * different-sized segment's record is
+                                     * not this segment's, just stale */
+            continue;
+        }
+        snprintf(hex_out, 65, "%s", recs[i].hex);
+        return 1;
+    }
+    if (out_size_mismatch)
+        *out_size_mismatch = saw_offset_match;
+    return 0;
+}
+
+/* baseline_save_record()'s "file already holds AC_BASELINE_MAX_RECORDS
+ * *other* segments' records" case -- distinct from a plain I/O failure
+ * (errno-bearing, return -1) so cmd_scan can tell the operator what
+ * actually happened instead of a generic "cannot write baseline". */
+#define AC_BASELINE_SAVE_FULL (-2)
+
+/* Replaces this (inode, offset, size) segment's record in place, leaving
+ * every other segment's record already saved for this path untouched --
+ * including one at the same (inode, offset) but a different size, since
+ * two distinct file-backed VMAs can legitimately share a starting file
+ * offset while covering different lengths (e.g. the same region mapped
+ * twice at different addresses).
+ *
+ * The whole read-modify-write is done under an flock() held on blpath
+ * itself, and written out via a same-directory temp file + rename()
+ * rather than truncating blpath in place: without the lock, two
+ * concurrent `scan --hash --save` runs against the same path (e.g. two
+ * segments of one library scanned back to back mid-race) could each
+ * load the same old contents and have the second's rename silently
+ * discard the first's new record; without the temp file, a write error
+ * or a process killed mid-fprintf() loop leaves blpath truncated with
+ * only some of the previously-valid records rewritten -- exactly the
+ * kind of silent baseline-coverage loss this file exists to prevent
+ * (#51). rename() within the same directory is atomic, so a reader
+ * (baseline_load_records()) never observes a half-written file. */
+static int baseline_save_record(const char *blpath, unsigned long long inode,
+                                 unsigned long long offset, unsigned long long size,
+                                 const char *hex)
+{
+    struct ac_baseline_rec recs[AC_BASELINE_MAX_RECORDS];
+    char tmp_path[PATH_MAX];
+    int i, kept = 0, n, lock_fd, tmp_fd, saved_errno;
+    FILE *f;
+
+    lock_fd = open(blpath, O_RDWR | O_CREAT, 0644);
+    if (lock_fd < 0)
+        return -1;
+    if (flock(lock_fd, LOCK_EX) < 0) {
+        saved_errno = errno;
+        close(lock_fd);
+        errno = saved_errno;
+        return -1;
+    }
+
+    n = baseline_load_records(blpath, recs, NULL);
+    for (i = 0; i < n; i++)
+        if (recs[i].inode != inode || recs[i].offset != offset ||
+            recs[i].size != size)
+            recs[kept++] = recs[i];
+
+    if (kept == AC_BASELINE_MAX_RECORDS) {
+        /* Every slot already belongs to some other segment of this same
+         * path -- there's no room for this one without dropping one of
+         * them. Fail loudly rather than quietly writing back the same
+         * `kept` records and claiming success while this segment ends
+         * up with no baseline at all. */
+        flock(lock_fd, LOCK_UN);
+        close(lock_fd);
+        return AC_BASELINE_SAVE_FULL;
+    }
+
+    if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmpXXXXXX", blpath) >=
+        (int)sizeof(tmp_path)) {
+        flock(lock_fd, LOCK_UN);
+        close(lock_fd);
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    tmp_fd = mkstemp(tmp_path);
+    if (tmp_fd < 0) {
+        saved_errno = errno;
+        flock(lock_fd, LOCK_UN);
+        close(lock_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    fchmod(tmp_fd, 0644);
+    f = fdopen(tmp_fd, "w");
+    if (!f) {
+        saved_errno = errno;
+        close(tmp_fd);
+        unlink(tmp_path);
+        flock(lock_fd, LOCK_UN);
+        close(lock_fd);
+        errno = saved_errno;
+        return -1;
+    }
+
+    for (i = 0; i < kept; i++)
+        fprintf(f, "%llx %llx %llx %s\n", recs[i].inode, recs[i].offset,
+                recs[i].size, recs[i].hex);
+    fprintf(f, "%llx %llx %llx %s\n", inode, offset, size, hex);
+
+    if (fflush(f) != 0 || fsync(tmp_fd) != 0 || fclose(f) != 0) {
+        saved_errno = errno;
+        unlink(tmp_path);
+        flock(lock_fd, LOCK_UN);
+        close(lock_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    if (rename(tmp_path, blpath) < 0) {
+        saved_errno = errno;
+        unlink(tmp_path);
+        flock(lock_fd, LOCK_UN);
+        close(lock_fd);
+        errno = saved_errno;
+        return -1;
+    }
+
+    flock(lock_fd, LOCK_UN);
+    close(lock_fd);
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1175,10 +1392,8 @@ static int cmd_scan(int argc, char **argv)
                    vi->start, vi->end, vi->path[0] ? vi->path : "(anonymous)");
 
         if (do_hash && (vi->flags & AC_VM_EXEC) && vi->is_file) {
-            char hex[65], blpath[PATH_MAX], line[512];
+            char hex[65], blpath[PATH_MAX];
             uint64_t size;
-            FILE *f;
-            int changed = 0;
 
             size = vi->end - vi->start;
             if (size > AC_HASH_CAP)
@@ -1188,40 +1403,47 @@ static int cmd_scan(int argc, char **argv)
                 continue;
             }
             baseline_path_for(vi->path, blpath);
-            printf("  %s [%#llx..%#llx] %s\n",
-                   vi->path, vi->start, vi->start + size, hex);
+            printf("  %s [%#llx..%#llx] (offset %#llx) %s\n",
+                   vi->path, vi->start, vi->start + size, vi->offset, hex);
 
             if (do_save) {
+                int rc;
+
                 ac_mkdir_baselines();
-                f = fopen(blpath, "w");
-                if (!f) {
+                rc = baseline_save_record(blpath, vi->inode, vi->offset,
+                                           size, hex);
+                if (rc == AC_BASELINE_SAVE_FULL)
+                    fprintf(stderr, "cannot save baseline for %s: %s already"
+                            " holds the maximum %d segment records\n",
+                            vi->path, blpath, AC_BASELINE_MAX_RECORDS);
+                else if (rc < 0)
                     fprintf(stderr, "cannot write baseline %s: %s\n",
                             blpath, strerror(errno));
-                    continue;
-                }
-                fprintf(f, "%llx %llx %s\n",
-                        (unsigned long long)vi->start,
-                        (unsigned long long)size, hex);
-                fclose(f);
-                printf("    baseline saved: %s\n", blpath);
+                else
+                    printf("    baseline saved: %s\n", blpath);
             }
             if (do_check) {
-                f = fopen(blpath, "r");
-                if (!f) {
-                    printf("    no baseline for %s (run with --save first)\n",
-                           vi->path);
+                struct ac_baseline_rec recs[AC_BASELINE_MAX_RECORDS];
+                char bhex[65];
+                int legacy = 0, size_mismatch = 0;
+                int n = baseline_load_records(blpath, recs, &legacy);
+
+                if (!baseline_find_record(recs, n, vi->inode, vi->offset, size,
+                                           bhex, &size_mismatch)) {
+                    if (legacy)
+                        printf("    legacy-format baseline for %s"
+                               " -- re-run --save to regenerate\n", vi->path);
+                    else if (size_mismatch)
+                        printf("    baseline for %s at offset %#llx was saved"
+                               " for a different mapping size (rebuilt or"
+                               " remapped?) -- re-run --save\n",
+                               vi->path, vi->offset);
+                    else
+                        printf("    no baseline for %s at offset %#llx"
+                               " (run with --save first)\n", vi->path, vi->offset);
                     continue;
                 }
-                if (fgets(line, sizeof(line), f)) {
-                    unsigned long long bs, bsz;
-                    char bhex[65];
-                    if (sscanf(line, "%llx %llx %64s", &bs, &bsz, bhex) == 3) {
-                        if (strcmp(bhex, hex) != 0)
-                            changed = 1;
-                    }
-                }
-                fclose(f);
-                if (changed)
+                if (strcmp(bhex, hex) != 0)
                     printf("    [ALERT] memory content differs from baseline"
                            " (possible runtime patching)\n");
                 else
@@ -2500,10 +2722,10 @@ static int check_baselines_periodic(void)
         for (v = 0; v < b.n_vmas; v++) {
             struct ac_scan_get g;
             struct ac_vma_info *vi;
-            char blpath[PATH_MAX], line[512], hex[65], bhex[65];
-            unsigned long long bs, bsz;
+            char blpath[PATH_MAX], hex[65], bhex[65];
+            struct ac_baseline_rec recs[AC_BASELINE_MAX_RECORDS];
             uint64_t size;
-            FILE *f;
+            int n, legacy = 0, size_mismatch = 0;
 
             memset(&g, 0, sizeof(g));
             g.pid = pl.items[i].pid;
@@ -2514,17 +2736,25 @@ static int check_baselines_periodic(void)
             if (!(vi->flags & AC_VM_EXEC) || !vi->is_file)
                 continue;
 
+            size = vi->end - vi->start;
+            if (size > AC_HASH_CAP)
+                size = AC_HASH_CAP;
+
             baseline_path_for(vi->path, blpath);
-            f = fopen(blpath, "r");
-            if (!f)
-                continue; /* nothing saved for this file -- nothing to check */
-            if (!fgets(line, sizeof(line), f)) {
-                fclose(f);
-                continue;
+            n = baseline_load_records(blpath, recs, &legacy);
+            if (!baseline_find_record(recs, n, vi->inode, vi->offset, size,
+                                       bhex, &size_mismatch)) {
+                if (legacy)
+                    logmsg(LOG_WARNING, "pid %d (%s): legacy-format baseline"
+                           " for %s -- run `scan --hash --save` to regenerate",
+                           pl.items[i].pid, pl.items[i].comm, vi->path);
+                else if (size_mismatch)
+                    logmsg(LOG_WARNING, "pid %d (%s): baseline for %s was"
+                           " saved for a different mapping size (rebuilt or"
+                           " remapped?) -- run `scan --hash --save` to regenerate",
+                           pl.items[i].pid, pl.items[i].comm, vi->path);
+                continue; /* nothing (compatible) saved for this segment */
             }
-            fclose(f);
-            if (sscanf(line, "%llx %llx %64s", &bs, &bsz, bhex) != 3)
-                continue;
 
             /* Opened lazily on the first VMA that actually has a saved
              * baseline, and reused for the rest of this pid's VMAs --
@@ -2549,9 +2779,6 @@ static int check_baselines_periodic(void)
                 }
             }
 
-            size = vi->end - vi->start;
-            if (size > AC_HASH_CAP)
-                size = AC_HASH_CAP;
             if (hash_proc_mem(mem_fd, vi->start, size, hex) < 0)
                 continue;
             if (strcmp(bhex, hex) != 0)

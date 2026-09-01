@@ -164,11 +164,29 @@ unrecognized-layer count for a pid, same baseline-delta design as
 anon-exec detection above. Alerts go to syslog (`LOG_AUTH`) and
 `/var/log/anticheat.log`.
 
-Baselines are stored in `/var/lib/anticheat/baselines/` (one SHA-256 per
-file-backed executable mapping; override the directory with the
-`AC_BASELINE_DIR` environment variable). `--check` reports mappings whose
-runtime content differs from the baseline — a strong signal of runtime code
-patching.
+Baselines are stored in `/var/lib/anticheat/baselines/` (one file per path,
+named by a SHA-256 of the path; override the directory with the
+`AC_BASELINE_DIR` environment variable, up to 256 segment records per
+file). Within that file, each file-backed executable mapping gets its
+own record, keyed by `(inode, file offset, size)` rather than path alone
+— a library with more than one executable `PT_LOAD` segment gets one
+independently-tracked record per segment instead of the last `--save`
+silently overwriting the others, and two mappings that happen to share a
+starting file offset at different lengths don't evict each other either.
+A mapping at a known `(inode, offset)` whose size no longer matches (e.g.
+the file was rebuilt at the same path) is treated as having no
+compatible baseline rather than hashed against a stale digest, and
+reported as such so an operator knows to re-run `--save`, same treatment
+given to a baseline saved by a daemon build predating per-segment
+records (pre-#51) and detected as a legacy, unreadable format. `--check`
+reports mappings whose runtime content differs from their segment's
+baseline — a strong signal of runtime code patching. `--save` itself is
+written via a same-directory temp file + `rename()` under an `flock()`
+held on the target file, so a write error, a killed process, or two
+concurrent `--save` runs against the same path can't corrupt or drop
+another segment's already-saved record; a file already holding 256
+*other* segments' records fails the save outright rather than silently
+dropping it.
 
 ### Render-hook detection (Vulkan + GLX/OpenGL + EGL present-call)
 
