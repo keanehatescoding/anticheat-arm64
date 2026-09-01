@@ -6,9 +6,15 @@
  * are pure file I/O), by simulating a library with two executable
  * PT_LOAD segments: same inode/path, two different file offsets.
  *
- * Also covers two coderabbit findings on the #51 fix itself:
+ * Also covers coderabbit findings on the #51 fix itself:
  *   - baseline_find_record() must treat a size mismatch at the same
  *     (inode, offset) as an incompatible baseline, not a content diff.
+ *   - ...and must report that distinctly (out_size_mismatch) from "no
+ *     record at this (inode, offset) at all", so callers can tell the
+ *     operator to re-run --save instead of silently dropping coverage.
+ *   - baseline_save_record()/baseline_find_record() must key on the full
+ *     (inode, offset, size), not (inode, offset) alone, since two
+ *     distinct VMAs can share a starting file offset at different sizes.
  *   - baseline_load_records() must tell a legacy pre-#51 3-field record
  *     apart from "nothing saved", so callers can point the operator at
  *     re-running --save instead of reporting it identically to "never
@@ -43,7 +49,7 @@ int main(void)
     char blpath[PATH_MAX];
     struct ac_baseline_rec recs[AC_BASELINE_MAX_RECORDS];
     char hex[65];
-    int n, legacy;
+    int n, legacy, size_mismatch;
 
     if (!mkdtemp(tmpdir)) {
         perror("mkdtemp");
@@ -70,18 +76,23 @@ int main(void)
     CHECK(n == 2, "both segments' records survive in the baseline file");
     CHECK(!legacy, "no legacy-format lines flagged for a fresh file");
 
-    CHECK(baseline_find_record(recs, n, 42, 0x1000, 0x2000, hex) &&
+    CHECK(baseline_find_record(recs, n, 42, 0x1000, 0x2000, hex, NULL) &&
           strncmp(hex, "1111", 4) == 0,
           "segment 1's record is still intact after segment 2 was saved");
-    CHECK(baseline_find_record(recs, n, 42, 0x5000, 0x1000, hex) &&
+    CHECK(baseline_find_record(recs, n, 42, 0x5000, 0x1000, hex, NULL) &&
           strncmp(hex, "2222", 4) == 0,
           "segment 2's record is present");
 
     /* Same (inode, offset) as segment 1, but a different size (e.g. the
      * file at this path was rebuilt) -- must NOT match segment 1's
-     * record and be hashed against a stale digest. */
-    CHECK(!baseline_find_record(recs, n, 42, 0x1000, 0x9999, hex),
+     * record and be hashed against a stale digest, and must be reported
+     * distinctly (out_size_mismatch) from "nothing saved for this
+     * (inode, offset) at all", so a caller can tell the operator to
+     * re-run --save instead of silently dropping coverage. */
+    size_mismatch = 0;
+    CHECK(!baseline_find_record(recs, n, 42, 0x1000, 0x9999, hex, &size_mismatch),
           "a size mismatch at a known (inode, offset) is not treated as a match");
+    CHECK(size_mismatch, "the size mismatch is reported via out_size_mismatch");
 
     /* Re-saving segment 1 (e.g. after a legitimate update) replaces only
      * its own record, still without touching segment 2's. */
@@ -90,17 +101,21 @@ int main(void)
           "re-save segment 1");
     n = baseline_load_records(blpath, recs, &legacy);
     CHECK(n == 2, "record count unchanged after re-saving an existing segment");
-    CHECK(baseline_find_record(recs, n, 42, 0x1000, 0x2000, hex) &&
+    CHECK(baseline_find_record(recs, n, 42, 0x1000, 0x2000, hex, NULL) &&
           strncmp(hex, "3333", 4) == 0,
           "segment 1's record was updated in place");
-    CHECK(baseline_find_record(recs, n, 42, 0x5000, 0x1000, hex) &&
+    CHECK(baseline_find_record(recs, n, 42, 0x5000, 0x1000, hex, NULL) &&
           strncmp(hex, "2222", 4) == 0,
           "segment 2's record is untouched by re-saving segment 1");
 
     /* A segment nobody ever saved a baseline for is correctly reported
-     * as absent, not confused with an unrelated offset's record. */
-    CHECK(!baseline_find_record(recs, n, 42, 0x9000, 0x1000, hex),
+     * as absent (no size mismatch flagged -- there's no record at this
+     * offset at all to have mismatched), not confused with an unrelated
+     * offset's record. */
+    size_mismatch = 1;
+    CHECK(!baseline_find_record(recs, n, 42, 0x9000, 0x1000, hex, &size_mismatch),
           "an offset with no saved record is not found");
+    CHECK(!size_mismatch, "no size-mismatch flagged when the offset itself is unknown");
 
     /* Two distinct file-backed VMAs can legitimately share a starting
      * file offset while covering different lengths (the same region
@@ -115,10 +130,10 @@ int main(void)
           "save a same-(inode,offset), size-0x3000 mapping");
     n = baseline_load_records(blpath, recs, &legacy);
     CHECK(n == 4, "both same-(inode,offset) different-size records are kept");
-    CHECK(baseline_find_record(recs, n, 99, 0x2000, 0x1000, hex) &&
+    CHECK(baseline_find_record(recs, n, 99, 0x2000, 0x1000, hex, NULL) &&
           strncmp(hex, "5555", 4) == 0,
           "the size-0x1000 mapping's own record is found");
-    CHECK(baseline_find_record(recs, n, 99, 0x2000, 0x3000, hex) &&
+    CHECK(baseline_find_record(recs, n, 99, 0x2000, 0x3000, hex, NULL) &&
           strncmp(hex, "6666", 4) == 0,
           "the size-0x3000 mapping's own record is found, not evicted by the other");
 

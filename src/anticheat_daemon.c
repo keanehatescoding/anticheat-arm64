@@ -592,23 +592,39 @@ static int baseline_load_records(const char *blpath, struct ac_baseline_rec *out
  * loaded before its updated baseline was saved) would otherwise have its
  * *old* record matched by inode/offset alone and hashed over a different
  * byte range than what was saved, reporting a content-mismatch ALERT for
- * what is really just a stale/incompatible baseline. */
+ * what is really just a stale/incompatible baseline.
+ *
+ * out_size_mismatch (may be NULL) is set to 1 on a "not found" return if
+ * some record at this exact (inode, offset) exists but none of them match
+ * `size` -- as opposed to no record at this (inode, offset) at all.
+ * Without this, "never baselined" and "baselined, but for a size that no
+ * longer matches (rebuilt/remapped since)" would be indistinguishable to
+ * the caller, silently dropping integrity coverage after a rebuild
+ * without ever telling the operator to re-run --save. */
 static int baseline_find_record(const struct ac_baseline_rec *recs, int n,
                                  unsigned long long inode, unsigned long long offset,
-                                 unsigned long long size, char hex_out[65])
+                                 unsigned long long size, char hex_out[65],
+                                 int *out_size_mismatch)
 {
     int i;
+    int saw_offset_match = 0;
 
+    if (out_size_mismatch)
+        *out_size_mismatch = 0;
     for (i = 0; i < n; i++) {
         if (recs[i].inode != inode || recs[i].offset != offset)
             continue;
-        if (recs[i].size != size)
-            continue;       /* same (inode, offset), but a different-sized
-                              * segment's record -- keep looking rather than
-                              * treating it as this segment's, stale */
+        if (recs[i].size != size) {
+            saw_offset_match = 1;  /* keep looking -- a same-(inode,offset)
+                                     * different-sized segment's record is
+                                     * not this segment's, just stale */
+            continue;
+        }
         snprintf(hex_out, 65, "%s", recs[i].hex);
         return 1;
     }
+    if (out_size_mismatch)
+        *out_size_mismatch = saw_offset_match;
     return 0;
 }
 
@@ -1318,13 +1334,19 @@ static int cmd_scan(int argc, char **argv)
             if (do_check) {
                 struct ac_baseline_rec recs[AC_BASELINE_MAX_RECORDS];
                 char bhex[65];
-                int legacy = 0;
+                int legacy = 0, size_mismatch = 0;
                 int n = baseline_load_records(blpath, recs, &legacy);
 
-                if (!baseline_find_record(recs, n, vi->inode, vi->offset, size, bhex)) {
+                if (!baseline_find_record(recs, n, vi->inode, vi->offset, size,
+                                           bhex, &size_mismatch)) {
                     if (legacy)
                         printf("    legacy-format baseline for %s"
                                " -- re-run --save to regenerate\n", vi->path);
+                    else if (size_mismatch)
+                        printf("    baseline for %s at offset %#llx was saved"
+                               " for a different mapping size (rebuilt or"
+                               " remapped?) -- re-run --save\n",
+                               vi->path, vi->offset);
                     else
                         printf("    no baseline for %s at offset %#llx"
                                " (run with --save first)\n", vi->path, vi->offset);
@@ -2612,7 +2634,7 @@ static int check_baselines_periodic(void)
             char blpath[PATH_MAX], hex[65], bhex[65];
             struct ac_baseline_rec recs[AC_BASELINE_MAX_RECORDS];
             uint64_t size;
-            int n, legacy = 0;
+            int n, legacy = 0, size_mismatch = 0;
 
             memset(&g, 0, sizeof(g));
             g.pid = pl.items[i].pid;
@@ -2629,10 +2651,16 @@ static int check_baselines_periodic(void)
 
             baseline_path_for(vi->path, blpath);
             n = baseline_load_records(blpath, recs, &legacy);
-            if (!baseline_find_record(recs, n, vi->inode, vi->offset, size, bhex)) {
+            if (!baseline_find_record(recs, n, vi->inode, vi->offset, size,
+                                       bhex, &size_mismatch)) {
                 if (legacy)
                     logmsg(LOG_WARNING, "pid %d (%s): legacy-format baseline"
                            " for %s -- run `scan --hash --save` to regenerate",
+                           pl.items[i].pid, pl.items[i].comm, vi->path);
+                else if (size_mismatch)
+                    logmsg(LOG_WARNING, "pid %d (%s): baseline for %s was"
+                           " saved for a different mapping size (rebuilt or"
+                           " remapped?) -- run `scan --hash --save` to regenerate",
                            pl.items[i].pid, pl.items[i].comm, vi->path);
                 continue; /* nothing (compatible) saved for this segment */
             }
