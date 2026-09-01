@@ -375,6 +375,20 @@ static unsigned int ac_ring_head, ac_ring_tail, ac_ring_count;
 static DEFINE_SPINLOCK(ac_ring_lock);
 static unsigned int ac_dropped;
 static unsigned int ac_last_hook_count;
+/* Monotonic count of events ever removed from the ring, by *any* means
+ * (overflow eviction below, ac_drain_events(), or ac_commit_events()).
+ * Lets ac_commit_events() tell "already removed by a racing eviction
+ * since the matching ac_peek_events()" apart from "still present, safe
+ * to remove" -- see the pairing's comment below for why a plain
+ * remove-n-oldest is wrong. */
+static u64 ac_ring_removed;
+/* Serializes the whole peek -> copy_to_user() -> commit sequence for
+ * AC_IOCTL_GET_EVENTS so two overlapping callers can't both peek the
+ * same entries and then each independently decide it's safe to commit
+ * them -- ac_ring_removed alone only protects against ac_emit()'s
+ * eviction racing a single GET_EVENTS call, not two GET_EVENTS calls
+ * racing each other. */
+static DEFINE_MUTEX(ac_get_events_lock);
 
 static void ac_emit(unsigned int type, int pid, const char *comm,
                     const char *fmt, ...)
@@ -388,6 +402,7 @@ static void ac_emit(unsigned int type, int pid, const char *comm,
         ac_ring_tail = (ac_ring_tail + 1) % AC_RING_SIZE;
         ac_ring_count--;
         ac_dropped++;
+        ac_ring_removed++;
     }
     ev = &ac_ring[ac_ring_head];
     memset(ev, 0, sizeof(*ev));
@@ -417,9 +432,63 @@ static int ac_drain_events(struct ac_event_list *out)
             out->events[out->count++] = ac_ring[ac_ring_tail];
         ac_ring_tail = (ac_ring_tail + 1) % AC_RING_SIZE;
         ac_ring_count--;
+        ac_ring_removed++;
     }
     spin_unlock_irqrestore(&ac_ring_lock, flags);
     return 0;
+}
+
+/* Copies up to AC_MAX_EVENTS oldest ring entries into *out without
+ * removing them from the ring, and records the current ac_ring_removed
+ * value in *removed_before. Paired with ac_commit_events() below so
+ * AC_IOCTL_GET_EVENTS can copy_to_user() the snapshot first and only
+ * remove entries from the ring once that copy actually lands -- a
+ * copy_to_user() fault must not lose events that were never successfully
+ * handed to userspace. Call only while holding ac_get_events_lock. */
+static void ac_peek_events(struct ac_event_list *out, u64 *removed_before)
+{
+    unsigned long flags;
+    unsigned int idx;
+
+    spin_lock_irqsave(&ac_ring_lock, flags);
+    out->dropped = ac_dropped;
+    out->count = 0;
+    *removed_before = ac_ring_removed;
+    idx = ac_ring_tail;
+    while (out->count < ac_ring_count && out->count < AC_MAX_EVENTS) {
+        out->events[out->count] = ac_ring[idx];
+        idx = (idx + 1) % AC_RING_SIZE;
+        out->count++;
+    }
+    spin_unlock_irqrestore(&ac_ring_lock, flags);
+}
+
+/* Removes the `n` entries a prior ac_peek_events() returned, now that
+ * the caller has safely copied them to userspace -- *not* simply "the
+ * current n oldest entries", which would be wrong if ac_emit()'s
+ * overflow eviction removed some of *our* peeked entries in the
+ * meantime and then new, never-copied events were appended: naively
+ * removing n-oldest-now would delete those new events instead. Using
+ * removed_before (recorded at peek time) to compute how many of our own
+ * n entries were already evicted lets this only ever remove entries
+ * this call actually copied out. Call only while holding
+ * ac_get_events_lock (serializes against another GET_EVENTS's
+ * peek/commit; ac_ring_lock alone only orders against ac_emit()). */
+static void ac_commit_events(unsigned int n, u64 removed_before)
+{
+    unsigned long flags;
+    u64 removed_since;
+    unsigned int to_remove;
+
+    spin_lock_irqsave(&ac_ring_lock, flags);
+    removed_since = ac_ring_removed - removed_before;
+    to_remove = removed_since >= n ? 0 : n - (unsigned int)removed_since;
+    if (to_remove > ac_ring_count)
+        to_remove = ac_ring_count;
+    ac_ring_tail = (ac_ring_tail + to_remove) % AC_RING_SIZE;
+    ac_ring_count -= to_remove;
+    ac_ring_removed += to_remove;
+    spin_unlock_irqrestore(&ac_ring_lock, flags);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1180,6 +1249,8 @@ struct ac_fd_state {
                                  * a shared/dup'd fd must not race a GET
                                  * against a concurrent BEGIN/END */
     struct ac_vma_info *vmas;   /* SCAN snapshot */
+    int resolved_pid;           /* host-namespace pid of the last SCAN_BEGIN
+                                  * target, for ac_scan_begin.resolved_pid */
     unsigned int n_vmas;
     unsigned int rwx_count;
     unsigned int exec_count;
@@ -1289,20 +1360,31 @@ static bool ac_module_sane(const struct module *m)
 }
 
 static int ac_build_vma_snapshot(struct ac_fd_state *st, int pid,
-                                 int emit_events)
+                                 int ref_pid, int emit_events)
 {
     struct task_struct *task;
     struct mm_struct *mm;
     struct vm_area_struct *vma;
     unsigned int n = 0;
+    char *pathbuf;
 
     kvfree(st->vmas);
     st->vmas = NULL;
     st->n_vmas = st->rwx_count = st->exec_count = st->anon_exec_count = st->truncated = 0;
+    st->resolved_pid = 0;
 
-    task = ac_find_task(pid);
+    task = ref_pid > 0 ? ac_find_task_in_ns_of(pid, ref_pid)
+                        : ac_find_task(pid);
     if (!task)
         return -ESRCH;
+    /* task_pid_nr(), not the caller-supplied `pid`: with ref_pid > 0,
+     * `pid` is namespace-relative and meaningless for host-side
+     * /proc/<pid>/... access -- the daemon needs this host pid for its
+     * own --hash/--check-hooks/--check-preload/etc. work after
+     * SCAN_BEGIN returns. Must be read before put_task_struct() below,
+     * same reference-liveness reasoning as ac_find_task_in_ns_of()'s own
+     * comment. */
+    st->resolved_pid = task_pid_nr(task);
     mm = get_task_mm(task);
     put_task_struct(task);
     if (!mm)
@@ -1317,11 +1399,19 @@ static int ac_build_vma_snapshot(struct ac_fd_state *st, int pid,
         return -ENOMEM;
     }
 
+    /* Allocated once, before mmap_read_lock(), and reused for every
+     * file-backed VMA's d_path() below. A per-VMA GFP_KERNEL kmalloc while
+     * holding the *target* process's mmap_read_lock is a sleeping
+     * allocation under another task's lock -- a lockdep/reclaim footgun,
+     * and it needlessly extends how long that lock is held on a process
+     * with many VMAs. Missing this buffer just means that VMA's path is
+     * left empty; it never fails the whole scan. */
+    pathbuf = kmalloc(PATH_MAX, GFP_KERNEL);
+
     mmap_read_lock(mm);
     VMA_ITERATOR(vmi, mm, 0);
     for_each_vma(vmi, vma) {
         struct ac_vma_info *vi;
-        char *buf;
         char *p;
 
         if (n >= AC_MAX_VMAS) {
@@ -1340,12 +1430,10 @@ static int ac_build_vma_snapshot(struct ac_fd_state *st, int pid,
             vi->is_file = 1;
             if (f->f_inode)
                 vi->inode = f->f_inode->i_ino;
-            buf = kmalloc(PATH_MAX, GFP_KERNEL);
-            if (buf) {
-                p = d_path(&f->f_path, buf, PATH_MAX);
+            if (pathbuf) {
+                p = d_path(&f->f_path, pathbuf, PATH_MAX);
                 if (!IS_ERR(p))
                     strscpy(vi->path, p, sizeof(vi->path));
-                kfree(buf);
             }
         }
         if ((vma->vm_flags & (VM_EXEC | VM_WRITE)) == (VM_EXEC | VM_WRITE)) {
@@ -1379,6 +1467,7 @@ static int ac_build_vma_snapshot(struct ac_fd_state *st, int pid,
     vma_iter_invalidate(&vmi);
     mmap_read_unlock(mm);
     mmput(mm);
+    kfree(pathbuf);
     st->n_vmas = n;
     return 0;
 }
@@ -1479,7 +1568,8 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
         if (copy_from_user(&d, uarg, sizeof(d)))
             return -EFAULT;
-        t = ac_find_task(d.pid);
+        t = d.ref_pid > 0 ? ac_find_task_in_ns_of(d.pid, d.ref_pid)
+                           : ac_find_task(d.pid);
         if (!t)
             return -ESRCH;
         ac_del_prot_thread_group(t);
@@ -1498,8 +1588,9 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             return -ENOMEM;
         }
         mutex_lock(&st->lock);
-        ret = ac_build_vma_snapshot(st, b.pid, b.emit_events);
+        ret = ac_build_vma_snapshot(st, b.pid, b.ref_pid, b.emit_events);
         if (!ret) {
+            b.resolved_pid = st->resolved_pid;
             b.n_vmas = st->n_vmas;
             b.rwx_count = st->rwx_count;
             b.exec_count = st->exec_count;
@@ -1623,14 +1714,25 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
          * bug (CWE-457/CWE-200), not just a style nit. Found during an
          * input-hardening audit of every ioctl handler, not by symptom. */
         struct ac_event_list *el = kzalloc(sizeof(*el), GFP_KERNEL);
+        u64 removed_before;
 
         if (!el)
             return -ENOMEM;
-        ret = ac_drain_events(el);
-        if (!ret && copy_to_user(uarg, el, sizeof(*el)))
-            ret = -EFAULT;
+        /* Held across the full peek/copy/commit sequence: see
+         * ac_get_events_lock's own comment for why ac_ring_lock alone
+         * isn't enough to keep two overlapping GET_EVENTS calls from
+         * both peeking and then both committing the same entries. */
+        mutex_lock(&ac_get_events_lock);
+        ac_peek_events(el, &removed_before);
+        if (copy_to_user(uarg, el, sizeof(*el))) {
+            mutex_unlock(&ac_get_events_lock);
+            kfree(el);
+            return -EFAULT;
+        }
+        ac_commit_events(el->count, removed_before);
+        mutex_unlock(&ac_get_events_lock);
         kfree(el);
-        return ret;
+        return 0;
     }
     case AC_IOCTL_FLUSH_EVENTS:
         ac_drain_events(NULL);
