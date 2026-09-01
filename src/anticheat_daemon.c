@@ -3189,19 +3189,63 @@ static int cmd_start(int argc, char **argv)
     ac_open();   /* holds /dev/anticheat open -> module pinned while we live */
 
     if (!foreground) {
+        /* Classic double-fork daemonization: the first child exits right
+         * after the second fork, so its pid is already dead by the time
+         * anything could report it. Only the surviving grandchild's pid
+         * is the one an operator can actually kill/track -- pass it back
+         * to the original, terminal-attached parent over a pipe before
+         * the intermediate first child exits, instead of printing the
+         * first child's own (about-to-die) pid. Printing from the
+         * grandchild itself isn't an option: by the time it exists,
+         * stdout has already been freopen()'d to the log file below. */
+        int pfd[2];
+
+        if (pipe(pfd) < 0)
+            die("pipe: %s", strerror(errno));
+
         pid = fork();
         if (pid < 0)
             die("fork: %s", strerror(errno));
         if (pid > 0) {
-            printf("anticheat daemon started (pid %d)\n", pid);
-            _exit(0);
+            pid_t final_pid = -1;
+            ssize_t r;
+
+            close(pfd[1]);
+            r = read(pfd[0], &final_pid, sizeof(final_pid));
+            close(pfd[0]);
+            if (r == (ssize_t)sizeof(final_pid) && final_pid > 0) {
+                printf("anticheat daemon started (pid %d)\n", final_pid);
+                /* _exit() skips stdio flushing (unlike exit()) -- when
+                 * stdout isn't a tty (e.g. redirected to a file/pipe by
+                 * the caller) it's fully buffered rather than
+                 * line-buffered, so without this the message above can
+                 * be silently lost. */
+                fflush(stdout);
+                _exit(0);
+            }
+            fprintf(stderr, "anticheat: daemon failed to start\n");
+            _exit(1);
         }
+        close(pfd[0]);
         setsid();
         pid = fork();
         if (pid < 0)
             die("fork: %s", strerror(errno));
-        if (pid > 0)
+        if (pid > 0) {
+            pid_t final_pid = pid;
+
+            /* A single write() of a pid_t-sized buffer is well under
+             * PIPE_BUF, so it's atomic -- the parent's read() above gets
+             * it whole in one call. Best-effort: if this write somehow
+             * fails, the parent's short/absent read falls back to the
+             * failure message above. */
+            ssize_t w = write(pfd[1], &final_pid, sizeof(final_pid));
+
+            (void)w;
+            close(pfd[1]);
             _exit(0);
+        }
+        close(pfd[1]);
         /* best-effort daemonization; failures are not fatal */
         if (chdir("/") < 0)
             fprintf(stderr, "daemon: chdir failed: %s\n", strerror(errno));
