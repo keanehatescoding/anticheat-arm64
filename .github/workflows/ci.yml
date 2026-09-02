@@ -154,9 +154,18 @@ jobs:
           # (added for #63) calling memcpy() is exactly the kind of
           # newly-linked-in undefined symbol a hardcoded, stale list here
           # would silently drop from ksymvers and fail modpost on.
+          #
+          # nm printing more than one file at once inserts a "path:"
+          # header line per file into the stream; NF==2 keeps only real
+          # "U symbolname" lines (2 whitespace-separated fields) and
+          # drops those headers (1 field) and the blank separator lines
+          # nm puts around them, which the plain `{print $2}` used when
+          # there was only ever one object here happily let through as a
+          # symbol-less entry -- and modpost's dump-file parser rejects
+          # that outright with "parse error in symbol dump file".
           make KDIR="$PWD/linux-6.12" module 2>&1 | tail -3 || true
           objs="$(grep '^anticheat-objs' Makefile | cut -d= -f2)"
-          nm -u $objs | awk '{print $2}' | sort -u | \
+          nm -u $objs | awk 'NF==2 {print $2}' | sort -u | \
             awk '{printf "0x00000000\t%s\tvmlinux\tEXPORT_SYMBOL\t\n", $1}' \
             > "$PWD/ksymvers"
           make KDIR="$PWD/linux-6.12" KBUILD_EXTRA_SYMBOLS="$PWD/ksymvers" module

@@ -108,10 +108,13 @@ jobs:
           # See ci.yml's own module job for why the object list is read
           # from the Makefile's anticheat-objs rather than hardcoded here
           # a second time (a hardcoded, stale list silently drops a newly
-          # linked-in object's undefined symbols from ksymvers).
+          # linked-in object's undefined symbols from ksymvers), and why
+          # NF==2 filters nm's multi-file "path:" header lines out of the
+          # symbol list instead of the plain `{print $2}` this used when
+          # there was only ever one object to nm here.
           make KDIR="$PWD/linux-6.12" module 2>&1 | tail -3 || true
           objs="$(grep '^anticheat-objs' Makefile | cut -d= -f2)"
-          nm -u $objs | awk '{print $2}' | sort -u | \
+          nm -u $objs | awk 'NF==2 {print $2}' | sort -u | \
             awk '{printf "0x00000000\t%s\tvmlinux\tEXPORT_SYMBOL\t\n", $1}' \
             > "$PWD/ksymvers"
           make KDIR="$PWD/linux-6.12" KBUILD_EXTRA_SYMBOLS="$PWD/ksymvers" module
