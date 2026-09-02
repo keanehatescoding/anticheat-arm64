@@ -3305,6 +3305,17 @@ static int cmd_start(int argc, char **argv)
             clock_gettime(CLOCK_MONOTONIC, &t1);
             waited_ms = (t1.tv_sec - t0.tv_sec) * 1000L +
                         (t1.tv_nsec - t0.tv_nsec) / 1000000L;
+            /* got < 0 here from a SIGTERM/SIGINT during the blocking
+             * ioctl (-EINTR/-ERESTARTSYS, see the sigaction comment
+             * above) must skip straight to the while(!g_stop) check --
+             * otherwise the periodic checks and the fallback sleep
+             * below would still run first, burning most of block_ms
+             * and defeating the whole point of leaving SA_RESTART
+             * unset. Any other ioctl failure (e.g. ENOTTY from a
+             * legacy module) falls through to the fallback sleep as
+             * before. */
+            if (got < 0 && g_stop)
+                break;
             if (got == 0) {
                 for (i = 0; i < (int)el.count; i++) {
                     struct ac_event *e = &el.events[i];
