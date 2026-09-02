@@ -66,6 +66,67 @@ expect_out "list shows pid"            "$$"             ./anticheat list
 expect_rc  "protect --comm bash"      0 ./anticheat protect --comm bash
 expect_rc  "unprotect"                0 ./anticheat unprotect --pid $$
 
+echo "== protect --comm: exe-basename precision (issue #69) =="
+# pid_of_comm() now prefers matching /proc/<pid>/exe's basename (the
+# executable's real, untruncated name) over the raw /proc/<pid>/comm
+# string (silently truncated by the kernel to TASK_COMM_LEN-1 = 15
+# chars), falling back to the comm string only when /proc/<pid>/exe isn't
+# usable. Exercise both paths against real background processes -- this
+# scans the real /proc, not the mocked ioctl ABI, so it needs actual
+# pids on disk, not just mock state.
+AC_TESTBIN_DIR="/tmp/ac_testbin_$$"
+mkdir -p "$AC_TESTBIN_DIR"
+
+# > 15 chars, so the old comm-string-only match couldn't have found this
+# pid at all (comm would read back truncated) -- only the exe-basename
+# match can.
+AC_LONGNAME="ac69-exe-match-longname-$$"
+cp /bin/sleep "$AC_TESTBIN_DIR/$AC_LONGNAME"
+chmod +x "$AC_TESTBIN_DIR/$AC_LONGNAME"
+"$AC_TESTBIN_DIR/$AC_LONGNAME" 30 &
+AC_LONGPID=$!
+expect_rc  "protect --comm matches full (>15-char) exe basename" 0 \
+    ./anticheat protect --comm "$AC_LONGNAME"
+expect_out "list shows exe-basename-matched pid" "$AC_LONGPID" ./anticheat list
+./anticheat unprotect --pid "$AC_LONGPID" >/dev/null 2>&1
+kill "$AC_LONGPID" 2>/dev/null
+wait "$AC_LONGPID" 2>/dev/null
+
+# <= 15 chars, then the backing file is deleted while the process keeps
+# running: /proc/<pid>/exe now resolves to "... (deleted)", which
+# exe_path_matches() deliberately treats as unusable -- this must fall
+# back to the original /proc/<pid>/comm string match, not fail outright.
+AC_SHORTNAME="ac69delfb$$"
+AC_SHORTNAME="${AC_SHORTNAME:0:15}"
+cp /bin/sleep "$AC_TESTBIN_DIR/$AC_SHORTNAME"
+chmod +x "$AC_TESTBIN_DIR/$AC_SHORTNAME"
+"$AC_TESTBIN_DIR/$AC_SHORTNAME" 30 &
+AC_DELPID=$!
+rm -f "$AC_TESTBIN_DIR/$AC_SHORTNAME"
+expect_rc  "protect --comm falls back to comm string (exe deleted)" 0 \
+    ./anticheat protect --comm "$AC_SHORTNAME"
+expect_out "list shows comm-fallback-matched pid" "$AC_DELPID" ./anticheat list
+./anticheat unprotect --pid "$AC_DELPID" >/dev/null 2>&1
+kill "$AC_DELPID" 2>/dev/null
+wait "$AC_DELPID" 2>/dev/null
+
+rm -rf "$AC_TESTBIN_DIR"
+
+echo "== protect: kernel-thread rejection (issue #69) =="
+# The real module now rejects PF_KTHREAD tasks in ac_add_prot_task(); the
+# mock mirrors that with a userspace analog (empty /proc/<pid>/cmdline --
+# see is_kthread_like() in mock_anticheat.c) so this end-to-end path is
+# covered without root or a loaded module. kthreadd is the ancestor of
+# every kernel thread and always has an empty cmdline, so it's a stable,
+# always-present stand-in target.
+AC_KPID=$(pgrep -x kthreadd 2>/dev/null | head -1)
+if [ -n "$AC_KPID" ] && [ -r "/proc/$AC_KPID/cmdline" ]; then
+    expect_rc "protect --pid <kernel thread> is rejected" 1 \
+        ./anticheat protect --pid "$AC_KPID"
+else
+    echo "  (skipped: kthreadd not found/readable on this system)"
+fi
+
 echo "== scan (VMA + RWX) =="
 expect_rc  "scan --pid \$\$"           0 ./anticheat scan --pid $$
 expect_out "scan summary"              "VMA(s)"         ./anticheat scan --pid $$

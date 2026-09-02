@@ -132,6 +132,26 @@ static void read_comm(int pid, char *out, size_t n)
     fclose(f);
 }
 
+/* Userspace analog of the real module's "t->flags & PF_KTHREAD" check --
+ * see the AC_IOCTL_ADD_PROC comment below. A kernel thread never has an
+ * argv, so /proc/<pid>/cmdline reads back 0 bytes; an ordinary process
+ * (even one invoked with no arguments) always has at least argv[0], so
+ * this doesn't false-positive on real userspace targets. */
+static int is_kthread_like(int pid)
+{
+    char path[64], buf[1];
+    FILE *f;
+    size_t r;
+
+    snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
+    f = fopen(path, "rb");
+    if (!f)
+        return 0;   /* pid gone / unreadable: not our call to make here */
+    r = fread(buf, 1, sizeof(buf), f);
+    fclose(f);
+    return r == 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* VMA scan snapshot (parses /proc/<pid>/maps like the module walks    */
 /* the mmap maple tree)                                                */
@@ -260,6 +280,19 @@ static int do_ioctl(unsigned long req, void *arg)
 
         if (S.nprots >= AC_MAX_PROTS) {
             errno = ENOSPC;
+            return -1;
+        }
+        /* Mirror the real kernel module's PF_KTHREAD rejection (issue
+         * #69 / ac_add_prot_task() in anticheat_module.c): this mock has
+         * no task_struct to check PF_KTHREAD on, but a kernel thread's
+         * /proc/<pid>/cmdline is always empty -- it has no argv, unlike
+         * any real userspace process -- which is a reliable
+         * userspace-visible analog for "not a valid protect target".
+         * Rejecting it here lets mock_test.sh exercise the same
+         * ADD_PROC-fails-for-a-kernel-thread behaviour end-to-end
+         * without root or a loaded module. */
+        if (is_kthread_like(id->pid)) {
+            errno = EINVAL;
             return -1;
         }
         for (i = 0; i < S.nprots; i++)
