@@ -3046,6 +3046,47 @@ static void ac_report_client_id(char *out, size_t outsz)
     snprintf(out, outsz, "unknown");
 }
 
+/* Strict HTTP status-line parser: "HTTP/1.<minor> <code> <reason>", where
+ * <minor> and <code> must each be exactly the digit count RFC 7230's
+ * HTTP-version/status-code grammar specifies (one, three) -- not "one or
+ * more" the way a naive digit-scanning loop would accept. sscanf()'s
+ * "%d" would also accept a leading sign or extra digits -- e.g. a
+ * malformed "HTTP/1.1 +200 OK" is not a valid status line, but "%d"
+ * happily parses it as a real 200 and reports success anyway. The major
+ * version is required to be exactly "1": ac_report() always speaks
+ * plain HTTP/1.x over a raw socket (see the no-TLS note above), so
+ * anything else -- "HTTP/2.0 200 OK" included -- cannot be a genuine
+ * response from the configured report server and must fail closed
+ * rather than being parsed as a 2xx. Returns the parsed code, or -1 if
+ * resp isn't a well-formed status line (fails closed: -1 is never
+ * inside the accepted 2xx range). */
+static int ac_http_status_code(const char *resp)
+{
+    const char *p = resp;
+
+    if (strncmp(p, "HTTP/1.", 7) != 0)
+        return -1;
+    p += 7;
+    if (!isdigit((unsigned char)*p))
+        return -1;
+    p++;
+    if (*p != ' ')
+        return -1;
+    p++;
+    if (!isdigit((unsigned char)p[0]) || !isdigit((unsigned char)p[1]) ||
+        !isdigit((unsigned char)p[2]))
+        return -1;
+    /* The three digits must end at a proper status-line delimiter: a
+     * space before the reason-phrase, a line ending if the reason
+     * phrase is empty, or end-of-buffer if the response was cut off
+     * exactly there. Anything else -- a fourth digit, or a stray
+     * non-space byte glued onto the code like "200X" -- means these
+     * three digits aren't actually the whole status code. */
+    if (p[3] != ' ' && p[3] != '\r' && p[3] != '\n' && p[3] != '\0')
+        return -1;
+    return (p[0] - '0') * 100 + (p[1] - '0') * 10 + (p[2] - '0');
+}
+
 static void ac_report(const char *event_type, const char *detail)
 {
     const char *url = getenv("AC_REPORT_URL");
@@ -3166,10 +3207,35 @@ static void ac_report(const char *event_type, const char *detail)
         }
     }
     n = read(fd, resp, sizeof(resp) - 1);
-    if (n > 0) {
-        resp[n] = '\0';
-        if (!strstr(resp, " 200") && !strstr(resp, " 201"))
-            fprintf(stderr, "ac_report: server response: %.60s\n", resp);
+    {
+        int code = -1;
+        char body[64];
+
+        /* n <= 0 (connection closed before any bytes arrived, or the
+         * read itself failed/timed out) is exactly as much a failed
+         * delivery as a non-2xx status -- resp is uninitialized in that
+         * case, so log a fixed placeholder instead of reading it, but
+         * still fail closed (code stays -1) and still log, instead of
+         * silently falling through with no operator-visible indication
+         * that the report never landed. */
+        if (n > 0) {
+            resp[n] = '\0';
+            /* Parse the numeric status code from the status line only
+             * -- scanning the whole raw response for " 200"/" 201" as
+             * substrings would also match those digits inside a header
+             * value (e.g. "Content-Length: 200") on an actual error
+             * response and misreport a failed delivery as successful. */
+            code = ac_http_status_code(resp);
+            snprintf(body, sizeof(body), "%.60s", resp);
+        } else if (n == 0) {
+            snprintf(body, sizeof(body), "(connection closed, no response)");
+        } else {
+            snprintf(body, sizeof(body), "(read failed: %s)",
+                     strerror(errno));
+        }
+        if (code < 200 || code >= 300)
+            fprintf(stderr, "ac_report: server response status %d: %s\n",
+                    code, body);
     }
     close(fd);
 }
