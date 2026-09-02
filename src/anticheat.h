@@ -16,7 +16,14 @@
 #define AC_DEV_NAME     "anticheat"
 #define AC_DEV_PATH     "/dev/anticheat"
 #define AC_IOCTL_MAGIC  0xAC
-#define AC_IOCTL_VERSION 1
+#define AC_IOCTL_VERSION 2
+
+/* Upper bound (milliseconds) the kernel clamps struct ac_event_list's
+ * block_ms field to for AC_IOCTL_GET_EVENTS -- see that struct's own
+ * comment. Keeps a caller (malicious or just buggy) from tying up a
+ * kernel thread indefinitely, and bounds worst-case ioctl-fuzz overhead
+ * per iteration that happens to land on this command with an empty ring. */
+#define AC_GET_EVENTS_MAX_BLOCK_MS 1000
 
 #define AC_MAX_COMM     16
 #define AC_MAX_PROCS    64
@@ -39,7 +46,7 @@
 #define AC_IOCTL_DEL_PROC         _IOW(AC_IOCTL_MAGIC,  3, struct ac_proc_id)
 #define AC_IOCTL_SCAN_BEGIN       _IOWR(AC_IOCTL_MAGIC, 4, struct ac_scan_begin)
 #define AC_IOCTL_CHECK_SYSCALLS   _IOR(AC_IOCTL_MAGIC,  5, struct ac_syscall_check)
-#define AC_IOCTL_GET_EVENTS       _IOR(AC_IOCTL_MAGIC,  7, struct ac_event_list)
+#define AC_IOCTL_GET_EVENTS       _IOWR(AC_IOCTL_MAGIC, 7, struct ac_event_list)
 #define AC_IOCTL_FLUSH_EVENTS     _IO(AC_IOCTL_MAGIC,   8)
 #define AC_IOCTL_LIST_PROTECTED   _IOR(AC_IOCTL_MAGIC,  9, struct ac_prot_list)
 #define AC_IOCTL_LOCK             _IO(AC_IOCTL_MAGIC,  10)
@@ -183,6 +190,19 @@ struct ac_event {
 struct ac_event_list {
     unsigned int  count;
     unsigned int  dropped;      /* total drops (cumulative) */
+    /* in: 0 (default -- a zero-filled struct, same as every pre-v2
+     * caller sends) means AC_IOCTL_GET_EVENTS returns immediately,
+     * exactly like before this field existed. >0 asks the kernel to
+     * block interruptibly for up to this many milliseconds waiting for
+     * the ring to become non-empty, woken early the moment an event is
+     * pushed; the kernel clamps this down to
+     * AC_GET_EVENTS_MAX_BLOCK_MS. A signal (including one used only to
+     * ask a thread to stop, e.g. SIGTERM) interrupts the wait and the
+     * ioctl returns -EINTR/-ERESTARTSYS rather than blocking through it
+     * -- callers must not treat that as this field being ignored.
+     * Not echoed back on output (the kernel does not promise to
+     * preserve it across the call). */
+    unsigned int  block_ms;
     struct ac_event events[AC_MAX_EVENTS];
 };
 
