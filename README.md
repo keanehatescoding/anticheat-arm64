@@ -41,7 +41,13 @@ userspace daemon/CLI that talks to it over a small ioctl interface
    then checked to lie inside the core kernel text (`[_stext, _etext)`) and
    outside any loaded module — the classic rootkit hook (redirecting a
    syscall into module/vmalloc memory) is flagged and reported as
-   `AC_EV_SYSCALL_HOOK`.
+   `AC_EV_SYSCALL_HOOK`. Separately, every handler address is snapshotted
+   and SHA-256-checksummed once at module load; each later check (periodic,
+   or on demand via `anticheat syscalls`) recomputes the checksum and
+   compares per-slot against that boot baseline, flagging an entry whose
+   handler changed while still passing the core-text check as
+   `AC_EV_SYSCALL_REDIRECT` — an in-text redirect (e.g. sys_read →
+   sys_write) that the range check alone can't see (see #63).
 
 2. **Module enumeration.** The kernel-internal module list is walked
    (preemption disabled, since `module_mutex` is not exported) and compared
@@ -926,9 +932,18 @@ design).
 - **Heuristic, not provably secure.** A determined rootkit with kernel
   privileges can defeat any in-band detector. This tool is defense-in-depth:
   it raises the cost and detects the *typical* hook points.
-- The syscall-entry check treats "inside `[_stext, _etext)` and outside all
-  modules" as legit. A hook that redirects within core kernel text (e.g.,
-  sys_read → sys_write) is not flagged (rare; also visually detectable).
+- The syscall-entry range check treats "inside `[_stext, _etext)` and
+  outside all modules" as legit, and on its own can't see a hook that
+  redirects within core kernel text (e.g., sys_read → sys_write). The
+  boot-time handler-address baseline (`AC_EV_SYSCALL_REDIRECT`, see #63)
+  closes most of that gap for a redirect installed *after* the module
+  loads, but not against an adversary who already has kernel-write
+  privilege equal to or greater than the module's own — such an attacker
+  can patch the in-kernel baseline (`ac_syscall_baseline[]`) the same way
+  it can patch the table itself, and a redirect already present *before*
+  the module's baseline snapshot at load time is captured as normal,
+  never flagged. See THREAT_MODEL.md's "Within-core-kernel-text
+  redirects" note.
   If the `_stext`/`_etext` kprobe lookups are unavailable (they are section
   labels and not always probe-able), the module derives the text bounds
   from the syscall table entries themselves and falls back to a ±64 MB

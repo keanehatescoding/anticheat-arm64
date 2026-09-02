@@ -16,7 +16,7 @@
 #define AC_DEV_NAME     "anticheat"
 #define AC_DEV_PATH     "/dev/anticheat"
 #define AC_IOCTL_MAGIC  0xAC
-#define AC_IOCTL_VERSION 1
+#define AC_IOCTL_VERSION 2
 
 #define AC_MAX_COMM     16
 #define AC_MAX_PROCS    64
@@ -76,6 +76,21 @@ enum {
                             * values (not inserted alongside AC_EV_PTRACE above)
                             * so a module/daemon version mismatch can't silently
                             * misclassify any event that already shipped. */
+    AC_EV_SYSCALL_REDIRECT, /* a syscall table entry's handler address changed
+                            * since the boot-time snapshot (see
+                            * ac_syscall_check.baseline_sha256) but still
+                            * points inside core kernel text -- distinct from
+                            * AC_EV_SYSCALL_HOOK, which is entries pointing
+                            * outside core text/into a module. An in-text
+                            * redirect (e.g. sys_read -> sys_write) is exactly
+                            * the gap THREAT_MODEL.md's "Within-core-kernel-
+                            * text redirects" note describes as out of scope
+                            * for the original range-only check; this event
+                            * raises the detection bar for it without
+                            * claiming to close it against a kernel-privileged
+                            * attacker (see #63). Appended after the
+                            * pre-existing values for the same version-skew
+                            * reason as AC_EV_PROCESS_VM above. */
 };
 
 /* ------------------------------------------------------------------ */
@@ -159,6 +174,35 @@ struct ac_syscall_check {
     unsigned int       non_text;      /* entries outside core kernel text */
     unsigned int       hooked;        /* = non_text (kept for compat) */
     unsigned int       ok;            /* 1 if no hooks found */
+    /* Boot-time handler-address baseline (#63): closes the gap
+     * THREAT_MODEL.md calls out under "Within-core-kernel-text redirects"
+     * -- table_addr/non_text/hooked above only ever look at *where* an
+     * entry points relative to core text, so a hook that swaps one
+     * in-text handler for another (e.g. sys_read -> sys_write) is
+     * invisible to them by design. These fields compare the live table
+     * against a checksum of the handler addresses captured once at
+     * module load, independent of whether any given entry still looks
+     * like a plausible core-text address. */
+    unsigned int       baseline_ready;     /* 1 if a boot-time handler-address
+                                             * snapshot was captured (0 if the
+                                             * syscall table couldn't be
+                                             * located at load time) */
+    unsigned int       redirected;         /* entries whose handler address
+                                             * differs from the boot baseline
+                                             * while still pointing inside core
+                                             * kernel text (in-text redirect) */
+    unsigned int       checksum_mismatch;  /* 1 if the whole-table SHA-256
+                                             * over live handler addresses
+                                             * differs from the boot baseline
+                                             * -- redundant with `redirected`
+                                             * for the in-text case above, but
+                                             * also catches any handler churn
+                                             * the per-slot walk didn't
+                                             * individually flag */
+    char               baseline_sha256[65]; /* hex digest captured at load;
+                                              * empty if baseline_ready == 0 */
+    char               current_sha256[65];  /* hex digest of the live table
+                                              * as of this check */
 };
 
 struct ac_mod_info {

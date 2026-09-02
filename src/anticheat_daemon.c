@@ -156,6 +156,7 @@ static const char *ev_type_str(unsigned int t)
     case AC_EV_PTRACE:      return "PTRACE-DENIED";
     case AC_EV_PROCESS_VM:  return "PROCESS-VM-DENIED";
     case AC_EV_SYSCALL_HOOK:return "SYSCALL-HOOK";
+    case AC_EV_SYSCALL_REDIRECT: return "SYSCALL-REDIRECT";
     case AC_EV_RWX:         return "RWX";
     case AC_EV_ANON_EXEC:   return "ANON-EXEC";
     case AC_EV_INFO:        return "INFO";
@@ -1493,10 +1494,22 @@ static int cmd_syscalls(void)
     printf("  entries examined : %u\n", c.nr_syscalls);
     printf("  non-NULL entries : %u\n", c.total);
     printf("  hooked           : %u\n", c.hooked);
-    if (c.ok)
+    if (c.baseline_ready) {
+        printf("  boot baseline    : %s\n", c.baseline_sha256);
+        printf("  current checksum : %s%s\n", c.current_sha256,
+               c.checksum_mismatch ? " (MISMATCH)" : "");
+        printf("  redirected       : %u (in-text handler swap since boot)\n",
+               c.redirected);
+    } else {
+        printf("  boot baseline    : unavailable (syscall table not located at load)\n");
+    }
+    if (c.ok && c.redirected == 0)
         printf("  result           : OK — no hooks detected\n");
     else {
-        printf("  result           : COMPROMISED — syscall hooks present!\n");
+        if (!c.ok)
+            printf("  result           : COMPROMISED — syscall hooks present!\n");
+        if (c.redirected)
+            printf("  result           : COMPROMISED — in-text syscall redirect(s) present!\n");
         return 2;
     }
     ac_close();
@@ -1820,11 +1833,12 @@ static int check_syscalls_periodic(void)
     memset(&c, 0, sizeof(c));
     if (ioctl(dev_fd, AC_IOCTL_CHECK_SYSCALLS, &c) < 0)
         return -1;
-    /* Don't log here: the kernel only emits AC_EV_SYSCALL_HOOK into the
-     * event ring on a rising edge (new hook, not a still-hooked slot), and
-     * the main loop's ring drain already logs it at LOG_CRIT. Logging here
-     * too would re-report the same persistent hook at CRIT on every poll
-     * (see #52). */
+    /* Don't log here: the kernel only emits AC_EV_SYSCALL_HOOK /
+     * AC_EV_SYSCALL_REDIRECT into the event ring on a rising edge (a new
+     * hook or in-text handler swap, not one already reported), and the
+     * main loop's ring drain already logs both at LOG_CRIT. Logging here
+     * too would re-report the same persistent hook/redirect at CRIT on
+     * every poll (see #52). */
     return c.hooked;
 }
 
@@ -3274,7 +3288,8 @@ static int cmd_start(int argc, char **argv)
                     if (e->type == AC_EV_PTRACE || e->type == AC_EV_PROCESS_VM)
                         logmsg(LOG_ALERT, "%s pid=%d comm=%s %s",
                                ev_type_str(e->type), e->pid, e->comm, e->data);
-                    else if (e->type == AC_EV_SYSCALL_HOOK)
+                    else if (e->type == AC_EV_SYSCALL_HOOK ||
+                             e->type == AC_EV_SYSCALL_REDIRECT)
                         logmsg(LOG_CRIT, "%s %s", ev_type_str(e->type), e->data);
                     else
                         logmsg(LOG_INFO, "%s pid=%d comm=%s %s",
