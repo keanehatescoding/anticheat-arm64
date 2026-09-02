@@ -127,6 +127,8 @@ expect_rc  "start: mismatched version fails fast" 1 \
     env AC_MOCK_VERSION=99 ./anticheat start --foreground
 expect_out "start: mismatched version error names both versions" \
     "version mismatch" env AC_MOCK_VERSION=99 ./anticheat start --foreground
+expect_out "start: mismatched version error names daemon's version" \
+    "AC_IOCTL_VERSION=1" env AC_MOCK_VERSION=99 ./anticheat start --foreground
 expect_out "start: mismatched version error names module's version" \
     "version=99" env AC_MOCK_VERSION=99 ./anticheat start --foreground
 expect_out "start: mismatched version error refuses to start" \
