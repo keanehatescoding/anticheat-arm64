@@ -23,6 +23,9 @@
  *   AC_MOCK_HOOKED=1    simulate a compromised syscall table (out-of-text)
  *   AC_MOCK_REDIRECT=1  simulate an in-text syscall handler swap since the
  *                       boot baseline (SYSCALL-REDIRECT events; see #63)
+ *   AC_MOCK_CHECKSUM_ONLY=1
+ *                       simulate a whole-table checksum mismatch with no
+ *                       per-slot hook/redirect flagged (see #63)
  *   AC_MOCK_VERSION=N   report ioctl ABI version N instead of the real
  *                       AC_IOCTL_VERSION (simulates a stale module)
  *   AC_MOCK_STATE=path  state file location
@@ -368,6 +371,7 @@ static int do_ioctl(unsigned long req, void *arg)
     case AC_IOCTL_CHECK_SYSCALLS: {
         struct ac_syscall_check *c = arg;
         int mock_redirect = getenv("AC_MOCK_REDIRECT") != NULL;
+        int mock_checksum_only = getenv("AC_MOCK_CHECKSUM_ONLY") != NULL;
 
         c->table_addr = 0xffffffff82d02300ULL;
         c->nr_syscalls = 472;
@@ -388,12 +392,15 @@ static int do_ioctl(unsigned long req, void *arg)
          * capturing one when the table was located, which it always is
          * here), with the live checksum diverging whenever either kind of
          * tampering -- out-of-text hook or in-text redirect -- is
-         * simulated. */
+         * simulated. AC_MOCK_CHECKSUM_ONLY simulates handler churn the
+         * per-slot walk doesn't individually flag (out->ok stays 1 and
+         * out->redirected stays 0): a slot going non-zero -> 0 flips the
+         * whole-table checksum without tripping either per-slot counter. */
         c->baseline_ready = 1;
         mock_fill_digest(c->baseline_sha256, '1');
         mock_fill_digest(c->current_sha256,
-                          (c->hooked || c->redirected) ? '2' : '1');
-        c->checksum_mismatch = (c->hooked || c->redirected) ? 1 : 0;
+                          (c->hooked || c->redirected || mock_checksum_only) ? '2' : '1');
+        c->checksum_mismatch = (c->hooked || c->redirected || mock_checksum_only) ? 1 : 0;
 
         /* Mirrors the real module's rising-edge gating (see #52): only
          * push a ring event on the clean->hooked/redirected transition,

@@ -94,6 +94,16 @@ expect_out "syscalls redirect alert"   "COMPROMISED"    env AC_MOCK_REDIRECT=1 .
 expect_out "syscalls redirect count"   "redirected       : 1" env AC_MOCK_REDIRECT=1 ./anticheat syscalls
 expect_out "syscalls checksum mismatch" "MISMATCH"      env AC_MOCK_REDIRECT=1 ./anticheat syscalls
 
+echo "== syscall integrity: checksum-only mismatch (#63 review fix) =="
+# Handler churn that flips the whole-table checksum without tripping any
+# per-slot hook/redirect counter (e.g. a slot going non-zero -> 0) must
+# still be reported as COMPROMISED with a non-zero exit code, not silently
+# swallowed by a verdict that only looks at out->hooked/out->redirected.
+expect_rc  "syscalls checksum-only -> rc 2" 2 env AC_MOCK_CHECKSUM_ONLY=1 ./anticheat syscalls
+expect_out "syscalls checksum-only alert" "COMPROMISED"  env AC_MOCK_CHECKSUM_ONLY=1 ./anticheat syscalls
+expect_out "syscalls checksum-only mismatch shown" "MISMATCH" env AC_MOCK_CHECKSUM_ONLY=1 ./anticheat syscalls
+expect_out "syscalls checksum-only hooked/redirected both zero" "hooked           : 0" env AC_MOCK_CHECKSUM_ONLY=1 ./anticheat syscalls
+
 echo "== hidden module detection =="
 expect_rc  "modules -> rc 2 (hidden)" 2 ./anticheat modules
 expect_out "modules: hidden count"     "hidden modules: 1" ./anticheat modules

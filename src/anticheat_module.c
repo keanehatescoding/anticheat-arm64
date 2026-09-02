@@ -357,10 +357,19 @@ static bool ac_syscall_baseline_ready;
 /* Per-slot rising-edge state for AC_EV_SYSCALL_REDIRECT, same rationale
  * as ac_hooked_bitmap above (avoid re-emitting every 5s poll). */
 static unsigned long ac_redirect_bitmap[BITS_TO_LONGS(__NR_syscalls)];
+/* Set for slot i once ac_syscall_baseline[i] holds a value read straight
+ * from the table (at boot, or backfilled below) rather than the 0 stored
+ * for a slot whose read failed. A real handler address is never 0, so 0
+ * is an unambiguous "no baseline" sentinel; this bitmap only exists to
+ * make that explicit instead of relying on the value being falsy. */
+static unsigned long ac_baseline_captured[BITS_TO_LONGS(__NR_syscalls)];
 
 /* Called once from ac_init(), after ac_syscall_table is located. A read
- * failure on any individual slot is treated as an empty (0) entry, same
- * as ac_check_syscalls() below, so the two are directly comparable. */
+ * failure on any individual slot leaves that slot uncaptured (0, bit
+ * clear in ac_baseline_captured) rather than aborting the whole
+ * baseline -- ac_check_syscalls() below backfills such a slot from the
+ * first later successful read, so a boot-time hiccup on one slot only
+ * narrows (doesn't defeat) redirect detection for it. */
 static void ac_capture_syscall_baseline(void)
 {
     unsigned long base = ac_syscall_table;
@@ -372,7 +381,9 @@ static void ac_capture_syscall_baseline(void)
     for (i = 0; i < __NR_syscalls; i++) {
         unsigned long e = 0;
 
-        if (ac_kread(&e, (void *)(base + i * sizeof(e)), sizeof(e)))
+        if (!ac_kread(&e, (void *)(base + i * sizeof(e)), sizeof(e)) && e)
+            __set_bit(i, ac_baseline_captured);
+        else
             e = 0;
         ac_syscall_baseline[i] = e;
     }
@@ -398,9 +409,6 @@ static int ac_check_syscalls(struct ac_syscall_check *out)
 
     out->nr_syscalls = __NR_syscalls;
     out->baseline_ready = ac_syscall_baseline_ready;
-    if (ac_syscall_baseline_ready)
-        strscpy(out->baseline_sha256, ac_syscall_baseline_hex,
-                sizeof(out->baseline_sha256));
 
     ac_sha256_init(&hash);
     for (i = 0; i < __NR_syscalls; i++) {
@@ -412,21 +420,45 @@ static int ac_check_syscalls(struct ac_syscall_check *out)
                        * baseline capture above so the two hash identically */
         ac_sha256_update(&hash, &e, sizeof(e));
 
-        if (ac_syscall_baseline_ready && e && ac_syscall_baseline[i] &&
-            e != ac_syscall_baseline[i]) {
-            if (!ac_entry_bad(e)) {
-                /* still inside core text but a different handler than what
-                 * was there at boot -- the in-text-redirect case. */
-                out->redirected++;
-                if (!test_and_set_bit(i, ac_redirect_bitmap))
-                    ac_emit(AC_EV_SYSCALL_REDIRECT, 0, "?",
-                            "syscall[%u] handler changed 0x%lx -> 0x%lx (still core text)",
-                            i, ac_syscall_baseline[i], e);
+        /* A read failure this round (e == 0) means nothing was actually
+         * observed -- leave ac_redirect_bitmap exactly as it was instead
+         * of treating it as "back to baseline". Clearing it here would
+         * both hide a redirect that's still there and, on the next
+         * successful read of an unchanged-but-still-redirected slot,
+         * re-trigger AC_EV_SYSCALL_REDIRECT via the rising-edge check
+         * below, defeating the once-per-transition dedup. */
+        if (ac_syscall_baseline_ready && e) {
+            if (!test_bit(i, ac_baseline_captured)) {
+                /* Boot-time capture never got a reading for this slot
+                 * (ac_table_plausible() already validated hundreds of
+                 * other entries, so this is a narrow per-slot hiccup, not
+                 * a misidentified table). Adopt this first later reading
+                 * as the baseline now instead of leaving the slot
+                 * permanently exempt from redirect detection -- this
+                 * only narrows, same as the already-accepted
+                 * pre-snapshot-redirect gap in THREAT_MODEL.md, the
+                 * window in which a redirect installed before the
+                 * backfill would be captured as "normal". */
+                ac_syscall_baseline[i] = e;
+                __set_bit(i, ac_baseline_captured);
+                ac_sha256_hex(ac_syscall_baseline, sizeof(ac_syscall_baseline),
+                              ac_syscall_baseline_hex);
+                clear_bit(i, ac_redirect_bitmap);
+            } else if (e != ac_syscall_baseline[i]) {
+                if (!ac_entry_bad(e)) {
+                    /* still inside core text but a different handler than
+                     * what was there at boot -- the in-text-redirect case. */
+                    out->redirected++;
+                    if (!test_and_set_bit(i, ac_redirect_bitmap))
+                        ac_emit(AC_EV_SYSCALL_REDIRECT, 0, "?",
+                                "syscall[%u] handler changed 0x%lx -> 0x%lx (still core text)",
+                                i, ac_syscall_baseline[i], e);
+                } else {
+                    clear_bit(i, ac_redirect_bitmap);
+                }
             } else {
                 clear_bit(i, ac_redirect_bitmap);
             }
-        } else {
-            clear_bit(i, ac_redirect_bitmap);
         }
 
         if (!e)
@@ -443,6 +475,10 @@ static int ac_check_syscalls(struct ac_syscall_check *out)
             clear_bit(i, ac_hooked_bitmap);
         }
     }
+    if (ac_syscall_baseline_ready)
+        strscpy(out->baseline_sha256, ac_syscall_baseline_hex,
+                sizeof(out->baseline_sha256));   /* after the loop: reflects
+                                                    * any backfill above */
     ac_sha256_final(&hash, digest);
     ac_sha256_hex_digest(digest, out->current_sha256);
     out->checksum_mismatch = ac_syscall_baseline_ready &&

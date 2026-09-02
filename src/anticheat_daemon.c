@@ -1504,13 +1504,16 @@ static int cmd_syscalls(void)
     } else {
         printf("  boot baseline    : unavailable (syscall table not located at load)\n");
     }
-    if (c.ok && c.redirected == 0)
+    if (c.ok && c.redirected == 0 && !c.checksum_mismatch)
         printf("  result           : OK — no hooks detected\n");
     else {
         if (!c.ok)
             printf("  result           : COMPROMISED — syscall hooks present!\n");
         if (c.redirected)
             printf("  result           : COMPROMISED — in-text syscall redirect(s) present!\n");
+        if (c.checksum_mismatch && c.ok && c.redirected == 0)
+            printf("  result           : COMPROMISED — syscall checksum mismatch"
+                   " (handler churn not caught by per-slot checks)!\n");
         return 2;
     }
     ac_close();
