@@ -112,6 +112,28 @@ echo "== error paths =="
 expect_rc  "scan without --pid"       1 ./anticheat scan
 expect_rc  "protect without args"     1 ./anticheat protect
 
+echo "== daemon/module ABI version handshake =="
+# Matching version: the daemon's compiled-in AC_IOCTL_VERSION vs. what the
+# mock reports (default, unmodified) -- start must get past the handshake
+# and into its normal run loop, so a short foreground run that exits
+# cleanly on SIGTERM proves the check didn't reject a healthy pairing.
+out=$(timeout -k 2 --preserve-status 2 ./anticheat start --foreground 2>&1)
+rc=$?
+if [ "$rc" -eq 0 ]; then pass "start: matching version proceeds"; else fail "start: matching version (rc=$rc)"; fi
+
+# Mismatched version: die() fires before any fork, so this returns
+# immediately with no timeout needed -- a hang here would itself be a bug.
+expect_rc  "start: mismatched version fails fast" 1 \
+    env AC_MOCK_VERSION=99 ./anticheat start --foreground
+expect_out "start: mismatched version error names both versions" \
+    "version mismatch" env AC_MOCK_VERSION=99 ./anticheat start --foreground
+expect_out "start: mismatched version error names daemon's version" \
+    "AC_IOCTL_VERSION=1" env AC_MOCK_VERSION=99 ./anticheat start --foreground
+expect_out "start: mismatched version error names module's version" \
+    "version=99" env AC_MOCK_VERSION=99 ./anticheat start --foreground
+expect_out "start: mismatched version error refuses to start" \
+    "refusing to start" env AC_MOCK_VERSION=99 ./anticheat start --foreground
+
 echo "== monitoring daemon (start --foreground) =="
 # --preserve-status: report the command's own exit status; a clean exit after
 # SIGTERM is rc=0, a hang is caught by -k (SIGKILL -> 137).

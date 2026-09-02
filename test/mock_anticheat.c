@@ -21,6 +21,8 @@
  *   AC_MOCK_ROOT=1      fake root (geteuid == 0)
  *   AC_MOCK_ATTACK=1    simulate a ptrace attack (PTRACE-DENIED events)
  *   AC_MOCK_HOOKED=1    simulate a compromised syscall table
+ *   AC_MOCK_VERSION=N   report ioctl ABI version N instead of the real
+ *                       AC_IOCTL_VERSION (simulates a stale module)
  *   AC_MOCK_STATE=path  state file location
  */
 #define _GNU_SOURCE
@@ -245,8 +247,13 @@ static int do_ioctl(unsigned long req, void *arg)
     switch (req) {
     case AC_IOCTL_STATUS: {
         struct ac_status *st = arg;
+        const char *vover = getenv("AC_MOCK_VERSION");
 
-        st->version = AC_IOCTL_VERSION;
+        /* AC_MOCK_VERSION lets tests simulate a stale module/daemon
+         * pairing by reporting a version other than the one this mock
+         * (and the real module) actually speaks. */
+        st->version = (vover && *vover) ?
+            (unsigned long long)strtoull(vover, NULL, 0) : AC_IOCTL_VERSION;
         st->syscall_table_addr = 0xffffffff82d02300ULL; /* mirrors this kernel */
         st->active_procs = S.nprots;
         st->events_dropped = S.events_dropped_total;
