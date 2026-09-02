@@ -21,6 +21,8 @@ test/thread_exit_migration_test
 test/thread_spawn_after_protect_test
 test/ioctl_fuzz
 test/baseline_test
+test/ac_report_status_test
+test/ac_report_url_test
 
 # runtime state
 *.log

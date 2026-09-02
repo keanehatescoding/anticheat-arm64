@@ -27,6 +27,7 @@ TERM_KILLER_PID=""
 TP_SERVER_PID=""
 NOTP_SERVER_PID=""
 ROT_SERVER_PID=""
+UNIX_SERVER_PID=""
 # cleanup is invoked via trap below; shellcheck cannot always see that
 # shellcheck disable=SC2317,SC2329
 cleanup() {
@@ -40,6 +41,7 @@ cleanup() {
     [ -n "$TP_SERVER_PID" ] && kill "$TP_SERVER_PID" 2>/dev/null
     [ -n "$NOTP_SERVER_PID" ] && kill "$NOTP_SERVER_PID" 2>/dev/null
     [ -n "$ROT_SERVER_PID" ] && kill "$ROT_SERVER_PID" 2>/dev/null
+    [ -n "$UNIX_SERVER_PID" ] && kill "$UNIX_SERVER_PID" 2>/dev/null
     wait "$SERVER_PID" 2>/dev/null
     wait "$RL_SERVER_PID" 2>/dev/null
     wait "$TERM_SERVER_PID" 2>/dev/null
@@ -47,6 +49,7 @@ cleanup() {
     wait "$TP_SERVER_PID" 2>/dev/null
     wait "$NOTP_SERVER_PID" 2>/dev/null
     wait "$ROT_SERVER_PID" 2>/dev/null
+    wait "$UNIX_SERVER_PID" 2>/dev/null
     rm -f "$DB" "$DB-wal" "$DB-shm"
 }
 trap cleanup EXIT
@@ -826,6 +829,91 @@ kill "$ROT_SERVER_PID" 2>/dev/null
 wait "$ROT_SERVER_PID" 2>/dev/null
 ROT_SERVER_PID=""
 rm -rf "$ROT_TESTDIR"
+
+# --unix-socket transport (#67): a dedicated instance listening on an
+# AF_UNIX socket instead of TCP -- the alternative to plain-HTTP-over-TCP
+# this test exercises end to end (report ingestion, auth, the fixed
+# "unix" source_addr placeholder, and the socket's own file permissions),
+# the same way the daemon side is covered by test/ac_report_url_test.c's
+# AC_REPORT_URL=unix://... parsing checks.
+UNIX_TESTDIR="$(mktemp -d /tmp/ac_server_unix_test.XXXXXXXX)"
+UNIX_SOCK="$UNIX_TESTDIR/ac_server.sock"
+UNIX_DB="$UNIX_TESTDIR/ac_server.db"
+UNIX_CID="test-unix-$$"
+AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
+    python3 ./ac_server.py --unix-socket "$UNIX_SOCK" --db "$UNIX_DB" \
+    --rate-limit 500 --rate-window 60 \
+    >"$UNIX_TESTDIR/server.log" 2>&1 &
+UNIX_SERVER_PID=$!
+
+UNIX_READY=0
+for _ in $(seq 1 50); do
+    if curl -s --unix-socket "$UNIX_SOCK" http://localhost/banned/x \
+        -H "Authorization: Bearer $ADMIN_KEY" 2>/dev/null \
+        | grep -q '"banned"'; then
+        UNIX_READY=1
+        break
+    fi
+    sleep 0.1
+done
+
+if [ "$UNIX_READY" -ne 1 ]; then
+    fail "--unix-socket server never became ready at $UNIX_SOCK"
+else
+    # socket file must be private (0600), same trust-boundary reasoning
+    # as the DB file's own 0600 check at the top of this script.
+    UNIX_SOCK_MODE=$(stat -c '%a' "$UNIX_SOCK")
+    if [ "$UNIX_SOCK_MODE" = "600" ]; then
+        pass "unix socket created with private mode 0600"
+    else
+        fail "unix socket should be 0600 (got $UNIX_SOCK_MODE)"
+    fi
+
+    # report ingestion works the same as over TCP
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$UNIX_SOCK" \
+        -X POST http://localhost/report \
+        -H "Authorization: Bearer $REPORT_KEY" -H 'Content-Type: application/json' \
+        -d "{\"client_id\":\"$UNIX_CID\",\"event_type\":\"CRITICAL\",\"detail\":\"syscall hook\",\"ts\":123}")
+    if [ "$CODE" = "201" ]; then
+        pass "POST /report over --unix-socket with valid report key -> 201"
+    else
+        fail "POST /report over --unix-socket (got $CODE)"
+    fi
+
+    # auth tiers stay separate over this transport too
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$UNIX_SOCK" \
+        -X POST http://localhost/report \
+        -H "Authorization: Bearer wrong" -H 'Content-Type: application/json' \
+        -d "{\"client_id\":\"$UNIX_CID\",\"event_type\":\"X\",\"detail\":\"x\",\"ts\":1}")
+    if [ "$CODE" = "401" ]; then
+        pass "POST /report over --unix-socket with wrong key -> 401"
+    else
+        fail "POST /report over --unix-socket with wrong key (got $CODE)"
+    fi
+
+    # every connection over this transport is identified by the same
+    # fixed "unix" placeholder (see ThreadingUnixHTTPServer.get_request)
+    # instead of a per-peer network address -- there is no meaningful
+    # per-client IP to report on a local socket.
+    OUT=$(curl -s --unix-socket "$UNIX_SOCK" "http://localhost/reports/$UNIX_CID" \
+        -H "Authorization: Bearer $ADMIN_KEY")
+    if printf '%s' "$OUT" | grep -q '"source_addr": "unix"'; then
+        pass "report over --unix-socket records source_addr \"unix\""
+    else
+        fail "expected source_addr \"unix\" (out: $OUT)"
+    fi
+fi
+kill "$UNIX_SERVER_PID" 2>/dev/null
+wait "$UNIX_SERVER_PID" 2>/dev/null
+UNIX_SERVER_PID=""
+# A clean shutdown should have unlinked the socket file itself (see
+# main()'s finally: block) -- confirm it, then remove whatever's left.
+if [ -e "$UNIX_SOCK" ]; then
+    fail "unix socket file was not cleaned up after a clean shutdown"
+else
+    pass "unix socket file removed on clean shutdown"
+fi
+rm -rf "$UNIX_TESTDIR"
 
 # Startup-failure paths: no server needed, just exit code + stderr.
 if AC_SERVER_REPORT_KEY='' AC_SERVER_ADMIN_KEY='' python3 ./ac_server.py \

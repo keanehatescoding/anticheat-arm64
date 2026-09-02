@@ -66,6 +66,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/syslog.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <linux/limits.h>
 
@@ -2813,7 +2814,15 @@ static int check_baselines_periodic(void)
 /*                                                                      */
 /* No TLS: this is plain HTTP, meant for a local/LAN deployment behind  */
 /* a reverse proxy that terminates TLS for anything reachable over an   */
-/* untrusted network. AC_REPORT_URL is host:port, no scheme.            */
+/* untrusted network. AC_REPORT_URL is either "host:port" (plain TCP,   */
+/* no scheme) or "unix:///path/to/socket" (AF_UNIX SOCK_STREAM instead  */
+/* of a network socket -- the same HTTP/1.1 request framing goes out    */
+/* either way, ac_server.py just needs to be listening on that path via */
+/* its own --unix-socket, see server/ac_server.py). The Unix-socket     */
+/* option trades the plaintext-network-credential exposure noted above  */
+/* for filesystem permissions on the socket as the trust boundary --    */
+/* the natural fit when the daemon and server are co-located, which is  */
+/* the deployment this project actually expects (see THREAT_MODEL.md).  */
 /* ------------------------------------------------------------------ */
 #define AC_REPORT_TIMEOUT_SEC 3
 
@@ -3087,14 +3096,78 @@ static int ac_http_status_code(const char *resp)
     return (p[0] - '0') * 100 + (p[1] - '0') * 10 + (p[2] - '0');
 }
 
+#define AC_REPORT_UNIX_PREFIX "unix://"
+
+/* A parsed AC_REPORT_URL: either a TCP host:port, or an AF_UNIX socket
+ * path. `host` is dual-purpose -- for TCP it's the bare hostname passed
+ * to ac_resolve_timeout() and reused verbatim as the HTTP Host: header;
+ * for a unix:// destination there's no real hostname, so it's filled
+ * with a fixed "localhost" placeholder for the Host: header only (the
+ * same convention curl's --unix-socket uses), and sock_path carries the
+ * actual filesystem path instead. */
+struct ac_report_dest {
+    int is_unix;
+    char host[256];
+    char port[32];
+    char sock_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+};
+
+/* Parses AC_REPORT_URL into *out. Returns 0 on success; returns -1 on a
+ * malformed URL, having already logged what's wrong to stderr. Kept
+ * separate from ac_report() itself so the parsing logic is unit-testable
+ * without needing a real socket -- see test/ac_report_url_test.c. */
+static int ac_report_parse_url(const char *url, struct ac_report_dest *out)
+{
+    memset(out, 0, sizeof(*out));
+
+    if (strncmp(url, AC_REPORT_UNIX_PREFIX,
+                strlen(AC_REPORT_UNIX_PREFIX)) == 0) {
+        const char *path = url + strlen(AC_REPORT_UNIX_PREFIX);
+
+        if (!*path) {
+            fprintf(stderr,
+                    "ac_report: unix:// AC_REPORT_URL missing a socket "
+                    "path\n");
+            return -1;
+        }
+        /* sun_path has no room for a trailing NUL past this length --
+         * reject up front instead of silently truncating the path and
+         * connecting to the wrong (or a nonexistent) socket. */
+        if (strlen(path) >= sizeof(out->sock_path)) {
+            fprintf(stderr, "ac_report: unix socket path too long: %s\n",
+                    path);
+            return -1;
+        }
+        out->is_unix = 1;
+        snprintf(out->sock_path, sizeof(out->sock_path), "%s", path);
+        snprintf(out->host, sizeof(out->host), "localhost");
+        return 0;
+    }
+
+    {
+        char *colon;
+
+        snprintf(out->host, sizeof(out->host), "%s", url);
+        colon = strrchr(out->host, ':');
+        if (!colon) {
+            fprintf(stderr,
+                    "ac_report: AC_REPORT_URL must be host:port or "
+                    "unix:///path/to/socket\n");
+            return -1;
+        }
+        *colon = '\0';
+        snprintf(out->port, sizeof(out->port), "%s", colon + 1);
+        return 0;
+    }
+}
+
 static void ac_report(const char *event_type, const char *detail)
 {
     const char *url = getenv("AC_REPORT_URL");
     const char *key = getenv("AC_REPORT_KEY");
-    char host[256], client_id[128], et_esc[64], detail_esc[600];
+    char client_id[128], et_esc[64], detail_esc[600];
     char body[1024], req[2048], resp[64];
-    const char *port;
-    char *colon;
+    struct ac_report_dest dest;
     struct ac_resolved_addr addrs[AC_RESOLVE_MAX];
     int fd = -1, naddrs, ai;
     struct timeval tv;
@@ -3103,14 +3176,8 @@ static void ac_report(const char *event_type, const char *detail)
     if (!url || !*url || !key || !*key)
         return;   /* not configured -- silently a no-op, by design */
 
-    snprintf(host, sizeof(host), "%s", url);
-    colon = strrchr(host, ':');
-    if (!colon) {
-        fprintf(stderr, "ac_report: AC_REPORT_URL must be host:port\n");
-        return;
-    }
-    *colon = '\0';
-    port = colon + 1;
+    if (ac_report_parse_url(url, &dest) != 0)
+        return;   /* ac_report_parse_url() already logged what's wrong */
 
     ac_report_client_id(client_id, sizeof(client_id));
     ac_json_escape(event_type, et_esc, sizeof(et_esc));
@@ -3120,33 +3187,66 @@ static void ac_report(const char *event_type, const char *detail)
              "\"ts\":%lld}",
              client_id, et_esc, detail_esc, (long long)time(NULL));
 
-    naddrs = ac_resolve_timeout(host, port, addrs, AC_RESOLVE_MAX,
-                                 AC_REPORT_TIMEOUT_SEC);
-    if (naddrs <= 0) {
-        fprintf(stderr, "ac_report: could not resolve %s:%s\n", host, port);
-        return;
-    }
-    /* A hung/unreachable report server must never stall the security
-     * monitoring loop -- ac_connect_timeout() bounds connect() itself
-     * (which SO_SNDTIMEO/SO_RCVTIMEO do not, on Linux), and those two
-     * still bound the subsequent send/recv on whichever address works. */
-    for (ai = 0; ai < naddrs; ai++) {
-        fd = socket(addrs[ai].family, addrs[ai].socktype, addrs[ai].protocol);
-        if (fd < 0)
-            continue;
+    if (dest.is_unix) {
+        struct sockaddr_un sun;
+
+        memset(&sun, 0, sizeof(sun));
+        sun.sun_family = AF_UNIX;
+        /* dest.sock_path is already bounded to sizeof(sun.sun_path) by
+         * ac_report_parse_url(), so this can't overflow. */
+        memcpy(sun.sun_path, dest.sock_path, sizeof(sun.sun_path));
+
+        fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0) {
+            fprintf(stderr, "ac_report: socket() failed: %s\n",
+                    strerror(errno));
+            return;
+        }
         tv.tv_sec = AC_REPORT_TIMEOUT_SEC;
         tv.tv_usec = 0;
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        if (ac_connect_timeout(fd, (struct sockaddr *)&addrs[ai].addr,
-                                addrs[ai].addrlen, AC_REPORT_TIMEOUT_SEC) == 0)
-            break;
-        close(fd);
-        fd = -1;
-    }
-    if (fd < 0) {
-        fprintf(stderr, "ac_report: could not connect to %s:%s\n", host, port);
-        return;
+        if (ac_connect_timeout(fd, (struct sockaddr *)&sun, sizeof(sun),
+                                AC_REPORT_TIMEOUT_SEC) != 0) {
+            fprintf(stderr,
+                    "ac_report: could not connect to unix socket %s: %s\n",
+                    dest.sock_path, strerror(errno));
+            close(fd);
+            return;
+        }
+    } else {
+        naddrs = ac_resolve_timeout(dest.host, dest.port, addrs,
+                                     AC_RESOLVE_MAX, AC_REPORT_TIMEOUT_SEC);
+        if (naddrs <= 0) {
+            fprintf(stderr, "ac_report: could not resolve %s:%s\n",
+                    dest.host, dest.port);
+            return;
+        }
+        /* A hung/unreachable report server must never stall the security
+         * monitoring loop -- ac_connect_timeout() bounds connect() itself
+         * (which SO_SNDTIMEO/SO_RCVTIMEO do not, on Linux), and those two
+         * still bound the subsequent send/recv on whichever address works. */
+        for (ai = 0; ai < naddrs; ai++) {
+            fd = socket(addrs[ai].family, addrs[ai].socktype,
+                        addrs[ai].protocol);
+            if (fd < 0)
+                continue;
+            tv.tv_sec = AC_REPORT_TIMEOUT_SEC;
+            tv.tv_usec = 0;
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            if (ac_connect_timeout(fd, (struct sockaddr *)&addrs[ai].addr,
+                                    addrs[ai].addrlen,
+                                    AC_REPORT_TIMEOUT_SEC) == 0)
+                break;
+            close(fd);
+            fd = -1;
+        }
+        if (fd < 0) {
+            fprintf(stderr, "ac_report: could not connect to %s:%s\n",
+                    dest.host, dest.port);
+            return;
+        }
     }
 
     {
@@ -3159,7 +3259,7 @@ static void ac_report(const char *event_type, const char *detail)
                  "Connection: close\r\n"
                  "\r\n"
                  "%s",
-                 host, key, strlen(body), body);
+                 dest.host, key, strlen(body), body);
 
         /* snprintf() returns the length the fully-formatted request would
          * have needed, even when it truncated req[] to fit -- an

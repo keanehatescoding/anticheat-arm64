@@ -30,6 +30,16 @@ rotation window -- see --report-key-old/--admin-key-old below. There is no
 built-in TLS -- run this behind a reverse proxy for anything reachable
 over an untrusted network, or keep it LAN/localhost-only, which is the
 deployment this was actually built and tested against.
+
+Alternatively, pass --unix-socket PATH to listen on an AF_UNIX
+SOCK_STREAM socket instead of TCP (--host/--port are ignored when this is
+set) -- the matching daemon-side option is AC_REPORT_URL=unix://PATH (see
+ac_report() in src/anticheat_daemon.c). This removes the plaintext-
+network-credential exposure noted above for a daemon and server
+co-located on the same host: filesystem permissions on the socket become
+the trust boundary instead of network reachability. The socket is created
+0600 (owner-only) to match Store's own DB-file permissions -- widen that
+if the daemon runs as a different user than this server.
 """
 import argparse
 import hmac
@@ -40,6 +50,7 @@ import os
 import re
 import signal
 import socket
+import socketserver
 import sqlite3
 import sys
 import threading
@@ -93,6 +104,65 @@ class RateLimiter:
 
 def now_ts():
     return int(time.time())
+
+
+UNIX_CLIENT_ADDRESS = ("unix", 0)
+
+
+class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    """The --unix-socket transport: same request handling as
+    ThreadingHTTPServer, just over an AF_UNIX SOCK_STREAM socket bound to
+    a filesystem path instead of a TCP (host, port). http.server.HTTPServer
+    itself is transport-agnostic (it only calls socket.socket(self.address_family,
+    self.socket_type) and self.socket.bind(self.server_address)) -- the two
+    overrides below are the only AF_UNIX-specific behavior needed."""
+
+    address_family = socket.AF_UNIX
+
+    def server_bind(self):
+        # Binding an AF_UNIX SOCK_STREAM socket fails outright if a file
+        # already exists at that path -- unlike a TCP port, which is free
+        # again as soon as the previous listener closes it (modulo
+        # TIME_WAIT, which allow_reuse_address already handles). Without
+        # this, every restart after the very first one would fail with
+        # "address already in use" against the stale socket file the
+        # previous run left behind.
+        try:
+            os.unlink(self.server_address)
+        except FileNotFoundError:
+            pass
+        # Deliberately socketserver.TCPServer.server_bind(), not
+        # http.server.HTTPServer.server_bind(): the latter does
+        # `host, port = self.server_address[:2]` afterward, assuming a TCP
+        # (host, port) tuple -- for AF_UNIX, server_address is a path
+        # string, and slicing a 2+ char string still "unpacks" into two
+        # single-character strings without raising, silently assigning
+        # garbage (e.g. the path's first two characters) to
+        # server_name/server_port instead of failing loudly. Nothing here
+        # actually uses those two attributes, but there's no reason to let
+        # them hold nonsense when a real placeholder is just as cheap.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "unix"
+        self.server_port = 0
+        # Match Store's own DB-file permissions (0600, see Store.__init__):
+        # filesystem permissions on this socket are the trust boundary for
+        # the --unix-socket transport (see the module docstring's "No TLS"
+        # / unix-socket note), not whatever the process umask happens to
+        # be at bind time.
+        os.chmod(self.server_address, 0o600)
+
+    def get_request(self):
+        # accept()'s peer address for AF_UNIX is '' (the client end is
+        # usually unbound), not the (host, port) tuple BaseHTTPRequestHandler
+        # expects -- address_string()/log_message() and _client_ip() below
+        # all index self.client_address[0] assuming that shape. Every
+        # connection on this transport is already trust-boundary-gated by
+        # the socket's own filesystem permissions (see server_bind above),
+        # so a single fixed placeholder identifying "some client over the
+        # unix socket" is all that's meaningful here -- there is no
+        # per-peer network address to report or rate-limit on separately.
+        request, _client_address = super().get_request()
+        return request, UNIX_CLIENT_ADDRESS
 
 
 def _requires_auth(keys):
@@ -547,6 +617,17 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8787)
+    ap.add_argument(
+        "--unix-socket",
+        default=None,
+        metavar="PATH",
+        help="listen on an AF_UNIX SOCK_STREAM socket at PATH instead of "
+        "TCP -- --host/--port are ignored when this is set. The matching "
+        "daemon-side option is AC_REPORT_URL=unix://PATH. The socket is "
+        "created 0600 (owner-only); filesystem permissions on it are the "
+        "trust boundary for this transport, same role network exposure "
+        "plays for the default TCP one (default: off, use TCP)",
+    )
     ap.add_argument("--db", default="ac_server.db")
     ap.add_argument(
         "--max-reports-per-client",
@@ -668,7 +749,10 @@ def main():
     handler = make_handler(
         store, report_keys, admin_keys, rate_limiter, args.trust_proxy
     )
-    httpd = http.server.ThreadingHTTPServer((args.host, args.port), handler)
+    if args.unix_socket:
+        httpd = ThreadingUnixHTTPServer(args.unix_socket, handler)
+    else:
+        httpd = http.server.ThreadingHTTPServer((args.host, args.port), handler)
     # Drain in-flight requests on shutdown instead of abandoning them.
     # ThreadingHTTPServer defaults daemon_threads=True, under which
     # server_close() below does NOT wait for handler threads still running
@@ -701,11 +785,19 @@ def main():
             " (key rotation in progress: %s accepted)\n"
             % ", ".join(accepted_old_keys)
         )
+    if args.unix_socket:
+        listen_desc = (
+            "unix socket %s (0600, filesystem permissions are the trust "
+            "boundary -- see --unix-socket's help)" % args.unix_socket
+        )
+    else:
+        listen_desc = (
+            "%s:%d (plain HTTP -- put a TLS reverse proxy in front for "
+            "anything beyond localhost/LAN)" % (args.host, args.port)
+        )
     sys.stderr.write(
-        "ac_server: listening on %s:%d, db=%s, rate limit %d req/%ds per IP "
-        "(plain HTTP -- put a TLS reverse proxy in front for anything "
-        "beyond localhost/LAN)\n"
-        % (args.host, args.port, args.db, args.rate_limit, args.rate_window)
+        "ac_server: listening on %s, db=%s, rate limit %d req/%ds per IP\n"
+        % (listen_desc, args.db, args.rate_limit, args.rate_window)
     )
     if rotation_note:
         sys.stderr.write("ac_server:%s" % rotation_note)
@@ -716,6 +808,15 @@ def main():
     finally:
         httpd.shutdown()      # no-op/near-instant if SIGTERM already did this
         httpd.server_close()
+        if args.unix_socket:
+            # Tidy up the socket file on a clean exit -- not required for
+            # correctness (server_bind() above unlinks a stale one on the
+            # next start regardless), just avoids leaving a dead socket
+            # file lying around after a normal shutdown.
+            try:
+                os.unlink(args.unix_socket)
+            except FileNotFoundError:
+                pass
 
 
 if __name__ == "__main__":
