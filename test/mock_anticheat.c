@@ -258,16 +258,16 @@ static int do_ioctl(unsigned long req, void *arg)
         struct ac_proc_id *id = arg;
         unsigned int i;
 
-        if (S.nprots >= AC_MAX_PROTS) {
-            errno = ENOSPC;
-            return -1;
-        }
         for (i = 0; i < S.nprots; i++)
             if (S.prots[i].pid == id->pid) {
                 S.prots[i].jit_allowed = id->jit_allowed;  /* updatable via re-protect */
                 save_state();
                 return 0;   /* already protected */
             }
+        if (S.nprots >= AC_MAX_PROTS) {
+            errno = ENOSPC;
+            return -1;
+        }
         read_comm(id->pid, id->comm, sizeof(id->comm));
         S.prots[S.nprots].pid = id->pid;
         S.prots[S.nprots].jit_allowed = id->jit_allowed;
