@@ -267,6 +267,7 @@ static int do_ioctl(unsigned long req, void *arg)
                 return 0;   /* already protected */
         read_comm(id->pid, id->comm, sizeof(id->comm));
         S.prots[S.nprots].pid = id->pid;
+        S.prots[S.nprots].jit_allowed = id->jit_allowed;
         snprintf(S.prots[S.nprots].comm, sizeof(S.prots[S.nprots].comm),
                  "%s", id->comm);
         S.nprots++;

@@ -385,7 +385,8 @@ static int cmd_list(void)
         return 1;
     printf("%u protected process(es):\n", pl.count);
     for (i = 0; i < pl.count; i++)
-        printf("  pid %-8d %s\n", pl.items[i].pid, pl.items[i].comm);
+        printf("  pid %-8d %-16s jit=%s\n", pl.items[i].pid,
+               pl.items[i].comm, pl.items[i].jit_allowed ? "yes" : "no");
     ac_close();
     return 0;
 }
