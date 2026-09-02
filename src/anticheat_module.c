@@ -1826,7 +1826,25 @@ static int __init ac_init(void)
 {
     int ret;
 
-    ac_wq = create_workqueue("anticheat");
+    /*
+     * ac_schedule_kill() (see below) queues a tiny, non-blocking work item
+     * (get_pid_task/send_sig/put_task_struct/put_pid/kfree — no sleeping,
+     * no heavy CPU use) from kprobe context, i.e. atomic context, via
+     * kmalloc(GFP_ATOMIC) + queue_work(). WQ_MEM_RECLAIM preserves
+     * create_workqueue()'s guarantee of a rescuer thread so kill delivery
+     * still makes forward progress under memory pressure. WQ_HIGHPRI gets
+     * the kill dispatched ahead of ordinary work, which matters here since
+     * this is the delivery path for terminating a process that just
+     * attacked a protected one. Left bound (WQ_PERCPU, matching the
+     * legacy per-cpu default) rather than WQ_UNBOUND: the work is queued
+     * from the same CPU that took the kprobe hit, and bound execution
+     * keeps that cache locality without the NUMA/affinity machinery
+     * unbound queues carry, which this single-work-item queue has no use
+     * for. max_active 0 (default) preserves the original queue's
+     * uncapped concurrency.
+     */
+    ac_wq = alloc_workqueue("anticheat",
+                             WQ_MEM_RECLAIM | WQ_HIGHPRI | WQ_PERCPU, 0);
     if (!ac_wq)
         return -ENOMEM;
 
