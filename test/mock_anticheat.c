@@ -263,8 +263,11 @@ static int do_ioctl(unsigned long req, void *arg)
             return -1;
         }
         for (i = 0; i < S.nprots; i++)
-            if (S.prots[i].pid == id->pid)
+            if (S.prots[i].pid == id->pid) {
+                S.prots[i].jit_allowed = id->jit_allowed;  /* updatable via re-protect */
+                save_state();
                 return 0;   /* already protected */
+            }
         read_comm(id->pid, id->comm, sizeof(id->comm));
         S.prots[S.nprots].pid = id->pid;
         S.prots[S.nprots].jit_allowed = id->jit_allowed;

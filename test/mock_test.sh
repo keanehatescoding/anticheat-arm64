@@ -67,6 +67,8 @@ expect_out "list shows jit=no by default" "jit=no"      ./anticheat list
 expect_rc  "unprotect (before jit re-protect)" 0 ./anticheat unprotect --pid $$
 expect_rc  "protect --pid \$\$ --jit"  0 ./anticheat protect --pid $$ --jit
 expect_out "list shows jit=yes"        "jit=yes"        ./anticheat list
+expect_rc  "re-protect --pid \$\$ (drop --jit)" 0 ./anticheat protect --pid $$
+expect_out "list updates jit=no on re-protect" "jit=no" ./anticheat list
 expect_rc  "protect --comm bash"      0 ./anticheat protect --comm bash
 expect_rc  "unprotect"                0 ./anticheat unprotect --pid $$
 
