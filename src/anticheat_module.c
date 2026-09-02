@@ -51,6 +51,8 @@
 #include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/wait.h>
+#include <linux/jiffies.h>
 #include <linux/string.h>
 #include <linux/dcache.h>
 #include <linux/version.h>
@@ -474,6 +476,12 @@ static u64 ac_ring_removed;
  * eviction racing a single GET_EVENTS call, not two GET_EVENTS calls
  * racing each other. */
 static DEFINE_MUTEX(ac_get_events_lock);
+/* Woken any time ac_emit() pushes a new entry, so AC_IOCTL_GET_EVENTS can
+ * block until the ring is actually non-empty instead of polling on a
+ * fixed cadence (see the wait in its ioctl handler below). Only ever
+ * used to wake blocked GET_EVENTS callers -- it carries no data of its
+ * own, ac_ring_lock/ac_ring_count remain the source of truth. */
+static DECLARE_WAIT_QUEUE_HEAD(ac_event_wq);
 
 static void ac_emit(unsigned int type, int pid, const char *comm,
                     const char *fmt, ...)
@@ -501,6 +509,13 @@ static void ac_emit(unsigned int type, int pid, const char *comm,
     ac_ring_head = (ac_ring_head + 1) % AC_RING_SIZE;
     ac_ring_count++;
     spin_unlock_irqrestore(&ac_ring_lock, flags);
+    /* Outside the spinlock: wake_up_interruptible() takes its own lock
+     * (the waitqueue's) and there is no ordering requirement that
+     * requires holding ac_ring_lock across it -- a waiter that checks
+     * ac_ring_count right after this event was already counted in will
+     * always see it non-empty, whether it observes that before or after
+     * this wake-up call. */
+    wake_up_interruptible(&ac_event_wq);
 }
 
 static int ac_drain_events(struct ac_event_list *out)
@@ -1800,9 +1815,51 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
          * input-hardening audit of every ioctl handler, not by symptom. */
         struct ac_event_list *el = kzalloc(sizeof(*el), GFP_KERNEL);
         u64 removed_before;
+        unsigned int block_ms;
+        long wret;
 
         if (!el)
             return -ENOMEM;
+        /* Only block_ms is actually read from the caller -- copy the
+         * whole struct in anyway (matches every other ioctl handler's
+         * copy_from_user pattern) rather than a targeted sub-field copy;
+         * ac_peek_events() below fully overwrites count/dropped/events
+         * regardless of whatever was in the input buffer. */
+        if (copy_from_user(el, uarg, sizeof(*el))) {
+            kfree(el);
+            return -EFAULT;
+        }
+        block_ms = el->block_ms;
+        if (block_ms > AC_GET_EVENTS_MAX_BLOCK_MS)
+            block_ms = AC_GET_EVENTS_MAX_BLOCK_MS;
+
+        /* Block *outside* ac_get_events_lock -- it only needs to be held
+         * across the peek/copy/commit sequence below, and holding it
+         * across a multi-hundred-millisecond sleep would need every
+         * other concurrent GET_EVENTS caller to also block on the mutex
+         * for no reason. wait_event_interruptible_timeout() re-checks
+         * the condition itself on every wake-up, so this is a plain
+         * racy hint, not something that needs ac_ring_lock held: the
+         * actual, authoritative peek happens under the lock afterwards
+         * regardless of why we stopped waiting. Deliberately the
+         * *_interruptible_ variant, not a plain uninterruptible wait --
+         * a caller (the daemon monitor loop) must stay killable/
+         * signal-responsive while blocked here. */
+        if (block_ms) {
+            wret = wait_event_interruptible_timeout(ac_event_wq,
+                        READ_ONCE(ac_ring_count) > 0,
+                        msecs_to_jiffies(block_ms));
+            if (wret < 0) {
+                /* Interrupted by a signal -- propagate -ERESTARTSYS
+                 * rather than silently falling through to an empty
+                 * result, so the caller (and its signal handler, e.g.
+                 * the daemon's SIGTERM/SIGINT stop request) actually
+                 * gets to run instead of this ioctl swallowing it. */
+                kfree(el);
+                return (int)wret;
+            }
+        }
+
         /* Held across the full peek/copy/commit sequence: see
          * ac_get_events_lock's own comment for why ac_ring_lock alone
          * isn't enough to keep two overlapping GET_EVENTS calls from
@@ -1911,7 +1968,28 @@ static int __init ac_init(void)
 {
     int ret;
 
-    ac_wq = create_workqueue("anticheat");
+    /*
+     * ac_schedule_kill() (see below) queues a tiny, non-blocking work item
+     * (get_pid_task/send_sig/put_task_struct/put_pid/kfree — no sleeping,
+     * no heavy CPU use) from kprobe context, i.e. atomic context, via
+     * kmalloc(GFP_ATOMIC) + queue_work(). WQ_MEM_RECLAIM preserves
+     * create_workqueue()'s guarantee of a rescuer thread so kill delivery
+     * still makes forward progress under memory pressure. WQ_HIGHPRI gets
+     * the kill dispatched ahead of ordinary work, which matters here since
+     * this is the delivery path for terminating a process that just
+     * attacked a protected one. WQ_UNBOUND is deliberately omitted rather
+     * than passed: each work item is queued from the CPU that took the
+     * kprobe hit, and bound (per-CPU) execution keeps that cache locality
+     * without the NUMA/affinity machinery unbound queues carry, which
+     * this queue has no use for. max_active 0 selects the kernel's
+     * default cap (WQ_DFL_ACTIVE, 256), raising the limit from
+     * create_workqueue()'s max_active of 1 -- ac_schedule_kill() allocates
+     * a fresh ac_kill_req and queues it on every call, so concurrent
+     * attacks can leave several kill work items in flight at once; that's
+     * fine here since each one only touches its own independently-owned
+     * pid, with no state shared between work items.
+     */
+    ac_wq = alloc_workqueue("anticheat", WQ_MEM_RECLAIM | WQ_HIGHPRI, 0);
     if (!ac_wq)
         return -ENOMEM;
 

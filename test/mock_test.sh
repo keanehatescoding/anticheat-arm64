@@ -63,6 +63,12 @@ expect_out "status: version"          "version"        ./anticheat status
 echo "== protect / list / unprotect =="
 expect_rc  "protect --pid \$\$"        0 ./anticheat protect --pid $$
 expect_out "list shows pid"            "$$"             ./anticheat list
+expect_out "list shows jit=no by default" "jit=no"      ./anticheat list
+expect_rc  "unprotect (before jit re-protect)" 0 ./anticheat unprotect --pid $$
+expect_rc  "protect --pid \$\$ --jit"  0 ./anticheat protect --pid $$ --jit
+expect_out "list shows jit=yes"        "jit=yes"        ./anticheat list
+expect_rc  "re-protect --pid \$\$ (drop --jit)" 0 ./anticheat protect --pid $$
+expect_out "list updates jit=no on re-protect" "jit=no" ./anticheat list
 expect_rc  "protect --comm bash"      0 ./anticheat protect --comm bash
 expect_rc  "unprotect"                0 ./anticheat unprotect --pid $$
 
@@ -118,6 +124,38 @@ expect_out "status: unlocked"          "locked            : 0" ./anticheat statu
 echo "== error paths =="
 expect_rc  "scan without --pid"       1 ./anticheat scan
 expect_rc  "protect without args"     1 ./anticheat protect
+
+echo "== daemon/module ABI version handshake =="
+# Matching version: the daemon's compiled-in AC_IOCTL_VERSION vs. what the
+# mock reports (default, unmodified) -- start must get past the handshake
+# and into its normal run loop, so a short foreground run that exits
+# cleanly on SIGTERM proves the check didn't reject a healthy pairing.
+out=$(timeout -k 2 --preserve-status 2 ./anticheat start --foreground 2>&1)
+rc=$?
+if [ "$rc" -eq 0 ]; then pass "start: matching version proceeds"; else fail "start: matching version (rc=$rc)"; fi
+
+# Mismatched version: die() fires before any fork, so this returns
+# immediately with no timeout needed -- a hang here would itself be a bug.
+# The expected daemon-side version is read from anticheat.h rather than
+# hardcoded, so this doesn't silently go stale the next time
+# AC_IOCTL_VERSION is bumped.
+daemon_ioctl_version=$(sed -n 's/^#define AC_IOCTL_VERSION \([0-9]\+\)/\1/p' src/anticheat.h)
+case "$daemon_ioctl_version" in
+    ''|*[!0-9]*)
+        echo "mock_test.sh: couldn't extract a numeric AC_IOCTL_VERSION from src/anticheat.h" >&2
+        exit 1
+        ;;
+esac
+expect_rc  "start: mismatched version fails fast" 1 \
+    env AC_MOCK_VERSION=99 ./anticheat start --foreground
+expect_out "start: mismatched version error names both versions" \
+    "version mismatch" env AC_MOCK_VERSION=99 ./anticheat start --foreground
+expect_out "start: mismatched version error names daemon's version" \
+    "AC_IOCTL_VERSION=$daemon_ioctl_version" env AC_MOCK_VERSION=99 ./anticheat start --foreground
+expect_out "start: mismatched version error names module's version" \
+    "version=99" env AC_MOCK_VERSION=99 ./anticheat start --foreground
+expect_out "start: mismatched version error refuses to start" \
+    "refusing to start" env AC_MOCK_VERSION=99 ./anticheat start --foreground
 
 echo "== monitoring daemon (start --foreground) =="
 # --preserve-status: report the command's own exit status; a clean exit after

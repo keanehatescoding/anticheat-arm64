@@ -386,7 +386,8 @@ static int cmd_list(void)
         return 1;
     printf("%u protected process(es):\n", pl.count);
     for (i = 0; i < pl.count; i++)
-        printf("  pid %-8d %s\n", pl.items[i].pid, pl.items[i].comm);
+        printf("  pid %-8d %-16s jit=%s\n", pl.items[i].pid,
+               pl.items[i].comm, pl.items[i].jit_allowed ? "yes" : "no");
     ac_close();
     return 0;
 }
@@ -3060,6 +3061,47 @@ static void ac_report_client_id(char *out, size_t outsz)
     snprintf(out, outsz, "unknown");
 }
 
+/* Strict HTTP status-line parser: "HTTP/1.<minor> <code> <reason>", where
+ * <minor> and <code> must each be exactly the digit count RFC 7230's
+ * HTTP-version/status-code grammar specifies (one, three) -- not "one or
+ * more" the way a naive digit-scanning loop would accept. sscanf()'s
+ * "%d" would also accept a leading sign or extra digits -- e.g. a
+ * malformed "HTTP/1.1 +200 OK" is not a valid status line, but "%d"
+ * happily parses it as a real 200 and reports success anyway. The major
+ * version is required to be exactly "1": ac_report() always speaks
+ * plain HTTP/1.x over a raw socket (see the no-TLS note above), so
+ * anything else -- "HTTP/2.0 200 OK" included -- cannot be a genuine
+ * response from the configured report server and must fail closed
+ * rather than being parsed as a 2xx. Returns the parsed code, or -1 if
+ * resp isn't a well-formed status line (fails closed: -1 is never
+ * inside the accepted 2xx range). */
+static int ac_http_status_code(const char *resp)
+{
+    const char *p = resp;
+
+    if (strncmp(p, "HTTP/1.", 7) != 0)
+        return -1;
+    p += 7;
+    if (!isdigit((unsigned char)*p))
+        return -1;
+    p++;
+    if (*p != ' ')
+        return -1;
+    p++;
+    if (!isdigit((unsigned char)p[0]) || !isdigit((unsigned char)p[1]) ||
+        !isdigit((unsigned char)p[2]))
+        return -1;
+    /* The three digits must end at a proper status-line delimiter: a
+     * space before the reason-phrase, a line ending if the reason
+     * phrase is empty, or end-of-buffer if the response was cut off
+     * exactly there. Anything else -- a fourth digit, or a stray
+     * non-space byte glued onto the code like "200X" -- means these
+     * three digits aren't actually the whole status code. */
+    if (p[3] != ' ' && p[3] != '\r' && p[3] != '\n' && p[3] != '\0')
+        return -1;
+    return (p[0] - '0') * 100 + (p[1] - '0') * 10 + (p[2] - '0');
+}
+
 static void ac_report(const char *event_type, const char *detail)
 {
     const char *url = getenv("AC_REPORT_URL");
@@ -3180,13 +3222,49 @@ static void ac_report(const char *event_type, const char *detail)
         }
     }
     n = read(fd, resp, sizeof(resp) - 1);
-    if (n > 0) {
-        resp[n] = '\0';
-        if (!strstr(resp, " 200") && !strstr(resp, " 201"))
-            fprintf(stderr, "ac_report: server response: %.60s\n", resp);
+    {
+        int code = -1;
+        char body[64];
+
+        /* n <= 0 (connection closed before any bytes arrived, or the
+         * read itself failed/timed out) is exactly as much a failed
+         * delivery as a non-2xx status -- resp is uninitialized in that
+         * case, so log a fixed placeholder instead of reading it, but
+         * still fail closed (code stays -1) and still log, instead of
+         * silently falling through with no operator-visible indication
+         * that the report never landed. */
+        if (n > 0) {
+            resp[n] = '\0';
+            /* Parse the numeric status code from the status line only
+             * -- scanning the whole raw response for " 200"/" 201" as
+             * substrings would also match those digits inside a header
+             * value (e.g. "Content-Length: 200") on an actual error
+             * response and misreport a failed delivery as successful. */
+            code = ac_http_status_code(resp);
+            snprintf(body, sizeof(body), "%.60s", resp);
+        } else if (n == 0) {
+            snprintf(body, sizeof(body), "(connection closed, no response)");
+        } else {
+            snprintf(body, sizeof(body), "(read failed: %s)",
+                     strerror(errno));
+        }
+        if (code < 200 || code >= 300)
+            fprintf(stderr, "ac_report: server response status %d: %s\n",
+                    code, body);
     }
     close(fd);
 }
+
+/* How long the monitor loop below asks AC_IOCTL_GET_EVENTS to block for
+ * (via struct ac_event_list's block_ms field, see #61) when the ring is
+ * empty -- matches the fixed 1s cadence the loop used to get for free
+ * from sleep(1), so the periodic checks that share this loop iteration
+ * (check_syscalls_periodic() and friends, each independently gated by
+ * its own next_* deadline) keep running at the same granularity as
+ * before. Real detections no longer wait out this window: the kernel
+ * wakes a blocked GET_EVENTS the moment an event is pushed, regardless
+ * of how much of block_ms is left. */
+#define AC_MONITOR_BLOCK_MS 1000
 
 static int cmd_start(int argc, char **argv)
 {
@@ -3202,20 +3280,82 @@ static int cmd_start(int argc, char **argv)
 
     ac_open();   /* holds /dev/anticheat open -> module pinned while we live */
 
+    /* ABI version handshake: fail fast, before forking into the
+     * background, rather than let a stale module/daemon pairing surface
+     * later as confusing runtime behavior (struct layout mismatches,
+     * garbage fields, ...). See issue #64. */
+    {
+        struct ac_status st;
+
+        if (ioctl_ok(AC_IOCTL_STATUS, &st) < 0)
+            die("cannot query module status via %s -- refusing to start",
+                AC_DEV_PATH);
+        if (st.version != AC_IOCTL_VERSION)
+            die("ioctl ABI version mismatch: daemon built for "
+                "AC_IOCTL_VERSION=%d, but the loaded kernel module reports "
+                "version=%llu -- refusing to start. Rebuild/reload a "
+                "matching daemon and module pair.",
+                AC_IOCTL_VERSION, st.version);
+    }
+
     if (!foreground) {
+        /* Classic double-fork daemonization: the first child exits right
+         * after the second fork, so its pid is already dead by the time
+         * anything could report it. Only the surviving grandchild's pid
+         * is the one an operator can actually kill/track -- pass it back
+         * to the original, terminal-attached parent over a pipe before
+         * the intermediate first child exits, instead of printing the
+         * first child's own (about-to-die) pid. Printing from the
+         * grandchild itself isn't an option: by the time it exists,
+         * stdout has already been freopen()'d to the log file below. */
+        int pfd[2];
+
+        if (pipe(pfd) < 0)
+            die("pipe: %s", strerror(errno));
+
         pid = fork();
         if (pid < 0)
             die("fork: %s", strerror(errno));
         if (pid > 0) {
-            printf("anticheat daemon started (pid %d)\n", pid);
-            _exit(0);
+            pid_t final_pid = -1;
+            ssize_t r;
+
+            close(pfd[1]);
+            r = read(pfd[0], &final_pid, sizeof(final_pid));
+            close(pfd[0]);
+            if (r == (ssize_t)sizeof(final_pid) && final_pid > 0) {
+                printf("anticheat daemon started (pid %d)\n", final_pid);
+                /* _exit() skips stdio flushing (unlike exit()) -- when
+                 * stdout isn't a tty (e.g. redirected to a file/pipe by
+                 * the caller) it's fully buffered rather than
+                 * line-buffered, so without this the message above can
+                 * be silently lost. */
+                fflush(stdout);
+                _exit(0);
+            }
+            fprintf(stderr, "anticheat: daemon failed to start\n");
+            _exit(1);
         }
+        close(pfd[0]);
         setsid();
         pid = fork();
         if (pid < 0)
             die("fork: %s", strerror(errno));
-        if (pid > 0)
+        if (pid > 0) {
+            pid_t final_pid = pid;
+
+            /* A single write() of a pid_t-sized buffer is well under
+             * PIPE_BUF, so it's atomic -- the parent's read() above gets
+             * it whole in one call. Best-effort: if this write somehow
+             * fails, the parent's short/absent read falls back to the
+             * failure message above. */
+            ssize_t w = write(pfd[1], &final_pid, sizeof(final_pid));
+
+            (void)w;
+            close(pfd[1]);
             _exit(0);
+        }
+        close(pfd[1]);
         /* best-effort daemonization; failures are not fatal */
         if (chdir("/") < 0)
             fprintf(stderr, "daemon: chdir failed: %s\n", strerror(errno));
@@ -3228,8 +3368,26 @@ static int cmd_start(int argc, char **argv)
     }
 
     openlog("anticheat", LOG_PID | LOG_NDELAY, LOG_AUTH);
-    signal(SIGTERM, sig_handler);
-    signal(SIGINT, sig_handler);
+    {
+        /* sigaction(), not signal(): glibc's signal() installs handlers
+         * with SA_RESTART, which would make the kernel silently restart
+         * a blocked AC_IOCTL_GET_EVENTS (see #61) after this handler
+         * returns instead of letting the -EINTR/-ERESTARTSYS the module
+         * returns actually surface -- the monitor loop below would then
+         * not notice g_stop until the next full block_ms wait finishes
+         * (still bounded, but no longer near-instant the way sleep(1)'s
+         * interrupt-on-signal behavior used to be). Explicitly leaving
+         * SA_RESTART unset keeps shutdown latency on SIGTERM/SIGINT the
+         * same as before this change. */
+        struct sigaction sa;
+
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = sig_handler;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;   /* no SA_RESTART */
+        sigaction(SIGTERM, &sa, NULL);
+        sigaction(SIGINT, &sa, NULL);
+    }
     signal(SIGHUP, SIG_IGN);
 
     logmsg(LOG_INFO, "anticheat daemon started (foreground=%d)", foreground);
@@ -3278,10 +3436,30 @@ static int cmd_start(int argc, char **argv)
 
         while (!g_stop) {
             struct ac_event_list el;
-            time_t now = time(NULL);
+            struct timespec t0, t1;
+            long waited_ms;
+            time_t now;
+            int got;
 
             memset(&el, 0, sizeof(el));
-            if (ioctl(dev_fd, AC_IOCTL_GET_EVENTS, &el) == 0) {
+            el.block_ms = AC_MONITOR_BLOCK_MS;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            got = ioctl(dev_fd, AC_IOCTL_GET_EVENTS, &el);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            waited_ms = (t1.tv_sec - t0.tv_sec) * 1000L +
+                        (t1.tv_nsec - t0.tv_nsec) / 1000000L;
+            /* got < 0 here from a SIGTERM/SIGINT during the blocking
+             * ioctl (-EINTR/-ERESTARTSYS, see the sigaction comment
+             * above) must skip straight to the while(!g_stop) check --
+             * otherwise the periodic checks and the fallback sleep
+             * below would still run first, burning most of block_ms
+             * and defeating the whole point of leaving SA_RESTART
+             * unset. Any other ioctl failure (e.g. ENOTTY from a
+             * legacy module) falls through to the fallback sleep as
+             * before. */
+            if (got < 0 && g_stop)
+                break;
+            if (got == 0) {
                 for (i = 0; i < (int)el.count; i++) {
                     struct ac_event *e = &el.events[i];
 
@@ -3296,6 +3474,7 @@ static int cmd_start(int argc, char **argv)
                                ev_type_str(e->type), e->pid, e->comm, e->data);
                 }
             }
+            now = time(NULL);
             if (now >= next_sys) {
                 check_syscalls_periodic();
                 next_sys = now + 5;
@@ -3328,7 +3507,19 @@ static int cmd_start(int argc, char **argv)
                 check_implicit_layers_periodic();
                 next_implicit = now + ac_implicit_layer_check_interval();
             }
-            sleep(1);
+            /* Fallback for anything that doesn't actually honor block_ms
+             * -- a module built before this field existed (ioctl number
+             * mismatch -> ENOTTY), or the userspace mock, which answers
+             * GET_EVENTS immediately regardless of block_ms (see
+             * test/mock_anticheat.c). In either case the ioctl call
+             * above returned almost instantly with no events, and
+             * without this the loop would busy-spin at 100% CPU instead
+             * of blocking. When the kernel *did* block for us (real
+             * events made it return early, or it genuinely waited out
+             * block_ms with nothing arriving) this is a no-op -- the
+             * loop's cadence is unchanged from the old fixed sleep(1). */
+            if ((got != 0 || el.count == 0) && waited_ms < AC_MONITOR_BLOCK_MS)
+                usleep((useconds_t)(AC_MONITOR_BLOCK_MS - waited_ms) * 1000);
         }
     }
     logmsg(LOG_INFO, "anticheat daemon stopped");

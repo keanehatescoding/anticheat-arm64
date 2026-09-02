@@ -135,6 +135,17 @@ baseline-test: test/baseline_test
 test/baseline_test: test/baseline_test.c src/anticheat_daemon.c src/sha256.c src/sha256.h src/anticheat.h
 	$(CC) $(CFLAGS) -o $@ test/baseline_test.c src/sha256.c $(LDFLAGS)
 
+# ac_report() HTTP status-line parsing unit test (#57): pulls
+# anticheat_daemon.c in directly and proves ac_http_status_code() decides
+# success/failure from the status line only, not a substring match on the
+# raw response, and rejects a malformed status code (e.g. a leading sign).
+# See test/ac_report_status_test.c.
+ac-report-status-test: test/ac_report_status_test
+	./test/ac_report_status_test
+
+test/ac_report_status_test: test/ac_report_status_test.c src/anticheat_daemon.c src/sha256.c src/sha256.h src/anticheat.h
+	$(CC) $(CFLAGS) -o $@ test/ac_report_status_test.c src/sha256.c $(LDFLAGS)
+
 # run the daemon CLI against the userspace mock (no kernel module, no root)
 test-mock: mock daemon
 	./test/mock_test.sh
@@ -144,12 +155,12 @@ test-mock: mock daemon
 # headers and is exercised separately in CI against a prepared kernel tree.)
 ci:
 	$(MAKE) clean
-	$(MAKE) CFLAGS="-O2 -Wall -Wextra -Werror" daemon mock baseline-test
+	$(MAKE) CFLAGS="-O2 -Wall -Wextra -Werror" daemon mock baseline-test ac-report-status-test
 	./test/mock_test.sh
 
 clean:
 	@if [ -d $(KDIR) ]; then $(MAKE) -C $(KDIR) M=$(PWD) clean; fi
-	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test test/mount_ns_probe test/anon_exec_test test/thread_exit_migration_test test/thread_spawn_after_protect_test test/ioctl_fuzz test/baseline_test
+	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test test/mount_ns_probe test/anon_exec_test test/thread_exit_migration_test test/thread_spawn_after_protect_test test/ioctl_fuzz test/baseline_test test/ac_report_status_test
 
 install: all
 	install -D -m 0755 anticheat /usr/local/sbin/anticheat
@@ -178,4 +189,4 @@ install-deck: all
 uninstall-deck:
 	rm -rf $(DECK_PREFIX)
 
-.PHONY: all module daemon mock test-mock priv-drop-test render-hook-test mount-ns-test thread-exit-migration-test thread-spawn-after-protect-test ioctl-fuzz baseline-test ci clean install uninstall install-deck uninstall-deck
+.PHONY: all module daemon mock test-mock priv-drop-test render-hook-test mount-ns-test thread-exit-migration-test thread-spawn-after-protect-test ioctl-fuzz baseline-test ac-report-status-test ci clean install uninstall install-deck uninstall-deck
