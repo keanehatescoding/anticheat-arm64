@@ -419,7 +419,7 @@ static int ac_check_syscalls(struct ac_syscall_check *out)
                 if (!test_and_set_bit(i, ac_redirect_bitmap))
                     ac_emit(AC_EV_SYSCALL_REDIRECT, 0, "?",
                             "syscall[%u] handler changed 0x%lx -> 0x%lx (still core text)",
-                            ac_syscall_baseline[i], e);
+                            i, ac_syscall_baseline[i], e);
             } else {
                 clear_bit(i, ac_redirect_bitmap);
             }
