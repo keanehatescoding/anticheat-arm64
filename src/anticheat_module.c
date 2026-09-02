@@ -1835,16 +1835,16 @@ static int __init ac_init(void)
      * still makes forward progress under memory pressure. WQ_HIGHPRI gets
      * the kill dispatched ahead of ordinary work, which matters here since
      * this is the delivery path for terminating a process that just
-     * attacked a protected one. Left bound (WQ_PERCPU, matching the
-     * legacy per-cpu default) rather than WQ_UNBOUND: the work is queued
-     * from the same CPU that took the kprobe hit, and bound execution
-     * keeps that cache locality without the NUMA/affinity machinery
-     * unbound queues carry, which this single-work-item queue has no use
-     * for. max_active 0 (default) preserves the original queue's
-     * uncapped concurrency.
+     * attacked a protected one. WQ_UNBOUND is deliberately omitted rather
+     * than passed: the work is queued from the same CPU that took the
+     * kprobe hit, and bound (per-CPU) execution keeps that cache locality
+     * without the NUMA/affinity machinery unbound queues carry, which
+     * this single-work-item queue has no use for. max_active 0 selects
+     * the kernel's default cap (WQ_DFL_ACTIVE, 256), raising the limit
+     * from create_workqueue()'s max_active of 1 -- benign here since only
+     * one kill work item is ever in flight.
      */
-    ac_wq = alloc_workqueue("anticheat",
-                             WQ_MEM_RECLAIM | WQ_HIGHPRI | WQ_PERCPU, 0);
+    ac_wq = alloc_workqueue("anticheat", WQ_MEM_RECLAIM | WQ_HIGHPRI, 0);
     if (!ac_wq)
         return -ENOMEM;
 
