@@ -3188,6 +3188,24 @@ static int cmd_start(int argc, char **argv)
 
     ac_open();   /* holds /dev/anticheat open -> module pinned while we live */
 
+    /* ABI version handshake: fail fast, before forking into the
+     * background, rather than let a stale module/daemon pairing surface
+     * later as confusing runtime behavior (struct layout mismatches,
+     * garbage fields, ...). See issue #64. */
+    {
+        struct ac_status st;
+
+        if (ioctl_ok(AC_IOCTL_STATUS, &st) < 0)
+            die("cannot query module status via %s -- refusing to start",
+                AC_DEV_PATH);
+        if (st.version != AC_IOCTL_VERSION)
+            die("ioctl ABI version mismatch: daemon built for "
+                "AC_IOCTL_VERSION=%d, but the loaded kernel module reports "
+                "version=%llu -- refusing to start. Rebuild/reload a "
+                "matching daemon and module pair.",
+                AC_IOCTL_VERSION, st.version);
+    }
+
     if (!foreground) {
         pid = fork();
         if (pid < 0)
