@@ -265,3 +265,129 @@ jobs:
           modinfo_out="$(modinfo "$built_ko" | tee /dev/stderr)"
           printf '%s' "$modinfo_out" | grep -q '^sig_id:\s*PKCS#7$'
           printf '%s' "$modinfo_out" | grep -q '^sig_hashalgo:\s*sha256$'
+
+  # --- path filter: only the real-module fuzz seed job below is gated on
+  # this. userspace/module above always run -- CONTRIBUTING.md documents
+  # ci.yml as always running on every push/PR, and this filter must not
+  # change that for the jobs that already existed. ---
+  changes:
+    name: detect kernel module changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      module: ${{ steps.filter.outputs.module }}
+    steps:
+      # fetch-depth: 0 -- paths-filter needs real git history to diff
+      # against (push events default to comparing HEAD^1..HEAD, pull_request
+      # events compare against the PR base); the default shallow (depth 1)
+      # checkout has neither, which would force it into the GitHub REST API
+      # fallback path (needing broader permissions this workflow doesn't
+      # otherwise grant) or fail outright on a push event.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check whether src/anticheat_module.c changed
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            module:
+              - 'src/anticheat_module.c'
+
+  # --- real-module fuzz seed: short KASAN run against the actual module ---
+  # THREAT_MODEL.md's "What 'production-ready' claims today" section
+  # documents this exact gap: every push only runs ioctl_fuzz's dry run
+  # against the userspace mock (proves the harness, not the kernel --
+  # the mock has none of copy_from_user()/access_ok() to stress), while
+  # the real run -- root, the real loaded module, full pointer-corruption
+  # fuzzing, watching dmesg -- was nightly-only via kasan-boot.yml. See
+  # https://github.com/keanehatescoding/anticheat/issues/68.
+  #
+  # This job closes part of that gap on every PR/push that touches the
+  # module itself, without paying nightly's full cost on every push: it
+  # reuses scripts/kasan_boot_test.sh verbatim (same KASAN+lockdep kernel
+  # build, same VM boot via virtme-ng, same dmesg oops/WARNING/KASAN/GPF
+  # grep as the pass/fail gate) rather than reinventing any of that here,
+  # and only shortens the fuzz run itself via the script's existing
+  # IOCTL_FUZZ_ITERATIONS knob (already used by kasan-boot.yml's own
+  # workflow_dispatch input -- no script changes needed). 50
+  # iterations-per-command (vs nightly's default 300) is a heuristic
+  # aimed at the issue's ~30s target for the fuzz portion specifically;
+  # ioctl_fuzz.c's tight loop has no per-call sleep, so wall-clock scales
+  # roughly with iteration count, but this can't be precisely benchmarked
+  # without actually running the workflow on GitHub Actions -- see the PR
+  # description. The kernel build + VM boot around it still take minutes
+  # regardless of iteration count, same as kasan-boot.yml.
+  kasan-fuzz-seed:
+    name: real-module ioctl fuzz seed (KASAN, short)
+    needs: changes
+    if: needs.changes.outputs.module == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      # persist-credentials: false -- same reasoning as kasan-boot.yml:
+      # no later step needs authenticated git access.
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install kernel build deps, QEMU, and virtme-ng
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bc flex bison libelf-dev libssl-dev dwarves qemu-system-x86
+          # pipx, not pip: recent Ubuntu images mark the system Python as
+          # externally-managed (PEP 668), so a plain `pip install --user`
+          # fails outright; pipx is GitHub's own documented workaround for
+          # installing a CLI tool like this without a hand-rolled venv.
+          pipx install virtme-ng
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # Best-effort only, same as kasan-boot.yml: GitHub doesn't document
+      # or guarantee /dev/kvm on hosted runners. When this doesn't pan
+      # out, kasan_boot_test.sh still runs -- vng transparently falls
+      # back to QEMU/TCG, just much slower. Never fail the job over this
+      # step itself.
+      - name: Attempt to enable /dev/kvm (best effort, non-fatal)
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo "/dev/kvm already present"
+          else
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+              | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+            sudo udevadm control --reload-rules || true
+            sudo udevadm trigger --name-match=kvm || true
+          fi
+          if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            echo "kvm=available"
+          else
+            echo "kvm=unavailable -- falling back to QEMU/TCG (slower, not fatal)"
+          fi
+
+      - name: Boot the KASAN+lockdep kernel and run a short real ioctl fuzz seed
+        env:
+          IOCTL_FUZZ_ITERATIONS: "50"
+        run: |
+          # A fresh seed every run, same reasoning as kasan-boot.yml: repeated
+          # runs across PR pushes accumulate fuzzing coverage instead of
+          # replaying the identical sequence forever -- printed up front so
+          # any failure is reproducible locally via the same
+          # IOCTL_FUZZ_SEED value.
+          export IOCTL_FUZZ_SEED
+          IOCTL_FUZZ_SEED="$(date +%s)"
+          echo "IOCTL_FUZZ_SEED=$IOCTL_FUZZ_SEED"
+          ./scripts/kasan_boot_test.sh
+
+      - name: Upload console log and built module on failure
+        # cancelled(), not just failure(): a timeout-minutes cancellation
+        # is a distinct workflow conclusion from failure() and would
+        # otherwise skip this step precisely when the partial console log
+        # is most useful for diagnosing where it hung.
+        if: ${{ failure() || cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: kasan-fuzz-seed-failure
+          path: |
+            kasan-console.log
+            anticheat.ko
+          if-no-files-found: ignore
