@@ -3241,6 +3241,17 @@ static void ac_report(const char *event_type, const char *detail)
     close(fd);
 }
 
+/* How long the monitor loop below asks AC_IOCTL_GET_EVENTS to block for
+ * (via struct ac_event_list's block_ms field, see #61) when the ring is
+ * empty -- matches the fixed 1s cadence the loop used to get for free
+ * from sleep(1), so the periodic checks that share this loop iteration
+ * (check_syscalls_periodic() and friends, each independently gated by
+ * its own next_* deadline) keep running at the same granularity as
+ * before. Real detections no longer wait out this window: the kernel
+ * wakes a blocked GET_EVENTS the moment an event is pushed, regardless
+ * of how much of block_ms is left. */
+#define AC_MONITOR_BLOCK_MS 1000
+
 static int cmd_start(int argc, char **argv)
 {
     int foreground = 0, i;
@@ -3343,8 +3354,26 @@ static int cmd_start(int argc, char **argv)
     }
 
     openlog("anticheat", LOG_PID | LOG_NDELAY, LOG_AUTH);
-    signal(SIGTERM, sig_handler);
-    signal(SIGINT, sig_handler);
+    {
+        /* sigaction(), not signal(): glibc's signal() installs handlers
+         * with SA_RESTART, which would make the kernel silently restart
+         * a blocked AC_IOCTL_GET_EVENTS (see #61) after this handler
+         * returns instead of letting the -EINTR/-ERESTARTSYS the module
+         * returns actually surface -- the monitor loop below would then
+         * not notice g_stop until the next full block_ms wait finishes
+         * (still bounded, but no longer near-instant the way sleep(1)'s
+         * interrupt-on-signal behavior used to be). Explicitly leaving
+         * SA_RESTART unset keeps shutdown latency on SIGTERM/SIGINT the
+         * same as before this change. */
+        struct sigaction sa;
+
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = sig_handler;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;   /* no SA_RESTART */
+        sigaction(SIGTERM, &sa, NULL);
+        sigaction(SIGINT, &sa, NULL);
+    }
     signal(SIGHUP, SIG_IGN);
 
     logmsg(LOG_INFO, "anticheat daemon started (foreground=%d)", foreground);
@@ -3393,10 +3422,30 @@ static int cmd_start(int argc, char **argv)
 
         while (!g_stop) {
             struct ac_event_list el;
-            time_t now = time(NULL);
+            struct timespec t0, t1;
+            long waited_ms;
+            time_t now;
+            int got;
 
             memset(&el, 0, sizeof(el));
-            if (ioctl(dev_fd, AC_IOCTL_GET_EVENTS, &el) == 0) {
+            el.block_ms = AC_MONITOR_BLOCK_MS;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            got = ioctl(dev_fd, AC_IOCTL_GET_EVENTS, &el);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            waited_ms = (t1.tv_sec - t0.tv_sec) * 1000L +
+                        (t1.tv_nsec - t0.tv_nsec) / 1000000L;
+            /* got < 0 here from a SIGTERM/SIGINT during the blocking
+             * ioctl (-EINTR/-ERESTARTSYS, see the sigaction comment
+             * above) must skip straight to the while(!g_stop) check --
+             * otherwise the periodic checks and the fallback sleep
+             * below would still run first, burning most of block_ms
+             * and defeating the whole point of leaving SA_RESTART
+             * unset. Any other ioctl failure (e.g. ENOTTY from a
+             * legacy module) falls through to the fallback sleep as
+             * before. */
+            if (got < 0 && g_stop)
+                break;
+            if (got == 0) {
                 for (i = 0; i < (int)el.count; i++) {
                     struct ac_event *e = &el.events[i];
 
@@ -3410,6 +3459,7 @@ static int cmd_start(int argc, char **argv)
                                ev_type_str(e->type), e->pid, e->comm, e->data);
                 }
             }
+            now = time(NULL);
             if (now >= next_sys) {
                 check_syscalls_periodic();
                 next_sys = now + 5;
@@ -3442,7 +3492,19 @@ static int cmd_start(int argc, char **argv)
                 check_implicit_layers_periodic();
                 next_implicit = now + ac_implicit_layer_check_interval();
             }
-            sleep(1);
+            /* Fallback for anything that doesn't actually honor block_ms
+             * -- a module built before this field existed (ioctl number
+             * mismatch -> ENOTTY), or the userspace mock, which answers
+             * GET_EVENTS immediately regardless of block_ms (see
+             * test/mock_anticheat.c). In either case the ioctl call
+             * above returned almost instantly with no events, and
+             * without this the loop would busy-spin at 100% CPU instead
+             * of blocking. When the kernel *did* block for us (real
+             * events made it return early, or it genuinely waited out
+             * block_ms with nothing arriving) this is a no-op -- the
+             * loop's cadence is unchanged from the old fixed sleep(1). */
+            if ((got != 0 || el.count == 0) && waited_ms < AC_MONITOR_BLOCK_MS)
+                usleep((useconds_t)(AC_MONITOR_BLOCK_MS - waited_ms) * 1000);
         }
     }
     logmsg(LOG_INFO, "anticheat daemon stopped");

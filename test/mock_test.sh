@@ -129,12 +129,22 @@ if [ "$rc" -eq 0 ]; then pass "start: matching version proceeds"; else fail "sta
 
 # Mismatched version: die() fires before any fork, so this returns
 # immediately with no timeout needed -- a hang here would itself be a bug.
+# The expected daemon-side version is read from anticheat.h rather than
+# hardcoded, so this doesn't silently go stale the next time
+# AC_IOCTL_VERSION is bumped.
+daemon_ioctl_version=$(sed -n 's/^#define AC_IOCTL_VERSION \([0-9]\+\)/\1/p' src/anticheat.h)
+case "$daemon_ioctl_version" in
+    ''|*[!0-9]*)
+        echo "mock_test.sh: couldn't extract a numeric AC_IOCTL_VERSION from src/anticheat.h" >&2
+        exit 1
+        ;;
+esac
 expect_rc  "start: mismatched version fails fast" 1 \
     env AC_MOCK_VERSION=99 ./anticheat start --foreground
 expect_out "start: mismatched version error names both versions" \
     "version mismatch" env AC_MOCK_VERSION=99 ./anticheat start --foreground
 expect_out "start: mismatched version error names daemon's version" \
-    "AC_IOCTL_VERSION=1" env AC_MOCK_VERSION=99 ./anticheat start --foreground
+    "AC_IOCTL_VERSION=$daemon_ioctl_version" env AC_MOCK_VERSION=99 ./anticheat start --foreground
 expect_out "start: mismatched version error names module's version" \
     "version=99" env AC_MOCK_VERSION=99 ./anticheat start --foreground
 expect_out "start: mismatched version error refuses to start" \
