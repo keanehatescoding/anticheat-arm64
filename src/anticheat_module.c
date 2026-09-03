@@ -357,11 +357,12 @@ static bool ac_syscall_baseline_ready;
 /* Per-slot rising-edge state for AC_EV_SYSCALL_REDIRECT, same rationale
  * as ac_hooked_bitmap above (avoid re-emitting every 5s poll). */
 static unsigned long ac_redirect_bitmap[BITS_TO_LONGS(__NR_syscalls)];
-/* Set for slot i once ac_syscall_baseline[i] holds a value read straight
- * from the table (at boot, or backfilled below) rather than the 0 stored
- * for a slot whose read failed. A real handler address is never 0, so 0
- * is an unambiguous "no baseline" sentinel; this bitmap only exists to
- * make that explicit instead of relying on the value being falsy. */
+/* Set for slot i once ac_syscall_baseline[i] holds a value ac_kread()
+ * actually returned for it (at boot, or backfilled below) -- including a
+ * successful read of 0, which is why this is a separate bitmap rather
+ * than just testing ac_syscall_baseline[i] for truthiness: a failed
+ * read is also stored as 0, and the two must not be conflated (see
+ * ac_check_syscalls()'s "read_ok" handling below). */
 static unsigned long ac_baseline_captured[BITS_TO_LONGS(__NR_syscalls)];
 /* Serializes ac_check_syscalls() below: AC_IOCTL_CHECK_SYSCALLS is called
  * with no per-fd state, so the periodic monitor-loop caller and an
@@ -395,8 +396,9 @@ static void ac_capture_syscall_baseline(void)
     for (i = 0; i < __NR_syscalls; i++) {
         unsigned long e = 0;
 
-        if (!ac_kread(&e, (void *)(base + i * sizeof(e)), sizeof(e)) && e)
-            __set_bit(i, ac_baseline_captured);
+        if (!ac_kread(&e, (void *)(base + i * sizeof(e)), sizeof(e)))
+            __set_bit(i, ac_baseline_captured);   /* a successful read of
+                                                     * 0 still counts */
         else
             e = 0;
         ac_syscall_baseline[i] = e;
@@ -428,32 +430,48 @@ static int ac_check_syscalls(struct ac_syscall_check *out)
     ac_sha256_init(&hash);
     for (i = 0; i < __NR_syscalls; i++) {
         unsigned long e = 0;
-        bool bad;
+        bool bad, read_ok, have_baseline;
 
-        if (ac_kread(&e, (void *)(base + i * sizeof(e)), sizeof(e)))
-            e = 0;   /* unreadable slot == empty, same convention as the
-                       * baseline capture above so the two hash identically */
+        read_ok = !ac_kread(&e, (void *)(base + i * sizeof(e)), sizeof(e));
+        have_baseline = ac_syscall_baseline_ready &&
+                        test_bit(i, ac_baseline_captured);
+
+        if (!read_ok) {
+            /* Nothing was actually observed this round. 0 is itself a
+             * value a slot could legitimately hold (see
+             * ac_baseline_captured's comment), so hashing a fabricated 0
+             * here would let a transient ac_kread() failure masquerade as
+             * a real handler change and manufacture a false checksum-only
+             * compromise report. Fall back to whatever's already trusted
+             * for this slot instead, so an unobserved slot's contribution
+             * to the whole-table hash reads as "unchanged". */
+            e = have_baseline ? ac_syscall_baseline[i] : 0;
+        }
         ac_sha256_update(&hash, &e, sizeof(e));
 
-        /* A read failure this round (e == 0) means nothing was actually
-         * observed -- leave ac_redirect_bitmap exactly as it was instead
-         * of treating it as "back to baseline". Clearing it here would
-         * both hide a redirect that's still there and, on the next
-         * successful read of an unchanged-but-still-redirected slot,
-         * re-trigger AC_EV_SYSCALL_REDIRECT via the rising-edge check
-         * below, defeating the once-per-transition dedup. */
-        if (ac_syscall_baseline_ready && e) {
-            if (!test_bit(i, ac_baseline_captured)) {
+        if (!read_ok) {
+            /* Leave ac_redirect_bitmap/ac_hooked_bitmap and the backfill
+             * state exactly as they were -- clearing either here would
+             * both hide a condition that's still there and, on the next
+             * successful read of an unchanged-but-still-flagged slot,
+             * re-trigger the event via the rising-edge checks below,
+             * defeating the once-per-transition dedup. */
+            continue;
+        }
+
+        if (ac_syscall_baseline_ready) {
+            if (!have_baseline) {
                 /* Boot-time capture never got a reading for this slot
                  * (ac_table_plausible() already validated hundreds of
                  * other entries, so this is a narrow per-slot hiccup, not
                  * a misidentified table). Adopt this first later reading
-                 * as the baseline now instead of leaving the slot
-                 * permanently exempt from redirect detection -- this
-                 * only narrows, same as the already-accepted
-                 * pre-snapshot-redirect gap in THREAT_MODEL.md, the
-                 * window in which a redirect installed before the
-                 * backfill would be captured as "normal". */
+                 * -- including a legitimate 0 -- as the baseline now
+                 * instead of leaving the slot permanently exempt from
+                 * redirect detection; this only narrows, same as the
+                 * already-accepted pre-snapshot-redirect gap in
+                 * THREAT_MODEL.md, the window in which a redirect
+                 * installed before the backfill would be captured as
+                 * "normal". */
                 ac_syscall_baseline[i] = e;
                 __set_bit(i, ac_baseline_captured);
                 ac_sha256_hex(ac_syscall_baseline, sizeof(ac_syscall_baseline),
