@@ -63,6 +63,12 @@ expect_out "status: version"          "version"        ./anticheat status
 echo "== protect / list / unprotect =="
 expect_rc  "protect --pid \$\$"        0 ./anticheat protect --pid $$
 expect_out "list shows pid"            "$$"             ./anticheat list
+expect_out "list shows jit=no by default" "jit=no"      ./anticheat list
+expect_rc  "unprotect (before jit re-protect)" 0 ./anticheat unprotect --pid $$
+expect_rc  "protect --pid \$\$ --jit"  0 ./anticheat protect --pid $$ --jit
+expect_out "list shows jit=yes"        "jit=yes"        ./anticheat list
+expect_rc  "re-protect --pid \$\$ (drop --jit)" 0 ./anticheat protect --pid $$
+expect_out "list updates jit=no on re-protect" "jit=no" ./anticheat list
 expect_rc  "protect --comm bash"      0 ./anticheat protect --comm bash
 expect_rc  "unprotect"                0 ./anticheat unprotect --pid $$
 
@@ -74,8 +80,7 @@ echo "== protect --comm: exe-basename precision (issue #69) =="
 # usable. Exercise both paths against real background processes -- this
 # scans the real /proc, not the mocked ioctl ABI, so it needs actual
 # pids on disk, not just mock state.
-AC_TESTBIN_DIR="/tmp/ac_testbin_$$"
-mkdir -p "$AC_TESTBIN_DIR"
+AC_TESTBIN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ac_testbin.XXXXXX") || exit 1
 
 # > 15 chars, so the old comm-string-only match couldn't have found this
 # pid at all (comm would read back truncated) -- only the exe-basename
@@ -102,6 +107,15 @@ cp /bin/sleep "$AC_TESTBIN_DIR/$AC_SHORTNAME"
 chmod +x "$AC_TESTBIN_DIR/$AC_SHORTNAME"
 "$AC_TESTBIN_DIR/$AC_SHORTNAME" 30 &
 AC_DELPID=$!
+# Wait for the child to actually exec the copied binary before deleting
+# it out from under it -- deleting too early can still catch it mid-fork,
+# in which case /proc/<pid>/exe would resolve to nothing (ENOENT) instead
+# of "... (deleted)", and the fallback-to-comm-string assertion below
+# would flake intermittently.
+for _ in $(seq 1 50); do
+    [ "$(readlink "/proc/$AC_DELPID/exe" 2>/dev/null)" = "$AC_TESTBIN_DIR/$AC_SHORTNAME" ] && break
+    sleep 0.1
+done
 rm -f "$AC_TESTBIN_DIR/$AC_SHORTNAME"
 expect_rc  "protect --comm falls back to comm string (exe deleted)" 0 \
     ./anticheat protect --comm "$AC_SHORTNAME"
@@ -139,8 +153,25 @@ expect_out "baseline matches"          "matches baseline" bash -c "$SELFSCAN --h
 echo "== syscall integrity (clean + compromised) =="
 expect_rc  "syscalls clean"           0 ./anticheat syscalls
 expect_out "syscalls OK message"       "no hooks detected" ./anticheat syscalls
+expect_out "syscalls: boot baseline shown" "boot baseline" ./anticheat syscalls
 expect_rc  "syscalls compromised -> rc 2" 2 env AC_MOCK_HOOKED=1 ./anticheat syscalls
 expect_out "syscalls alert"            "COMPROMISED"    env AC_MOCK_HOOKED=1 ./anticheat syscalls
+
+echo "== syscall integrity: in-text redirect baseline (#63) =="
+expect_rc  "syscalls redirected -> rc 2" 2 env AC_MOCK_REDIRECT=1 ./anticheat syscalls
+expect_out "syscalls redirect alert"   "COMPROMISED"    env AC_MOCK_REDIRECT=1 ./anticheat syscalls
+expect_out "syscalls redirect count"   "redirected       : 1" env AC_MOCK_REDIRECT=1 ./anticheat syscalls
+expect_out "syscalls checksum mismatch" "MISMATCH"      env AC_MOCK_REDIRECT=1 ./anticheat syscalls
+
+echo "== syscall integrity: checksum-only mismatch (#63 review fix) =="
+# Handler churn that flips the whole-table checksum without tripping any
+# per-slot hook/redirect counter (e.g. a slot going non-zero -> 0) must
+# still be reported as COMPROMISED with a non-zero exit code, not silently
+# swallowed by a verdict that only looks at out->hooked/out->redirected.
+expect_rc  "syscalls checksum-only -> rc 2" 2 env AC_MOCK_CHECKSUM_ONLY=1 ./anticheat syscalls
+expect_out "syscalls checksum-only alert" "COMPROMISED"  env AC_MOCK_CHECKSUM_ONLY=1 ./anticheat syscalls
+expect_out "syscalls checksum-only mismatch shown" "MISMATCH" env AC_MOCK_CHECKSUM_ONLY=1 ./anticheat syscalls
+expect_out "syscalls checksum-only hooked/redirected both zero" "hooked           : 0" env AC_MOCK_CHECKSUM_ONLY=1 ./anticheat syscalls
 
 echo "== hidden module detection =="
 expect_rc  "modules -> rc 2 (hidden)" 2 ./anticheat modules
@@ -173,6 +204,38 @@ echo "== error paths =="
 expect_rc  "scan without --pid"       1 ./anticheat scan
 expect_rc  "protect without args"     1 ./anticheat protect
 
+echo "== daemon/module ABI version handshake =="
+# Matching version: the daemon's compiled-in AC_IOCTL_VERSION vs. what the
+# mock reports (default, unmodified) -- start must get past the handshake
+# and into its normal run loop, so a short foreground run that exits
+# cleanly on SIGTERM proves the check didn't reject a healthy pairing.
+out=$(timeout -k 2 --preserve-status 2 ./anticheat start --foreground 2>&1)
+rc=$?
+if [ "$rc" -eq 0 ]; then pass "start: matching version proceeds"; else fail "start: matching version (rc=$rc)"; fi
+
+# Mismatched version: die() fires before any fork, so this returns
+# immediately with no timeout needed -- a hang here would itself be a bug.
+# The expected daemon-side version is read from anticheat.h rather than
+# hardcoded, so this doesn't silently go stale the next time
+# AC_IOCTL_VERSION is bumped.
+daemon_ioctl_version=$(sed -n 's/^#define AC_IOCTL_VERSION \([0-9]\+\)/\1/p' src/anticheat.h)
+case "$daemon_ioctl_version" in
+    ''|*[!0-9]*)
+        echo "mock_test.sh: couldn't extract a numeric AC_IOCTL_VERSION from src/anticheat.h" >&2
+        exit 1
+        ;;
+esac
+expect_rc  "start: mismatched version fails fast" 1 \
+    env AC_MOCK_VERSION=99 ./anticheat start --foreground
+expect_out "start: mismatched version error names both versions" \
+    "version mismatch" env AC_MOCK_VERSION=99 ./anticheat start --foreground
+expect_out "start: mismatched version error names daemon's version" \
+    "AC_IOCTL_VERSION=$daemon_ioctl_version" env AC_MOCK_VERSION=99 ./anticheat start --foreground
+expect_out "start: mismatched version error names module's version" \
+    "version=99" env AC_MOCK_VERSION=99 ./anticheat start --foreground
+expect_out "start: mismatched version error refuses to start" \
+    "refusing to start" env AC_MOCK_VERSION=99 ./anticheat start --foreground
+
 echo "== monitoring daemon (start --foreground) =="
 # --preserve-status: report the command's own exit status; a clean exit after
 # SIGTERM is rc=0, a hang is caught by -k (SIGKILL -> 137).
@@ -204,6 +267,32 @@ if [ "$hooked_crit_count" -eq 1 ]; then
     pass "start: syscall-hook alert logged exactly once"
 else
     fail "start: expected exactly 1 SYSCALL-HOOK log line, got $hooked_crit_count"
+fi
+
+# Same rising-edge dedup proof as above, for the boot-baseline in-text
+# redirect check (AC_EV_SYSCALL_REDIRECT, #63) -- distinct event type from
+# SYSCALL-HOOK, so this also proves the two aren't conflated.
+redirect_out=$(timeout -k 2 --preserve-status 7 \
+    env AC_MOCK_REDIRECT=1 ./anticheat start --foreground 2>&1)
+redirect_crit_count=$(printf '%s' "$redirect_out" | grep -c "SYSCALL-REDIRECT")
+if [ "$redirect_crit_count" -eq 1 ]; then
+    pass "start: syscall-redirect alert logged exactly once"
+else
+    fail "start: expected exactly 1 SYSCALL-REDIRECT log line, got $redirect_crit_count"
+fi
+
+# checksum_mismatch has no matching kernel event (see #63 review fix), so
+# unlike the two cases above this dedup is entirely daemon-side, in
+# check_syscalls_periodic()'s own rising-edge state -- a distinct code
+# path from the ring-drain dedup exercised above, so it needs its own
+# proof of both "fires at all" and "stays deduplicated across polls".
+checksum_out=$(timeout -k 2 --preserve-status 7 \
+    env AC_MOCK_CHECKSUM_ONLY=1 ./anticheat start --foreground 2>&1)
+checksum_crit_count=$(printf '%s' "$checksum_out" | grep -c "checksum mismatch")
+if [ "$checksum_crit_count" -eq 1 ]; then
+    pass "start: checksum-only mismatch alert logged exactly once"
+else
+    fail "start: expected exactly 1 checksum mismatch log line, got $checksum_crit_count"
 fi
 
 echo

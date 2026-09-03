@@ -20,7 +20,14 @@
  * Behaviour knobs (environment):
  *   AC_MOCK_ROOT=1      fake root (geteuid == 0)
  *   AC_MOCK_ATTACK=1    simulate a ptrace attack (PTRACE-DENIED events)
- *   AC_MOCK_HOOKED=1    simulate a compromised syscall table
+ *   AC_MOCK_HOOKED=1    simulate a compromised syscall table (out-of-text)
+ *   AC_MOCK_REDIRECT=1  simulate an in-text syscall handler swap since the
+ *                       boot baseline (SYSCALL-REDIRECT events; see #63)
+ *   AC_MOCK_CHECKSUM_ONLY=1
+ *                       simulate a whole-table checksum mismatch with no
+ *                       per-slot hook/redirect flagged (see #63)
+ *   AC_MOCK_VERSION=N   report ioctl ABI version N instead of the real
+ *                       AC_IOCTL_VERSION (simulates a stale module)
  *   AC_MOCK_STATE=path  state file location
  */
 #define _GNU_SOURCE
@@ -167,6 +174,20 @@ static unsigned int snap_n;
  * STATUS before triggering a check would never observe that with the
  * real module. */
 static unsigned int last_hook_count;
+/* Same rising-edge convention as last_hook_count above, but for the
+ * boot-baseline in-text-redirect check (AC_EV_SYSCALL_REDIRECT, #63). */
+static unsigned int last_redirect_count;
+
+/* Fill a 65-byte digest buffer with 64 repeats of `c` + NUL. Not a real
+ * SHA-256 digest -- the mock only needs the daemon/CLI to see
+ * baseline_ready plus a current_sha256 that differs from baseline_sha256
+ * exactly when a redirect/hook is simulated, mirroring what
+ * AC_IOCTL_CHECK_SYSCALLS reports against the real module. */
+static void mock_fill_digest(char out_hex[65], char c)
+{
+    memset(out_hex, c, 64);
+    out_hex[64] = '\0';
+}
 
 static void do_scan(int pid)
 {
@@ -265,8 +286,13 @@ static int do_ioctl(unsigned long req, void *arg)
     switch (req) {
     case AC_IOCTL_STATUS: {
         struct ac_status *st = arg;
+        const char *vover = getenv("AC_MOCK_VERSION");
 
-        st->version = AC_IOCTL_VERSION;
+        /* AC_MOCK_VERSION lets tests simulate a stale module/daemon
+         * pairing by reporting a version other than the one this mock
+         * (and the real module) actually speaks. */
+        st->version = (vover && *vover) ?
+            (unsigned long long)strtoull(vover, NULL, 0) : AC_IOCTL_VERSION;
         st->syscall_table_addr = 0xffffffff82d02300ULL; /* mirrors this kernel */
         st->active_procs = S.nprots;
         st->events_dropped = S.events_dropped_total;
@@ -278,10 +304,6 @@ static int do_ioctl(unsigned long req, void *arg)
         struct ac_proc_id *id = arg;
         unsigned int i;
 
-        if (S.nprots >= AC_MAX_PROTS) {
-            errno = ENOSPC;
-            return -1;
-        }
         /* Mirror the real kernel module's PF_KTHREAD rejection (issue
          * #69 / ac_add_prot_task() in anticheat_module.c): this mock has
          * no task_struct to check PF_KTHREAD on, but a kernel thread's
@@ -290,16 +312,26 @@ static int do_ioctl(unsigned long req, void *arg)
          * userspace-visible analog for "not a valid protect target".
          * Rejecting it here lets mock_test.sh exercise the same
          * ADD_PROC-fails-for-a-kernel-thread behaviour end-to-end
-         * without root or a loaded module. */
+         * without root or a loaded module. Checked first, matching
+         * ac_add_prot_task()'s precedence: the real module rejects a
+         * kernel thread before it ever looks at registry capacity. */
         if (is_kthread_like(id->pid)) {
             errno = EINVAL;
             return -1;
         }
         for (i = 0; i < S.nprots; i++)
-            if (S.prots[i].pid == id->pid)
+            if (S.prots[i].pid == id->pid) {
+                S.prots[i].jit_allowed = id->jit_allowed;  /* updatable via re-protect */
+                save_state();
                 return 0;   /* already protected */
+            }
+        if (S.nprots >= AC_MAX_PROTS) {
+            errno = ENOSPC;
+            return -1;
+        }
         read_comm(id->pid, id->comm, sizeof(id->comm));
         S.prots[S.nprots].pid = id->pid;
+        S.prots[S.nprots].jit_allowed = id->jit_allowed;
         snprintf(S.prots[S.nprots].comm, sizeof(S.prots[S.nprots].comm),
                  "%s", id->comm);
         S.nprots++;
@@ -373,6 +405,8 @@ static int do_ioctl(unsigned long req, void *arg)
         return 0;
     case AC_IOCTL_CHECK_SYSCALLS: {
         struct ac_syscall_check *c = arg;
+        int mock_redirect = getenv("AC_MOCK_REDIRECT") != NULL;
+        int mock_checksum_only = getenv("AC_MOCK_CHECKSUM_ONLY") != NULL;
 
         c->table_addr = 0xffffffff82d02300ULL;
         c->nr_syscalls = 472;
@@ -386,18 +420,55 @@ static int do_ioctl(unsigned long req, void *arg)
             c->hooked = 0;
             c->ok = 1;
         }
+        c->redirected = mock_redirect ? 1 : 0;
+
+        /* Boot-time handler-address baseline (#63): the mock always
+         * reports a captured baseline (mirrors the real module always
+         * capturing one when the table was located, which it always is
+         * here), with the live checksum diverging whenever either kind of
+         * tampering -- out-of-text hook or in-text redirect -- is
+         * simulated. AC_MOCK_CHECKSUM_ONLY simulates handler churn the
+         * per-slot walk doesn't individually flag (out->ok stays 1 and
+         * out->redirected stays 0): a slot going non-zero -> 0 flips the
+         * whole-table checksum without tripping either per-slot counter. */
+        c->baseline_ready = 1;
+        mock_fill_digest(c->baseline_sha256, '1');
+        mock_fill_digest(c->current_sha256,
+                          (c->hooked || c->redirected || mock_checksum_only) ? '2' : '1');
+        c->checksum_mismatch = (c->hooked || c->redirected || mock_checksum_only) ? 1 : 0;
+
         /* Mirrors the real module's rising-edge gating (see #52): only
-         * push a ring event on the clean->hooked transition, not on
-         * every poll that still finds the same hook. */
+         * push a ring event on the clean->hooked/redirected transition,
+         * not on every poll that still finds the same condition. */
         if (c->hooked && !last_hook_count)
             push_event(AC_EV_SYSCALL_HOOK, 0, "?",
                        "mock: syscall[57] -> 0xdeadbeef outside core kernel text");
+        if (c->redirected && !last_redirect_count)
+            push_event(AC_EV_SYSCALL_REDIRECT, 0, "?",
+                       "mock: syscall[0] handler changed 0x1111 -> 0x2222 (still core text)");
         last_hook_count = c->hooked;
+        last_redirect_count = c->redirected;
         return 0;
     }
     case AC_IOCTL_GET_EVENTS: {
         struct ac_event_list *el = arg;
 
+        /* Real module (#61): blocks interruptibly for up to
+         * el->block_ms if the ring is empty, woken early the instant an
+         * event is pushed. The mock deliberately does NOT simulate that
+         * here -- it always answers immediately, block_ms or not. A
+         * fake sleep in a plain userspace LD_PRELOAD shim would just
+         * make every mock-backed test slower and, worse, timing-
+         * dependent/flaky for no real coverage gain: there is no
+         * concurrent kernel-side event source here that a genuine wait
+         * could usefully block against, only whatever this same test
+         * process already pushed via push_event() above. The daemon's
+         * own monitor loop (anticheat_daemon.c's cmd_start()) treats an
+         * instant, event-less return as this exact case (a caller that
+         * doesn't honor block_ms) and falls back to a client-side sleep
+         * to keep its polling cadence sane -- that fallback path, not a
+         * fake blocking wait here, is what mock_test.sh's
+         * "start --foreground" tests actually exercise. */
         el->count = S.n_evq;
         el->dropped = S.events_dropped_total;
         memcpy(el->events, S.evq, S.n_evq * sizeof(*S.evq));

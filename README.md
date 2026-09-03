@@ -41,7 +41,13 @@ userspace daemon/CLI that talks to it over a small ioctl interface
    then checked to lie inside the core kernel text (`[_stext, _etext)`) and
    outside any loaded module — the classic rootkit hook (redirecting a
    syscall into module/vmalloc memory) is flagged and reported as
-   `AC_EV_SYSCALL_HOOK`.
+   `AC_EV_SYSCALL_HOOK`. Separately, every handler address is snapshotted
+   and SHA-256-checksummed once at module load; each later check (periodic,
+   or on demand via `anticheat syscalls`) recomputes the checksum and
+   compares per-slot against that boot baseline, flagging an entry whose
+   handler changed while still passing the core-text check as
+   `AC_EV_SYSCALL_REDIRECT` — an in-text redirect (e.g. sys_read →
+   sys_write) that the range check alone can't see (see #63).
 
 2. **Module enumeration.** The kernel-internal module list is walked
    (preemption disabled, since `module_mutex` is not exported) and compared
@@ -501,6 +507,21 @@ local warning, never blocks or crashes the monitoring loop. DNS resolution
 via `getaddrinfo()` is not itself timeout-bounded — configure
 `AC_REPORT_URL` as a literal IP if that matters for your deployment.
 
+**Unix-domain-socket transport, as an alternative to plain HTTP-over-TCP
+(#67).** Set `AC_REPORT_URL=unix:///path/to/socket` instead of
+`host:port` to send the exact same HTTP/1.1 request over an `AF_UNIX`
+`SOCK_STREAM` socket rather than a network connection — the natural fit
+when the daemon and `ac_server.py` are co-located on the same host,
+which removes the plaintext-network-credential exposure the "No TLS"
+note below describes, since there's no network segment for the
+`Authorization: Bearer` key to cross at all. Pair it with `ac_server.py
+--unix-socket PATH` (see "Server side" below). Plain `host:port` TCP
+keeps working exactly as before — this is an additional option, not a
+replacement. See `THREAT_MODEL.md`'s "Unix-domain-socket transport"
+note for how this changes the accepted deployment surface (filesystem
+permissions on the socket become the trust boundary instead of network
+exposure).
+
 **Server side.** Stdlib-only Python (`http.server` + `sqlite3`, zero
 third-party dependencies) with two separate bearer-token tiers:
 
@@ -521,6 +542,34 @@ Both keys are required at startup — it refuses to run with no auth
 configured rather than defaulting to open. Client IDs are validated
 against a bounded alnum/`.`/`_`/`-` pattern before touching the database;
 report bodies are capped at 4 KiB.
+
+Or, to listen on a Unix domain socket instead of TCP (`--host`/`--port`
+are ignored when this is set) — the matching daemon-side setting is
+`AC_REPORT_URL=unix:///path/to/socket` above:
+
+```
+AC_SERVER_REPORT_KEY=<report-key> AC_SERVER_ADMIN_KEY=<admin-key> \
+    ./server/ac_server.py --unix-socket /run/anticheat/ac_server.sock --db ac_server.db
+```
+
+The socket is created `0600` (owner-only, same reasoning as the DB
+file's own permissions), and a stale socket file left behind by a
+previous run is unlinked before binding — "stale" is checked, not
+assumed: binding refuses to touch the path at all if something's still
+listening on it, or if it exists and isn't a socket. That said, `0600`
+on the socket file itself only stops someone from opening it — it can't
+stop someone who can already write to the socket's *parent directory*
+from deleting or replacing the path out from under the server before it
+binds. Put the socket in a directory only the server's own user (or
+root) can write to, e.g. the `/run/anticheat/` shown above with the
+service's own user as owner. `--rate-limit`/`--rate-window` still apply
+to every request, but per-source-IP granularity doesn't mean much for a
+local socket — every connection over it shares one fixed rate bucket and
+is recorded with `source_addr: "unix"` instead of a real peer address,
+since there's no per-peer network address to key on; `--trust-proxy`
+(below) is a TCP-only concept and is rejected outright alongside
+`--unix-socket` — trusting a client-supplied header here would just let
+that client forge its own `source_addr`.
 
 **Reports never auto-ban.** A report is a client-side daemon's unverified
 claim about itself, running on the exact machine a cheat author controls —
@@ -551,7 +600,9 @@ limiter and the `source_addr` recorded on every report use the real
 client IP (the last, proxy-authored hop of `X-Forwarded-For`) instead of
 the proxy's own address — off by default, since trusting that header
 from anything other than a proxy you control would let a client spoof
-both.
+both. If the daemon and server are co-located on the same host,
+`--unix-socket` (above) sidesteps this gap entirely instead of working
+around it — see `THREAT_MODEL.md`'s Unix-domain-socket note.
 
 **Fails closed, not silently.** An uncaught exception in a request
 handler (a real disk-full or locked-database error, not just a bad
@@ -926,9 +977,18 @@ design).
 - **Heuristic, not provably secure.** A determined rootkit with kernel
   privileges can defeat any in-band detector. This tool is defense-in-depth:
   it raises the cost and detects the *typical* hook points.
-- The syscall-entry check treats "inside `[_stext, _etext)` and outside all
-  modules" as legit. A hook that redirects within core kernel text (e.g.,
-  sys_read → sys_write) is not flagged (rare; also visually detectable).
+- The syscall-entry range check treats "inside `[_stext, _etext)` and
+  outside all modules" as legit, and on its own can't see a hook that
+  redirects within core kernel text (e.g., sys_read → sys_write). The
+  boot-time handler-address baseline (`AC_EV_SYSCALL_REDIRECT`, see #63)
+  closes most of that gap for a redirect installed *after* the module
+  loads, but not against an adversary who already has kernel-write
+  privilege equal to or greater than the module's own — such an attacker
+  can patch the in-kernel baseline (`ac_syscall_baseline[]`) the same way
+  it can patch the table itself, and a redirect already present *before*
+  the module's baseline snapshot at load time is captured as normal,
+  never flagged. See THREAT_MODEL.md's "Within-core-kernel-text
+  redirects" note.
   If the `_stext`/`_etext` kprobe lookups are unavailable (they are section
   labels and not always probe-able), the module derives the text bounds
   from the syscall table entries themselves and falls back to a ±64 MB

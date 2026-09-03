@@ -16,7 +16,14 @@
 #define AC_DEV_NAME     "anticheat"
 #define AC_DEV_PATH     "/dev/anticheat"
 #define AC_IOCTL_MAGIC  0xAC
-#define AC_IOCTL_VERSION 1
+#define AC_IOCTL_VERSION 2
+
+/* Upper bound (milliseconds) the kernel clamps struct ac_event_list's
+ * block_ms field to for AC_IOCTL_GET_EVENTS -- see that struct's own
+ * comment. Keeps a caller (malicious or just buggy) from tying up a
+ * kernel thread indefinitely, and bounds worst-case ioctl-fuzz overhead
+ * per iteration that happens to land on this command with an empty ring. */
+#define AC_GET_EVENTS_MAX_BLOCK_MS 1000
 
 #define AC_MAX_COMM     16
 #define AC_MAX_PROCS    64
@@ -39,7 +46,7 @@
 #define AC_IOCTL_DEL_PROC         _IOW(AC_IOCTL_MAGIC,  3, struct ac_proc_id)
 #define AC_IOCTL_SCAN_BEGIN       _IOWR(AC_IOCTL_MAGIC, 4, struct ac_scan_begin)
 #define AC_IOCTL_CHECK_SYSCALLS   _IOR(AC_IOCTL_MAGIC,  5, struct ac_syscall_check)
-#define AC_IOCTL_GET_EVENTS       _IOR(AC_IOCTL_MAGIC,  7, struct ac_event_list)
+#define AC_IOCTL_GET_EVENTS       _IOWR(AC_IOCTL_MAGIC, 7, struct ac_event_list)
 #define AC_IOCTL_FLUSH_EVENTS     _IO(AC_IOCTL_MAGIC,   8)
 #define AC_IOCTL_LIST_PROTECTED   _IOR(AC_IOCTL_MAGIC,  9, struct ac_prot_list)
 #define AC_IOCTL_LOCK             _IO(AC_IOCTL_MAGIC,  10)
@@ -76,6 +83,21 @@ enum {
                             * values (not inserted alongside AC_EV_PTRACE above)
                             * so a module/daemon version mismatch can't silently
                             * misclassify any event that already shipped. */
+    AC_EV_SYSCALL_REDIRECT, /* a syscall table entry's handler address changed
+                            * since the boot-time snapshot (see
+                            * ac_syscall_check.baseline_sha256) but still
+                            * points inside core kernel text -- distinct from
+                            * AC_EV_SYSCALL_HOOK, which is entries pointing
+                            * outside core text/into a module. An in-text
+                            * redirect (e.g. sys_read -> sys_write) is exactly
+                            * the gap THREAT_MODEL.md's "Within-core-kernel-
+                            * text redirects" note describes as out of scope
+                            * for the original range-only check; this event
+                            * raises the detection bar for it without
+                            * claiming to close it against a kernel-privileged
+                            * attacker (see #63). Appended after the
+                            * pre-existing values for the same version-skew
+                            * reason as AC_EV_PROCESS_VM above. */
 };
 
 /* ------------------------------------------------------------------ */
@@ -159,6 +181,35 @@ struct ac_syscall_check {
     unsigned int       non_text;      /* entries outside core kernel text */
     unsigned int       hooked;        /* = non_text (kept for compat) */
     unsigned int       ok;            /* 1 if no hooks found */
+    /* Boot-time handler-address baseline (#63): closes the gap
+     * THREAT_MODEL.md calls out under "Within-core-kernel-text redirects"
+     * -- table_addr/non_text/hooked above only ever look at *where* an
+     * entry points relative to core text, so a hook that swaps one
+     * in-text handler for another (e.g. sys_read -> sys_write) is
+     * invisible to them by design. These fields compare the live table
+     * against a checksum of the handler addresses captured once at
+     * module load, independent of whether any given entry still looks
+     * like a plausible core-text address. */
+    unsigned int       baseline_ready;     /* 1 if a boot-time handler-address
+                                             * snapshot was captured (0 if the
+                                             * syscall table couldn't be
+                                             * located at load time) */
+    unsigned int       redirected;         /* entries whose handler address
+                                             * differs from the boot baseline
+                                             * while still pointing inside core
+                                             * kernel text (in-text redirect) */
+    unsigned int       checksum_mismatch;  /* 1 if the whole-table SHA-256
+                                             * over live handler addresses
+                                             * differs from the boot baseline
+                                             * -- redundant with `redirected`
+                                             * for the in-text case above, but
+                                             * also catches any handler churn
+                                             * the per-slot walk didn't
+                                             * individually flag */
+    char               baseline_sha256[65]; /* hex digest captured at load;
+                                              * empty if baseline_ready == 0 */
+    char               current_sha256[65];  /* hex digest of the live table
+                                              * as of this check */
 };
 
 struct ac_mod_info {
@@ -183,6 +234,19 @@ struct ac_event {
 struct ac_event_list {
     unsigned int  count;
     unsigned int  dropped;      /* total drops (cumulative) */
+    /* in: 0 (default -- a zero-filled struct, same as every pre-v2
+     * caller sends) means AC_IOCTL_GET_EVENTS returns immediately,
+     * exactly like before this field existed. >0 asks the kernel to
+     * block interruptibly for up to this many milliseconds waiting for
+     * the ring to become non-empty, woken early the moment an event is
+     * pushed; the kernel clamps this down to
+     * AC_GET_EVENTS_MAX_BLOCK_MS. A signal (including one used only to
+     * ask a thread to stop, e.g. SIGTERM) interrupts the wait and the
+     * ioctl returns -EINTR/-ERESTARTSYS rather than blocking through it
+     * -- callers must not treat that as this field being ignored.
+     * Not echoed back on output (the kernel does not promise to
+     * preserve it across the call). */
+    unsigned int  block_ms;
     struct ac_event events[AC_MAX_EVENTS];
 };
 

@@ -148,11 +148,24 @@ where the relevant code lives:
   for a human to correlate, not verdicts — a sufficiently disguised
   layer (named to blend into the allowlist) or a preload library that
   does nothing detectably wrong isn't flagged by name alone.
-- **Within-core-kernel-text redirects.** The syscall-integrity check
-  flags entries pointing outside `[_stext, _etext)` or into a module;
-  a hook that redirects one core-kernel syscall handler to another
-  (e.g. `sys_read` → `sys_write`) stays inside kernel text and is not
-  flagged — considered rare and also visually detectable by other means.
+- **Within-core-kernel-text redirects.** The syscall-integrity range
+  check flags entries pointing outside `[_stext, _etext)` or into a
+  module; a hook that redirects one core-kernel syscall handler to
+  another (e.g. `sys_read` → `sys_write`) stays inside kernel text and
+  is invisible to that check alone. A boot-time checksum of every
+  handler address (`AC_EV_SYSCALL_REDIRECT`, see #63) raises the
+  detection bar for this: an in-text redirect installed any time after
+  module load is caught the next periodic/on-demand check, without
+  needing to identify it by range. This does **not** close the gap
+  against the adversary this document is actually scoped to exclude —
+  an attacker with kernel-write privilege equal to or greater than
+  `anticheat.ko`'s own can patch the in-kernel baseline the same way it
+  patches the table, and a redirect already present before the module's
+  own load-time snapshot is captured as the new "normal" and never
+  flagged. Still considered a narrow, mostly-theoretical gap against the
+  actual in-scope adversary (ordinary user-to-root-userspace, or a cheat
+  module installing the redirect *after* this module has already
+  snapshotted the table) — also visually detectable by other means.
 - **`SIGKILL` of the daemon by a root-privileged attacker.** Daemon
   self-protection only stops ptrace-based attacks via the same kprobe
   everything else uses; nothing here hides or hardens the daemon process
@@ -243,3 +256,44 @@ sniff or sit on-path of, where the reverse proxy is required, not
 optional. None of this is yet a claim that this is safe to distribute to
 end users' machines you don't control, or to expose to the open internet
 without the operator's own additional review.
+
+**Unix-domain-socket transport extends the safely-supported deployment
+surface (#67).** `AC_REPORT_URL=unix:///path/to/socket` on the daemon
+side, paired with `ac_server.py --unix-socket PATH`, sends the same
+HTTP/1.1 request over an `AF_UNIX` `SOCK_STREAM` socket instead of a TCP
+connection — the daemon and server co-located on one host is, in
+practice, the more likely deployment than the LAN case above, and this
+option removes the plaintext-network-credential exposure entirely for
+it: there is no network segment for the `Authorization: Bearer` key to
+traverse in the first place. This changes what the relevant trust
+boundary *is*, not just narrows it — for the Unix-socket transport it's
+filesystem permissions on the socket path, not network reachability.
+`ac_server.py` creates the socket file `0600` (owner-only, mirroring the
+report DB's own permissions — see `Store.__init__`) and reapplies that
+mode on every start, so anyone able to open that socket has already
+cleared the same bar as reading the SQLite DB directly. That mode isn't
+durably widenable: a daemon running as a different user than the server
+cannot be accommodated by loosening the socket's group/ACL after the
+fact, since the next (re)start resets it to `0600` again -- the daemon
+and server must run as the same user (or the daemon as root). `0600` on
+the socket file is also not the whole boundary: it only gates *opening*
+the bound socket, not deleting or replacing the path before the server
+binds to it, so the containing directory (e.g. `/run/anticheat/`) must
+itself be writable only by that same user, not by anyone else who might
+squat the path first. Before binding, `ac_server.py` also refuses to
+touch a stale path that turns out not to be a socket, and refuses to
+steal a path something is still actively listening on, rather than
+unconditionally unlinking whatever it finds there. This is additive,
+not a replacement: plain HTTP-over-TCP keeps working unchanged for
+existing LAN/reverse-proxy deployments, and per-source-IP rate limiting
+doesn't apply in any meaningful way to the Unix-socket transport (every
+connection over it is attributed to a single fixed placeholder identity,
+since there's no per-peer network address to key on, and `--trust-proxy`
+is rejected outright alongside `--unix-socket` rather than letting a
+client forge that identity via `X-Forwarded-For`) — acceptable because
+reaching the socket at all is already permission-gated, unlike an open
+TCP port.
+HTTPS with a pinned certificate — the other half of #67 — remains a
+documented follow-up, not attempted here; it's the right answer for a
+genuinely remote, over-the-network deployment, which the Unix-socket
+option does not address.

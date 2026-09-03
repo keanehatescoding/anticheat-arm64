@@ -3,7 +3,15 @@
  * sha256.c — compact SHA-256 (FIPS 180-4).
  */
 #include "sha256.h"
-#include <string.h>
+/* memcpy() only -- linux/string.h provides the same signature in-kernel.
+ * Same __KERNEL__ split as sha256.h's stddef.h/stdint.h swap-in, and for
+ * the same reason: the kernel module build has no plain libc headers on
+ * its include path. */
+#ifdef __KERNEL__
+# include <linux/string.h>
+#else
+# include <string.h>
+#endif
 
 static const uint32_t K[64] = {
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
@@ -116,19 +124,25 @@ void ac_sha256_final(ac_sha256_ctx *c, uint8_t out[32])
     }
 }
 
-void ac_sha256_hex(const void *buf, size_t len, char out_hex[65])
+void ac_sha256_hex_digest(const uint8_t digest[32], char out_hex[65])
 {
     static const char hexd[] = "0123456789abcdef";
+    int i;
+
+    for (i = 0; i < 32; i++) {
+        out_hex[i * 2] = hexd[digest[i] >> 4];
+        out_hex[i * 2 + 1] = hexd[digest[i] & 0xf];
+    }
+    out_hex[64] = '\0';
+}
+
+void ac_sha256_hex(const void *buf, size_t len, char out_hex[65])
+{
     ac_sha256_ctx c;
     uint8_t d[32];
-    int i;
 
     ac_sha256_init(&c);
     ac_sha256_update(&c, buf, len);
     ac_sha256_final(&c, d);
-    for (i = 0; i < 32; i++) {
-        out_hex[i * 2] = hexd[d[i] >> 4];
-        out_hex[i * 2 + 1] = hexd[d[i] & 0xf];
-    }
-    out_hex[64] = '\0';
+    ac_sha256_hex_digest(d, out_hex);
 }

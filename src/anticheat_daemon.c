@@ -70,6 +70,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/syslog.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <linux/limits.h>
 
@@ -160,6 +161,7 @@ static const char *ev_type_str(unsigned int t)
     case AC_EV_PTRACE:      return "PTRACE-DENIED";
     case AC_EV_PROCESS_VM:  return "PROCESS-VM-DENIED";
     case AC_EV_SYSCALL_HOOK:return "SYSCALL-HOOK";
+    case AC_EV_SYSCALL_REDIRECT: return "SYSCALL-REDIRECT";
     case AC_EV_RWX:         return "RWX";
     case AC_EV_ANON_EXEC:   return "ANON-EXEC";
     case AC_EV_INFO:        return "INFO";
@@ -480,7 +482,8 @@ static int cmd_list(void)
         return 1;
     printf("%u protected process(es):\n", pl.count);
     for (i = 0; i < pl.count; i++)
-        printf("  pid %-8d %s\n", pl.items[i].pid, pl.items[i].comm);
+        printf("  pid %-8d %-16s jit=%s\n", pl.items[i].pid,
+               pl.items[i].comm, pl.items[i].jit_allowed ? "yes" : "no");
     ac_close();
     return 0;
 }
@@ -1588,10 +1591,25 @@ static int cmd_syscalls(void)
     printf("  entries examined : %u\n", c.nr_syscalls);
     printf("  non-NULL entries : %u\n", c.total);
     printf("  hooked           : %u\n", c.hooked);
-    if (c.ok)
+    if (c.baseline_ready) {
+        printf("  boot baseline    : %s\n", c.baseline_sha256);
+        printf("  current checksum : %s%s\n", c.current_sha256,
+               c.checksum_mismatch ? " (MISMATCH)" : "");
+        printf("  redirected       : %u (in-text handler swap since boot)\n",
+               c.redirected);
+    } else {
+        printf("  boot baseline    : unavailable (syscall table not located at load)\n");
+    }
+    if (c.ok && c.redirected == 0 && !c.checksum_mismatch)
         printf("  result           : OK — no hooks detected\n");
     else {
-        printf("  result           : COMPROMISED — syscall hooks present!\n");
+        if (!c.ok)
+            printf("  result           : COMPROMISED — syscall hooks present!\n");
+        if (c.redirected)
+            printf("  result           : COMPROMISED — in-text syscall redirect(s) present!\n");
+        if (c.checksum_mismatch && c.ok && c.redirected == 0)
+            printf("  result           : COMPROMISED — syscall checksum mismatch"
+                   " (handler churn not caught by per-slot checks)!\n");
         return 2;
     }
     ac_close();
@@ -1910,16 +1928,37 @@ static void sig_handler(int sig)
 
 static int check_syscalls_periodic(void)
 {
+    /* Rising-edge state for a checksum-only compromise -- see below. */
+    static int checksum_only_reported;
     struct ac_syscall_check c;
 
     memset(&c, 0, sizeof(c));
     if (ioctl(dev_fd, AC_IOCTL_CHECK_SYSCALLS, &c) < 0)
         return -1;
-    /* Don't log here: the kernel only emits AC_EV_SYSCALL_HOOK into the
-     * event ring on a rising edge (new hook, not a still-hooked slot), and
-     * the main loop's ring drain already logs it at LOG_CRIT. Logging here
-     * too would re-report the same persistent hook at CRIT on every poll
-     * (see #52). */
+    /* Don't log hooked/redirected here: the kernel only emits
+     * AC_EV_SYSCALL_HOOK / AC_EV_SYSCALL_REDIRECT into the event ring on
+     * a rising edge (a new hook or in-text handler swap, not one already
+     * reported), and the main loop's ring drain already logs both at
+     * LOG_CRIT. Logging them here too would re-report the same
+     * persistent hook/redirect at CRIT on every poll (see #52).
+     *
+     * checksum_mismatch has no matching kernel event, though: it exists
+     * specifically to catch handler churn the per-slot walk (and so
+     * those two events) didn't individually flag -- see anticheat.h's
+     * comment on the field. Without a report here, that case is
+     * detected by the kernel every 5s but never logged or acted on by
+     * the daemon at all. Track our own rising edge so it's reported
+     * once per transition, same rationale as #52.
+     */
+    if (c.checksum_mismatch && !c.hooked && !c.redirected) {
+        if (!checksum_only_reported)
+            logmsg(LOG_CRIT, "syscall table checksum mismatch: boot=%s "
+                   "current=%s (handler churn not individually flagged)",
+                   c.baseline_sha256, c.current_sha256);
+        checksum_only_reported = 1;
+    } else {
+        checksum_only_reported = 0;
+    }
     return c.hooked;
 }
 
@@ -2908,7 +2947,15 @@ static int check_baselines_periodic(void)
 /*                                                                      */
 /* No TLS: this is plain HTTP, meant for a local/LAN deployment behind  */
 /* a reverse proxy that terminates TLS for anything reachable over an   */
-/* untrusted network. AC_REPORT_URL is host:port, no scheme.            */
+/* untrusted network. AC_REPORT_URL is either "host:port" (plain TCP,   */
+/* no scheme) or "unix:///path/to/socket" (AF_UNIX SOCK_STREAM instead  */
+/* of a network socket -- the same HTTP/1.1 request framing goes out    */
+/* either way, ac_server.py just needs to be listening on that path via */
+/* its own --unix-socket, see server/ac_server.py). The Unix-socket     */
+/* option trades the plaintext-network-credential exposure noted above  */
+/* for filesystem permissions on the socket as the trust boundary --    */
+/* the natural fit when the daemon and server are co-located, which is  */
+/* the deployment this project actually expects (see THREAT_MODEL.md).  */
 /* ------------------------------------------------------------------ */
 #define AC_REPORT_TIMEOUT_SEC 3
 
@@ -3141,14 +3188,119 @@ static void ac_report_client_id(char *out, size_t outsz)
     snprintf(out, outsz, "unknown");
 }
 
+/* Strict HTTP status-line parser: "HTTP/1.<minor> <code> <reason>", where
+ * <minor> and <code> must each be exactly the digit count RFC 7230's
+ * HTTP-version/status-code grammar specifies (one, three) -- not "one or
+ * more" the way a naive digit-scanning loop would accept. sscanf()'s
+ * "%d" would also accept a leading sign or extra digits -- e.g. a
+ * malformed "HTTP/1.1 +200 OK" is not a valid status line, but "%d"
+ * happily parses it as a real 200 and reports success anyway. The major
+ * version is required to be exactly "1": ac_report() always speaks
+ * plain HTTP/1.x over a raw socket (see the no-TLS note above), so
+ * anything else -- "HTTP/2.0 200 OK" included -- cannot be a genuine
+ * response from the configured report server and must fail closed
+ * rather than being parsed as a 2xx. Returns the parsed code, or -1 if
+ * resp isn't a well-formed status line (fails closed: -1 is never
+ * inside the accepted 2xx range). */
+static int ac_http_status_code(const char *resp)
+{
+    const char *p = resp;
+
+    if (strncmp(p, "HTTP/1.", 7) != 0)
+        return -1;
+    p += 7;
+    if (!isdigit((unsigned char)*p))
+        return -1;
+    p++;
+    if (*p != ' ')
+        return -1;
+    p++;
+    if (!isdigit((unsigned char)p[0]) || !isdigit((unsigned char)p[1]) ||
+        !isdigit((unsigned char)p[2]))
+        return -1;
+    /* The three digits must end at a proper status-line delimiter: a
+     * space before the reason-phrase, a line ending if the reason
+     * phrase is empty, or end-of-buffer if the response was cut off
+     * exactly there. Anything else -- a fourth digit, or a stray
+     * non-space byte glued onto the code like "200X" -- means these
+     * three digits aren't actually the whole status code. */
+    if (p[3] != ' ' && p[3] != '\r' && p[3] != '\n' && p[3] != '\0')
+        return -1;
+    return (p[0] - '0') * 100 + (p[1] - '0') * 10 + (p[2] - '0');
+}
+
+#define AC_REPORT_UNIX_PREFIX "unix://"
+
+/* A parsed AC_REPORT_URL: either a TCP host:port, or an AF_UNIX socket
+ * path. `host` is dual-purpose -- for TCP it's the bare hostname passed
+ * to ac_resolve_timeout() and reused verbatim as the HTTP Host: header;
+ * for a unix:// destination there's no real hostname, so it's filled
+ * with a fixed "localhost" placeholder for the Host: header only (the
+ * same convention curl's --unix-socket uses), and sock_path carries the
+ * actual filesystem path instead. */
+struct ac_report_dest {
+    int is_unix;
+    char host[256];
+    char port[32];
+    char sock_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+};
+
+/* Parses AC_REPORT_URL into *out. Returns 0 on success; returns -1 on a
+ * malformed URL, having already logged what's wrong to stderr. Kept
+ * separate from ac_report() itself so the parsing logic is unit-testable
+ * without needing a real socket -- see test/ac_report_url_test.c. */
+static int ac_report_parse_url(const char *url, struct ac_report_dest *out)
+{
+    memset(out, 0, sizeof(*out));
+
+    if (strncmp(url, AC_REPORT_UNIX_PREFIX,
+                strlen(AC_REPORT_UNIX_PREFIX)) == 0) {
+        const char *path = url + strlen(AC_REPORT_UNIX_PREFIX);
+
+        if (!*path) {
+            fprintf(stderr,
+                    "ac_report: unix:// AC_REPORT_URL missing a socket "
+                    "path\n");
+            return -1;
+        }
+        /* sun_path has no room for a trailing NUL past this length --
+         * reject up front instead of silently truncating the path and
+         * connecting to the wrong (or a nonexistent) socket. */
+        if (strlen(path) >= sizeof(out->sock_path)) {
+            fprintf(stderr, "ac_report: unix socket path too long: %s\n",
+                    path);
+            return -1;
+        }
+        out->is_unix = 1;
+        snprintf(out->sock_path, sizeof(out->sock_path), "%s", path);
+        snprintf(out->host, sizeof(out->host), "localhost");
+        return 0;
+    }
+
+    {
+        char *colon;
+
+        snprintf(out->host, sizeof(out->host), "%s", url);
+        colon = strrchr(out->host, ':');
+        if (!colon) {
+            fprintf(stderr,
+                    "ac_report: AC_REPORT_URL must be host:port or "
+                    "unix:///path/to/socket\n");
+            return -1;
+        }
+        *colon = '\0';
+        snprintf(out->port, sizeof(out->port), "%s", colon + 1);
+        return 0;
+    }
+}
+
 static void ac_report(const char *event_type, const char *detail)
 {
     const char *url = getenv("AC_REPORT_URL");
     const char *key = getenv("AC_REPORT_KEY");
-    char host[256], client_id[128], et_esc[64], detail_esc[600];
+    char client_id[128], et_esc[64], detail_esc[600];
     char body[1024], req[2048], resp[64];
-    const char *port;
-    char *colon;
+    struct ac_report_dest dest;
     struct ac_resolved_addr addrs[AC_RESOLVE_MAX];
     int fd = -1, naddrs, ai;
     struct timeval tv;
@@ -3157,14 +3309,8 @@ static void ac_report(const char *event_type, const char *detail)
     if (!url || !*url || !key || !*key)
         return;   /* not configured -- silently a no-op, by design */
 
-    snprintf(host, sizeof(host), "%s", url);
-    colon = strrchr(host, ':');
-    if (!colon) {
-        fprintf(stderr, "ac_report: AC_REPORT_URL must be host:port\n");
-        return;
-    }
-    *colon = '\0';
-    port = colon + 1;
+    if (ac_report_parse_url(url, &dest) != 0)
+        return;   /* ac_report_parse_url() already logged what's wrong */
 
     ac_report_client_id(client_id, sizeof(client_id));
     ac_json_escape(event_type, et_esc, sizeof(et_esc));
@@ -3174,33 +3320,66 @@ static void ac_report(const char *event_type, const char *detail)
              "\"ts\":%lld}",
              client_id, et_esc, detail_esc, (long long)time(NULL));
 
-    naddrs = ac_resolve_timeout(host, port, addrs, AC_RESOLVE_MAX,
-                                 AC_REPORT_TIMEOUT_SEC);
-    if (naddrs <= 0) {
-        fprintf(stderr, "ac_report: could not resolve %s:%s\n", host, port);
-        return;
-    }
-    /* A hung/unreachable report server must never stall the security
-     * monitoring loop -- ac_connect_timeout() bounds connect() itself
-     * (which SO_SNDTIMEO/SO_RCVTIMEO do not, on Linux), and those two
-     * still bound the subsequent send/recv on whichever address works. */
-    for (ai = 0; ai < naddrs; ai++) {
-        fd = socket(addrs[ai].family, addrs[ai].socktype, addrs[ai].protocol);
-        if (fd < 0)
-            continue;
+    if (dest.is_unix) {
+        struct sockaddr_un sun;
+
+        memset(&sun, 0, sizeof(sun));
+        sun.sun_family = AF_UNIX;
+        /* dest.sock_path is already bounded to sizeof(sun.sun_path) by
+         * ac_report_parse_url(), so this can't overflow. */
+        memcpy(sun.sun_path, dest.sock_path, sizeof(sun.sun_path));
+
+        fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0) {
+            fprintf(stderr, "ac_report: socket() failed: %s\n",
+                    strerror(errno));
+            return;
+        }
         tv.tv_sec = AC_REPORT_TIMEOUT_SEC;
         tv.tv_usec = 0;
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        if (ac_connect_timeout(fd, (struct sockaddr *)&addrs[ai].addr,
-                                addrs[ai].addrlen, AC_REPORT_TIMEOUT_SEC) == 0)
-            break;
-        close(fd);
-        fd = -1;
-    }
-    if (fd < 0) {
-        fprintf(stderr, "ac_report: could not connect to %s:%s\n", host, port);
-        return;
+        if (ac_connect_timeout(fd, (struct sockaddr *)&sun, sizeof(sun),
+                                AC_REPORT_TIMEOUT_SEC) != 0) {
+            fprintf(stderr,
+                    "ac_report: could not connect to unix socket %s: %s\n",
+                    dest.sock_path, strerror(errno));
+            close(fd);
+            return;
+        }
+    } else {
+        naddrs = ac_resolve_timeout(dest.host, dest.port, addrs,
+                                     AC_RESOLVE_MAX, AC_REPORT_TIMEOUT_SEC);
+        if (naddrs <= 0) {
+            fprintf(stderr, "ac_report: could not resolve %s:%s\n",
+                    dest.host, dest.port);
+            return;
+        }
+        /* A hung/unreachable report server must never stall the security
+         * monitoring loop -- ac_connect_timeout() bounds connect() itself
+         * (which SO_SNDTIMEO/SO_RCVTIMEO do not, on Linux), and those two
+         * still bound the subsequent send/recv on whichever address works. */
+        for (ai = 0; ai < naddrs; ai++) {
+            fd = socket(addrs[ai].family, addrs[ai].socktype,
+                        addrs[ai].protocol);
+            if (fd < 0)
+                continue;
+            tv.tv_sec = AC_REPORT_TIMEOUT_SEC;
+            tv.tv_usec = 0;
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            if (ac_connect_timeout(fd, (struct sockaddr *)&addrs[ai].addr,
+                                    addrs[ai].addrlen,
+                                    AC_REPORT_TIMEOUT_SEC) == 0)
+                break;
+            close(fd);
+            fd = -1;
+        }
+        if (fd < 0) {
+            fprintf(stderr, "ac_report: could not connect to %s:%s\n",
+                    dest.host, dest.port);
+            return;
+        }
     }
 
     {
@@ -3213,7 +3392,7 @@ static void ac_report(const char *event_type, const char *detail)
                  "Connection: close\r\n"
                  "\r\n"
                  "%s",
-                 host, key, strlen(body), body);
+                 dest.host, key, strlen(body), body);
 
         /* snprintf() returns the length the fully-formatted request would
          * have needed, even when it truncated req[] to fit -- an
@@ -3261,13 +3440,49 @@ static void ac_report(const char *event_type, const char *detail)
         }
     }
     n = read(fd, resp, sizeof(resp) - 1);
-    if (n > 0) {
-        resp[n] = '\0';
-        if (!strstr(resp, " 200") && !strstr(resp, " 201"))
-            fprintf(stderr, "ac_report: server response: %.60s\n", resp);
+    {
+        int code = -1;
+        char body[64];
+
+        /* n <= 0 (connection closed before any bytes arrived, or the
+         * read itself failed/timed out) is exactly as much a failed
+         * delivery as a non-2xx status -- resp is uninitialized in that
+         * case, so log a fixed placeholder instead of reading it, but
+         * still fail closed (code stays -1) and still log, instead of
+         * silently falling through with no operator-visible indication
+         * that the report never landed. */
+        if (n > 0) {
+            resp[n] = '\0';
+            /* Parse the numeric status code from the status line only
+             * -- scanning the whole raw response for " 200"/" 201" as
+             * substrings would also match those digits inside a header
+             * value (e.g. "Content-Length: 200") on an actual error
+             * response and misreport a failed delivery as successful. */
+            code = ac_http_status_code(resp);
+            snprintf(body, sizeof(body), "%.60s", resp);
+        } else if (n == 0) {
+            snprintf(body, sizeof(body), "(connection closed, no response)");
+        } else {
+            snprintf(body, sizeof(body), "(read failed: %s)",
+                     strerror(errno));
+        }
+        if (code < 200 || code >= 300)
+            fprintf(stderr, "ac_report: server response status %d: %s\n",
+                    code, body);
     }
     close(fd);
 }
+
+/* How long the monitor loop below asks AC_IOCTL_GET_EVENTS to block for
+ * (via struct ac_event_list's block_ms field, see #61) when the ring is
+ * empty -- matches the fixed 1s cadence the loop used to get for free
+ * from sleep(1), so the periodic checks that share this loop iteration
+ * (check_syscalls_periodic() and friends, each independently gated by
+ * its own next_* deadline) keep running at the same granularity as
+ * before. Real detections no longer wait out this window: the kernel
+ * wakes a blocked GET_EVENTS the moment an event is pushed, regardless
+ * of how much of block_ms is left. */
+#define AC_MONITOR_BLOCK_MS 1000
 
 static int cmd_start(int argc, char **argv)
 {
@@ -3283,20 +3498,82 @@ static int cmd_start(int argc, char **argv)
 
     ac_open();   /* holds /dev/anticheat open -> module pinned while we live */
 
+    /* ABI version handshake: fail fast, before forking into the
+     * background, rather than let a stale module/daemon pairing surface
+     * later as confusing runtime behavior (struct layout mismatches,
+     * garbage fields, ...). See issue #64. */
+    {
+        struct ac_status st;
+
+        if (ioctl_ok(AC_IOCTL_STATUS, &st) < 0)
+            die("cannot query module status via %s -- refusing to start",
+                AC_DEV_PATH);
+        if (st.version != AC_IOCTL_VERSION)
+            die("ioctl ABI version mismatch: daemon built for "
+                "AC_IOCTL_VERSION=%d, but the loaded kernel module reports "
+                "version=%llu -- refusing to start. Rebuild/reload a "
+                "matching daemon and module pair.",
+                AC_IOCTL_VERSION, st.version);
+    }
+
     if (!foreground) {
+        /* Classic double-fork daemonization: the first child exits right
+         * after the second fork, so its pid is already dead by the time
+         * anything could report it. Only the surviving grandchild's pid
+         * is the one an operator can actually kill/track -- pass it back
+         * to the original, terminal-attached parent over a pipe before
+         * the intermediate first child exits, instead of printing the
+         * first child's own (about-to-die) pid. Printing from the
+         * grandchild itself isn't an option: by the time it exists,
+         * stdout has already been freopen()'d to the log file below. */
+        int pfd[2];
+
+        if (pipe(pfd) < 0)
+            die("pipe: %s", strerror(errno));
+
         pid = fork();
         if (pid < 0)
             die("fork: %s", strerror(errno));
         if (pid > 0) {
-            printf("anticheat daemon started (pid %d)\n", pid);
-            _exit(0);
+            pid_t final_pid = -1;
+            ssize_t r;
+
+            close(pfd[1]);
+            r = read(pfd[0], &final_pid, sizeof(final_pid));
+            close(pfd[0]);
+            if (r == (ssize_t)sizeof(final_pid) && final_pid > 0) {
+                printf("anticheat daemon started (pid %d)\n", final_pid);
+                /* _exit() skips stdio flushing (unlike exit()) -- when
+                 * stdout isn't a tty (e.g. redirected to a file/pipe by
+                 * the caller) it's fully buffered rather than
+                 * line-buffered, so without this the message above can
+                 * be silently lost. */
+                fflush(stdout);
+                _exit(0);
+            }
+            fprintf(stderr, "anticheat: daemon failed to start\n");
+            _exit(1);
         }
+        close(pfd[0]);
         setsid();
         pid = fork();
         if (pid < 0)
             die("fork: %s", strerror(errno));
-        if (pid > 0)
+        if (pid > 0) {
+            pid_t final_pid = pid;
+
+            /* A single write() of a pid_t-sized buffer is well under
+             * PIPE_BUF, so it's atomic -- the parent's read() above gets
+             * it whole in one call. Best-effort: if this write somehow
+             * fails, the parent's short/absent read falls back to the
+             * failure message above. */
+            ssize_t w = write(pfd[1], &final_pid, sizeof(final_pid));
+
+            (void)w;
+            close(pfd[1]);
             _exit(0);
+        }
+        close(pfd[1]);
         /* best-effort daemonization; failures are not fatal */
         if (chdir("/") < 0)
             fprintf(stderr, "daemon: chdir failed: %s\n", strerror(errno));
@@ -3309,8 +3586,26 @@ static int cmd_start(int argc, char **argv)
     }
 
     openlog("anticheat", LOG_PID | LOG_NDELAY, LOG_AUTH);
-    signal(SIGTERM, sig_handler);
-    signal(SIGINT, sig_handler);
+    {
+        /* sigaction(), not signal(): glibc's signal() installs handlers
+         * with SA_RESTART, which would make the kernel silently restart
+         * a blocked AC_IOCTL_GET_EVENTS (see #61) after this handler
+         * returns instead of letting the -EINTR/-ERESTARTSYS the module
+         * returns actually surface -- the monitor loop below would then
+         * not notice g_stop until the next full block_ms wait finishes
+         * (still bounded, but no longer near-instant the way sleep(1)'s
+         * interrupt-on-signal behavior used to be). Explicitly leaving
+         * SA_RESTART unset keeps shutdown latency on SIGTERM/SIGINT the
+         * same as before this change. */
+        struct sigaction sa;
+
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = sig_handler;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;   /* no SA_RESTART */
+        sigaction(SIGTERM, &sa, NULL);
+        sigaction(SIGINT, &sa, NULL);
+    }
     signal(SIGHUP, SIG_IGN);
 
     logmsg(LOG_INFO, "anticheat daemon started (foreground=%d)", foreground);
@@ -3359,23 +3654,45 @@ static int cmd_start(int argc, char **argv)
 
         while (!g_stop) {
             struct ac_event_list el;
-            time_t now = time(NULL);
+            struct timespec t0, t1;
+            long waited_ms;
+            time_t now;
+            int got;
 
             memset(&el, 0, sizeof(el));
-            if (ioctl(dev_fd, AC_IOCTL_GET_EVENTS, &el) == 0) {
+            el.block_ms = AC_MONITOR_BLOCK_MS;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            got = ioctl(dev_fd, AC_IOCTL_GET_EVENTS, &el);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            waited_ms = (t1.tv_sec - t0.tv_sec) * 1000L +
+                        (t1.tv_nsec - t0.tv_nsec) / 1000000L;
+            /* got < 0 here from a SIGTERM/SIGINT during the blocking
+             * ioctl (-EINTR/-ERESTARTSYS, see the sigaction comment
+             * above) must skip straight to the while(!g_stop) check --
+             * otherwise the periodic checks and the fallback sleep
+             * below would still run first, burning most of block_ms
+             * and defeating the whole point of leaving SA_RESTART
+             * unset. Any other ioctl failure (e.g. ENOTTY from a
+             * legacy module) falls through to the fallback sleep as
+             * before. */
+            if (got < 0 && g_stop)
+                break;
+            if (got == 0) {
                 for (i = 0; i < (int)el.count; i++) {
                     struct ac_event *e = &el.events[i];
 
                     if (e->type == AC_EV_PTRACE || e->type == AC_EV_PROCESS_VM)
                         logmsg(LOG_ALERT, "%s pid=%d comm=%s %s",
                                ev_type_str(e->type), e->pid, e->comm, e->data);
-                    else if (e->type == AC_EV_SYSCALL_HOOK)
+                    else if (e->type == AC_EV_SYSCALL_HOOK ||
+                             e->type == AC_EV_SYSCALL_REDIRECT)
                         logmsg(LOG_CRIT, "%s %s", ev_type_str(e->type), e->data);
                     else
                         logmsg(LOG_INFO, "%s pid=%d comm=%s %s",
                                ev_type_str(e->type), e->pid, e->comm, e->data);
                 }
             }
+            now = time(NULL);
             if (now >= next_sys) {
                 check_syscalls_periodic();
                 next_sys = now + 5;
@@ -3408,7 +3725,19 @@ static int cmd_start(int argc, char **argv)
                 check_implicit_layers_periodic();
                 next_implicit = now + ac_implicit_layer_check_interval();
             }
-            sleep(1);
+            /* Fallback for anything that doesn't actually honor block_ms
+             * -- a module built before this field existed (ioctl number
+             * mismatch -> ENOTTY), or the userspace mock, which answers
+             * GET_EVENTS immediately regardless of block_ms (see
+             * test/mock_anticheat.c). In either case the ioctl call
+             * above returned almost instantly with no events, and
+             * without this the loop would busy-spin at 100% CPU instead
+             * of blocking. When the kernel *did* block for us (real
+             * events made it return early, or it genuinely waited out
+             * block_ms with nothing arriving) this is a no-op -- the
+             * loop's cadence is unchanged from the old fixed sleep(1). */
+            if ((got != 0 || el.count == 0) && waited_ms < AC_MONITOR_BLOCK_MS)
+                usleep((useconds_t)(AC_MONITOR_BLOCK_MS - waited_ms) * 1000);
         }
     }
     logmsg(LOG_INFO, "anticheat daemon stopped");
