@@ -139,6 +139,43 @@ static void read_comm(int pid, char *out, size_t n)
     fclose(f);
 }
 
+/* Userspace analog of the real module's "t->flags & PF_KTHREAD" check --
+ * see the AC_IOCTL_ADD_PROC comment below. /proc/<pid>/stat field 9 is the
+ * task's raw kernel flags word (see `man 5 proc`), the same value the
+ * module reads off t->flags, so this mirrors PF_KTHREAD exactly instead of
+ * inferring it from an empty /proc/<pid>/cmdline -- a zombie userspace
+ * process also reads back 0 bytes of cmdline and would have been
+ * misclassified as a kernel thread by that heuristic. */
+#define AC_MOCK_PF_KTHREAD 0x00200000UL
+static int is_kthread_like(int pid)
+{
+    char path[64], line[512], *rparen;
+    FILE *f;
+    unsigned long flags;
+
+    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+    f = fopen(path, "r");
+    if (!f)
+        return 0;   /* pid gone / unreadable: not our call to make here */
+    if (!fgets(line, sizeof(line), f)) {
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+
+    /* comm is the parenthesized 2nd field and may itself contain ')', so
+     * skip to the *last* ')' before splitting the remaining fields --
+     * same technique `man 5 proc` recommends. */
+    rparen = strrchr(line, ')');
+    if (!rparen)
+        return 0;
+    /* Fields after comm: state, ppid, pgrp, session, tty_nr, tpgid, flags.
+     * flags is the 7th, i.e. the last of these six is skipped first. */
+    if (sscanf(rparen + 1, " %*c %*d %*d %*d %*d %*d %lu", &flags) != 1)
+        return 0;
+    return (flags & AC_MOCK_PF_KTHREAD) != 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* VMA scan snapshot (parses /proc/<pid>/maps like the module walks    */
 /* the mmap maple tree)                                                */
@@ -284,6 +321,21 @@ static int do_ioctl(unsigned long req, void *arg)
         struct ac_proc_id *id = arg;
         unsigned int i;
 
+        /* Mirror the real kernel module's PF_KTHREAD rejection (issue
+         * #69 / ac_add_prot_task() in anticheat_module.c): this mock has
+         * no task_struct to check PF_KTHREAD on, but a kernel thread's
+         * /proc/<pid>/cmdline is always empty -- it has no argv, unlike
+         * any real userspace process -- which is a reliable
+         * userspace-visible analog for "not a valid protect target".
+         * Rejecting it here lets mock_test.sh exercise the same
+         * ADD_PROC-fails-for-a-kernel-thread behaviour end-to-end
+         * without root or a loaded module. Checked first, matching
+         * ac_add_prot_task()'s precedence: the real module rejects a
+         * kernel thread before it ever looks at registry capacity. */
+        if (is_kthread_like(id->pid)) {
+            errno = EINVAL;
+            return -1;
+        }
         for (i = 0; i < S.nprots; i++)
             if (S.prots[i].pid == id->pid) {
                 S.prots[i].jit_allowed = id->jit_allowed;  /* updatable via re-protect */

@@ -813,6 +813,12 @@ static int ac_add_prot_mm(struct mm_struct *mm, pid_t pid, const char *comm,
     int i, slot = -1;
     int ret;
 
+    /* Kernel threads (PF_KTHREAD) never own an mm_struct (see issue #69's
+     * concern about them wasting a registry slot) -- get_task_mm() already
+     * returns NULL for one, so every caller here (ac_add_prot_pid(),
+     * ac_clone_ret() via ac_schedule_prot_add()) bails out before ever
+     * reaching this function with such a task. No separate PF_KTHREAD
+     * check is needed at the mm layer. */
     spin_lock_irqsave(&ac_prot_lock, flags);
     for (i = 0; i < AC_PROT_MAX; i++) {
         if (ac_prots[i].mm == mm) {
