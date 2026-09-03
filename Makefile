@@ -146,6 +146,19 @@ ac-report-status-test: test/ac_report_status_test
 test/ac_report_status_test: test/ac_report_status_test.c src/anticheat_daemon.c src/sha256.c src/sha256.h src/anticheat.h
 	$(CC) $(CFLAGS) -o $@ test/ac_report_status_test.c src/sha256.c $(LDFLAGS)
 
+# ac_report() AC_REPORT_URL parsing unit test (#67): pulls
+# anticheat_daemon.c in directly and proves ac_report_parse_url() accepts
+# both the existing "host:port" TCP form and the new "unix:///path"
+# AF_UNIX form, and rejects a malformed/oversized one. See
+# test/ac_report_url_test.c; the real AF_UNIX connect()/send()/recv()
+# path this feeds is exercised against a real server in
+# server/test_server.sh's --unix-socket block instead.
+ac-report-url-test: test/ac_report_url_test
+	./test/ac_report_url_test
+
+test/ac_report_url_test: test/ac_report_url_test.c src/anticheat_daemon.c src/sha256.c src/sha256.h src/anticheat.h
+	$(CC) $(CFLAGS) -o $@ test/ac_report_url_test.c src/sha256.c $(LDFLAGS)
+
 # run the daemon CLI against the userspace mock (no kernel module, no root)
 test-mock: mock daemon
 	./test/mock_test.sh
@@ -155,12 +168,12 @@ test-mock: mock daemon
 # headers and is exercised separately in CI against a prepared kernel tree.)
 ci:
 	$(MAKE) clean
-	$(MAKE) CFLAGS="-O2 -Wall -Wextra -Werror" daemon mock baseline-test ac-report-status-test
+	$(MAKE) CFLAGS="-O2 -Wall -Wextra -Werror" daemon mock baseline-test ac-report-status-test ac-report-url-test
 	./test/mock_test.sh
 
 clean:
 	@if [ -d $(KDIR) ]; then $(MAKE) -C $(KDIR) M=$(PWD) clean; fi
-	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test test/mount_ns_probe test/anon_exec_test test/thread_exit_migration_test test/thread_spawn_after_protect_test test/ioctl_fuzz test/baseline_test test/ac_report_status_test
+	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test test/mount_ns_probe test/anon_exec_test test/thread_exit_migration_test test/thread_spawn_after_protect_test test/ioctl_fuzz test/baseline_test test/ac_report_status_test test/ac_report_url_test
 
 install: all
 	install -D -m 0755 anticheat /usr/local/sbin/anticheat
@@ -189,4 +202,4 @@ install-deck: all
 uninstall-deck:
 	rm -rf $(DECK_PREFIX)
 
-.PHONY: all module daemon mock test-mock priv-drop-test render-hook-test mount-ns-test thread-exit-migration-test thread-spawn-after-protect-test ioctl-fuzz baseline-test ac-report-status-test ci clean install uninstall install-deck uninstall-deck
+.PHONY: all module daemon mock test-mock priv-drop-test render-hook-test mount-ns-test thread-exit-migration-test thread-spawn-after-protect-test ioctl-fuzz baseline-test ac-report-status-test ac-report-url-test ci clean install uninstall install-deck uninstall-deck
