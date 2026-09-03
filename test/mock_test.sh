@@ -212,6 +212,20 @@ else
     fail "start: expected exactly 1 SYSCALL-REDIRECT log line, got $redirect_crit_count"
 fi
 
+# checksum_mismatch has no matching kernel event (see #63 review fix), so
+# unlike the two cases above this dedup is entirely daemon-side, in
+# check_syscalls_periodic()'s own rising-edge state -- a distinct code
+# path from the ring-drain dedup exercised above, so it needs its own
+# proof of both "fires at all" and "stays deduplicated across polls".
+checksum_out=$(timeout -k 2 --preserve-status 7 \
+    env AC_MOCK_CHECKSUM_ONLY=1 ./anticheat start --foreground 2>&1)
+checksum_crit_count=$(printf '%s' "$checksum_out" | grep -c "checksum mismatch")
+if [ "$checksum_crit_count" -eq 1 ]; then
+    pass "start: checksum-only mismatch alert logged exactly once"
+else
+    fail "start: expected exactly 1 checksum mismatch log line, got $checksum_crit_count"
+fi
+
 echo
 if [ "$FAIL" -eq 0 ]; then
     printf '\033[1;32mALL MOCK TESTS PASSED\033[0m\n'

@@ -363,6 +363,20 @@ static unsigned long ac_redirect_bitmap[BITS_TO_LONGS(__NR_syscalls)];
  * is an unambiguous "no baseline" sentinel; this bitmap only exists to
  * make that explicit instead of relying on the value being falsy. */
 static unsigned long ac_baseline_captured[BITS_TO_LONGS(__NR_syscalls)];
+/* Serializes ac_check_syscalls() below: AC_IOCTL_CHECK_SYSCALLS is called
+ * with no per-fd state, so the periodic monitor-loop caller and an
+ * on-demand `anticheat syscalls` caller (or several of the latter) can
+ * run concurrently. Without this, two callers racing a slot whose boot
+ * capture failed could each pass the "not yet captured" check and
+ * backfill ac_syscall_baseline[i] from a different live read -- if an
+ * attacker redirects that slot between the two reads, the redirected
+ * address can win the race and become the trusted baseline. The lock
+ * covers the whole read-backfill-hash-bitmap sequence per call, not just
+ * the backfill, since ac_syscall_baseline_hex is rewritten in place and
+ * an unlocked reader (out->baseline_sha256's strscpy()) could otherwise
+ * observe it mid-update.
+ */
+static DEFINE_MUTEX(ac_syscall_check_lock);
 
 /* Called once from ac_init(), after ac_syscall_table is located. A read
  * failure on any individual slot leaves that slot uncaptured (0, bit
@@ -410,6 +424,7 @@ static int ac_check_syscalls(struct ac_syscall_check *out)
     out->nr_syscalls = __NR_syscalls;
     out->baseline_ready = ac_syscall_baseline_ready;
 
+    mutex_lock(&ac_syscall_check_lock);
     ac_sha256_init(&hash);
     for (i = 0; i < __NR_syscalls; i++) {
         unsigned long e = 0;
@@ -479,6 +494,7 @@ static int ac_check_syscalls(struct ac_syscall_check *out)
         strscpy(out->baseline_sha256, ac_syscall_baseline_hex,
                 sizeof(out->baseline_sha256));   /* after the loop: reflects
                                                     * any backfill above */
+    mutex_unlock(&ac_syscall_check_lock);
     ac_sha256_final(&hash, digest);
     ac_sha256_hex_digest(digest, out->current_sha256);
     out->checksum_mismatch = ac_syscall_baseline_ready &&

@@ -1832,17 +1832,37 @@ static void sig_handler(int sig)
 
 static int check_syscalls_periodic(void)
 {
+    /* Rising-edge state for a checksum-only compromise -- see below. */
+    static int checksum_only_reported;
     struct ac_syscall_check c;
 
     memset(&c, 0, sizeof(c));
     if (ioctl(dev_fd, AC_IOCTL_CHECK_SYSCALLS, &c) < 0)
         return -1;
-    /* Don't log here: the kernel only emits AC_EV_SYSCALL_HOOK /
-     * AC_EV_SYSCALL_REDIRECT into the event ring on a rising edge (a new
-     * hook or in-text handler swap, not one already reported), and the
-     * main loop's ring drain already logs both at LOG_CRIT. Logging here
-     * too would re-report the same persistent hook/redirect at CRIT on
-     * every poll (see #52). */
+    /* Don't log hooked/redirected here: the kernel only emits
+     * AC_EV_SYSCALL_HOOK / AC_EV_SYSCALL_REDIRECT into the event ring on
+     * a rising edge (a new hook or in-text handler swap, not one already
+     * reported), and the main loop's ring drain already logs both at
+     * LOG_CRIT. Logging them here too would re-report the same
+     * persistent hook/redirect at CRIT on every poll (see #52).
+     *
+     * checksum_mismatch has no matching kernel event, though: it exists
+     * specifically to catch handler churn the per-slot walk (and so
+     * those two events) didn't individually flag -- see anticheat.h's
+     * comment on the field. Without a report here, that case is
+     * detected by the kernel every 5s but never logged or acted on by
+     * the daemon at all. Track our own rising edge so it's reported
+     * once per transition, same rationale as #52.
+     */
+    if (c.checksum_mismatch && !c.hooked && !c.redirected) {
+        if (!checksum_only_reported)
+            logmsg(LOG_CRIT, "syscall table checksum mismatch: boot=%s "
+                   "current=%s (handler churn not individually flagged)",
+                   c.baseline_sha256, c.current_sha256);
+        checksum_only_reported = 1;
+    } else {
+        checksum_only_reported = 0;
+    }
     return c.hooked;
 }
 
