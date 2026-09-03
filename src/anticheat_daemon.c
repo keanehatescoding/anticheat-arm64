@@ -17,7 +17,11 @@
  *                           logs, at reduced severity, but isn't
  *                           auto-reported to the ban pipeline (also
  *                           works combined with --comm)
- *   protect --comm NAME    protect all processes whose comm == NAME
+ *   protect --comm NAME    protect all processes matching NAME -- prefers
+ *                           an exact /proc/<pid>/exe basename match
+ *                           (untruncated), falling back to the raw,
+ *                           15-char-truncated /proc/<pid>/comm string
+ *                           when /proc/<pid>/exe isn't usable
  *   unprotect --pid N      remove protection
  *   unprotect --pid N --ns-of REFPID   remove protection from a pid as
  *                           seen inside the pid namespace that host-pid
@@ -222,6 +226,89 @@ static int read_comm(int pid, char *buf, size_t bufsz)
     return (int)r;
 }
 
+/* Defined further down (the scan command's helpers); forward-declared here
+ * so pid_of_comm() can reuse it instead of duplicating the readlink. */
+static char *proc_exe_path(int pid);
+
+/* Returns 1 if /proc/<pid>/exe's basename exactly equals `comm`, 0 if
+ * /proc/<pid>/exe is readable but definitively doesn't match, or -1 if it
+ * can't be used to decide at all (process gone, EACCES reading another
+ * user's /proc/<pid>/exe, or a deleted/replaced binary) -- the last case
+ * is the caller's cue to fall back to the /proc/<pid>/comm string
+ * heuristic instead, same as before this function existed.
+ *
+ * /proc/<pid>/exe resolves to the executable's real, untruncated
+ * basename, unlike /proc/<pid>/comm which the kernel silently truncates
+ * to TASK_COMM_LEN-1 (15) characters. That's the precision win from
+ * issue #69: two differently-named binaries whose comm happens to
+ * truncate to the same 15 characters are indistinguishable via comm
+ * alone, but not via their exe basenames -- so preferring this check
+ * avoids matching and protecting an unrelated helper process that merely
+ * shares a truncated comm with the intended target. */
+static int exe_path_matches(int pid, const char *comm)
+{
+    char *link = proc_exe_path(pid);
+    const char *base;
+    size_t n;
+
+    if (!link)
+        return -1;
+
+    /* The kernel suffixes a deleted or replaced backing file's target
+     * with " (deleted)"; that path no longer reliably identifies what's
+     * actually running (the on-disk file may be a totally different
+     * binary now, or gone outright), so don't treat it as authoritative
+     * -- fall back to the comm heuristic instead of risking a wrong
+     * match. */
+    n = strlen(link);
+    if (n > 10 && strcmp(link + n - 10, " (deleted)") == 0)
+        return -1;
+
+    base = strrchr(link, '/');
+    base = base ? base + 1 : link;
+    return strcmp(base, comm) == 0;
+}
+
+/* Single source of truth for "does pid identify as target name `comm`",
+ * shared by pid_of_comm()'s initial /proc scan and cmd_protect()'s
+ * immediately-before-the-ioctl TOCTOU re-check below -- both need the
+ * exact same exe-basename-preferred, comm-string-fallback logic, and
+ * having the re-check apply only the old plain comm compare would silently
+ * reject every pid the exe-based match found (since that match exists
+ * precisely for names whose truncated comm does *not* equal `comm`).
+ *
+ * Returns 1 on a match (and, if comm_out is non-NULL, copies pid's current
+ * /proc/<pid>/comm string into it -- the same value that's always been
+ * stored in the kernel registry's informational comm field, even when the
+ * match itself was made via exe basename). Returns 0 otherwise. */
+static int pid_identifies_as(int pid, const char *comm, char *comm_out,
+                              size_t comm_out_sz)
+{
+    int exe_match = exe_path_matches(pid, comm);
+    char buf[AC_MAX_COMM + 1];
+
+    if (exe_match == 0)
+        return 0;   /* exe readable and definitively not this target */
+
+    if (exe_match < 0) {
+        /* exe unusable (gone, permission denied on another user's
+         * process, or a deleted/replaced binary) -- fall back to the
+         * original comm-string match so this doesn't regress any case
+         * the old code used to handle. */
+        if (read_comm(pid, buf, sizeof(buf)) < 0 || strcmp(buf, comm) != 0)
+            return 0;
+    } else {
+        /* exe_match == 1: matched via exe basename; still fetch the
+         * (possibly truncated) comm string purely for display/registry
+         * purposes, same field the kernel has always stored. */
+        if (read_comm(pid, buf, sizeof(buf)) < 0)
+            buf[0] = '\0';
+    }
+    if (comm_out)
+        snprintf(comm_out, comm_out_sz, "%s", buf);
+    return 1;
+}
+
 static int pid_of_comm(const char *comm, int *pids, int max)
 {
     DIR *d;
@@ -232,7 +319,6 @@ static int pid_of_comm(const char *comm, int *pids, int max)
     if (!d)
         die("opendir /proc: %s", strerror(errno));
     while ((de = readdir(d)) != NULL) {
-        char buf[AC_MAX_COMM + 1];
         int pid;
 
         if (de->d_name[0] < '0' || de->d_name[0] > '9')
@@ -240,9 +326,15 @@ static int pid_of_comm(const char *comm, int *pids, int max)
         pid = atoi(de->d_name);
         if (pid <= 0)
             continue;
-        if (read_comm(pid, buf, sizeof(buf)) < 0)
-            continue;
-        if (strcmp(buf, comm) == 0 && n < max)
+
+        /* Top-level /proc/[N] entries are always keyed by tgid: a
+         * non-leader thread only ever shows up under
+         * /proc/[tgid]/task/[tid], never as its own top-level /proc
+         * entry. So every pid this loop collects is already the
+         * thread-group leader -- "tgid-stable" per issue #69 -- with no
+         * extra lookup needed. */
+
+        if (pid_identifies_as(pid, comm, NULL, 0) && n < max)
             pids[n++] = pid;
     }
     closedir(d);
@@ -311,14 +403,17 @@ static int cmd_protect(int argc, char **argv)
         for (i = 0; i < n; i++) {
             char cur_comm[AC_MAX_COMM + 1];
 
-            /* Re-check comm right before the ioctl, not just at scan time:
+            /* Re-check right before the ioctl, not just at scan time:
              * pids[i] may have exited and been reused by an unrelated
              * process in between, and this is our last chance to catch
-             * that before silently protecting the wrong process. */
-            if (read_comm(pids[i], cur_comm, sizeof(cur_comm)) < 0 ||
-                strcmp(cur_comm, comm) != 0) {
+             * that before silently protecting the wrong process. Uses the
+             * same exe-basename-preferred match pid_of_comm() used to find
+             * pids[i] in the first place -- re-checking via the plain comm
+             * string alone would reject every pid that was only found via
+             * its exe basename. */
+            if (!pid_identifies_as(pids[i], comm, cur_comm, sizeof(cur_comm))) {
                 fprintf(stderr,
-                        "skipping pid %d: comm no longer matches '%s' (exited/reused?)\n",
+                        "skipping pid %d: no longer matches '%s' (exited/reused?)\n",
                         pids[i], comm);
                 continue;
             }

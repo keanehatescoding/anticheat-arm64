@@ -735,6 +735,17 @@ static int ac_add_prot_task(struct task_struct *t, bool jit_allowed)
     int i, slot = -1;
     int ret = 0;
 
+    /* Kernel threads (PF_KTHREAD) have no userspace memory of their own,
+     * can't be ptrace-attached or process_vm_{read,write}v'd the way a
+     * real protected process can, and are never a legitimate --pid/--comm
+     * target or a legitimate fork-inherit child of one -- see issue #69.
+     * A userspace comm-string match can still resolve to one (many kernel
+     * threads have ordinary-looking, even collidable, comm names, e.g.
+     * "kworker/0:1"), so reject it here rather than silently occupying an
+     * AC_PROT_MAX slot the checks above can never meaningfully protect. */
+    if (t->flags & PF_KTHREAD)
+        return -EINVAL;
+
     spin_lock_irqsave(&ac_prot_lock, flags);
     for (i = 0; i < AC_PROT_MAX; i++) {
         if (ac_prots[i].task == t) {
@@ -1208,6 +1219,7 @@ static int ac_clone_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
     long child_pid = (long)regs_return_value(regs);
     struct task_struct *child;
     char pcomm[AC_MAX_COMM];
+    int add_ret;
 
     if (child_pid <= 0)
         return 0;
@@ -1232,16 +1244,21 @@ static int ac_clone_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
     }
 
     strscpy(pcomm, current->comm, sizeof(pcomm));
-    if (ac_add_prot_task(child, ac_task_jit_allowed(current)) != 0) {
-        /* AC_PROT_MAX full (-ENOSPC): the child is NOT actually in the
-         * registry, so it must not be reported as protected -- an
-         * AC_EV_FORK "protection inherited" here would be a false claim
-         * an operator could rely on. AC_EV_INFO logs at the same LOG_INFO
-         * level AC_EV_FORK would have, so this doesn't change alerting
-         * behaviour, only the message's accuracy. */
+    add_ret = ac_add_prot_task(child, ac_task_jit_allowed(current));
+    if (add_ret != 0) {
+        /* The child is NOT actually in the registry, so it must not be
+         * reported as protected -- an AC_EV_FORK "protection inherited"
+         * here would be a false claim an operator could rely on.
+         * AC_EV_INFO logs at the same LOG_INFO level AC_EV_FORK would
+         * have, so this doesn't change alerting behaviour, only the
+         * message's accuracy. Two distinct causes: AC_PROT_MAX full
+         * (-ENOSPC), or the child is a kernel thread (-EINVAL, see
+         * ac_add_prot_task()) -- report which one rather than assuming
+         * it's always the registry. */
         ac_emit(AC_EV_INFO, child->pid, child->comm,
-                "child of protected pid %d (%s) NOT protected: registry full",
-                current->pid, pcomm);
+                "child of protected pid %d (%s) NOT protected: %s",
+                current->pid, pcomm,
+                add_ret == -ENOSPC ? "registry full" : "kernel thread");
         put_task_struct(child);
         return 0;
     }
