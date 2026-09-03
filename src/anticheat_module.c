@@ -704,6 +704,12 @@ struct ac_prot_entry {
     struct mmu_notifier notifier;
     pid_t pid;                   /* display only, snapshot at register time */
     bool jit_allowed;
+    /* Set under ac_prot_lock for the duration of an in-flight
+     * mmu_notifier_unregister() call on this slot (ac_del_prot_mm(),
+     * ac_clear_protected()) -- see those functions for why a slot can't
+     * be treated as free/reusable just because .mm reads NULL or matches,
+     * until that call has actually returned. */
+    bool removing;
     char comm[AC_MAX_COMM];
 };
 
@@ -826,7 +832,7 @@ static int ac_add_prot_mm(struct mm_struct *mm, pid_t pid, const char *comm,
             spin_unlock_irqrestore(&ac_prot_lock, flags);
             return 0;                                /* already protected */
         }
-        if (!ac_prots[i].mm && slot < 0)
+        if (!ac_prots[i].mm && !ac_prots[i].removing && slot < 0)
             slot = i;
     }
     if (slot < 0) {
@@ -885,20 +891,43 @@ static int ac_add_prot_pid(pid_t pid, pid_t ref_pid, bool jit_allowed,
  * table cleanup -- so there's no separate removal step here. No-op if
  * `mm` has no registry entry (including if ac_mmu_release() already ran
  * for it concurrently, e.g. the process exited right as this was
- * called). */
+ * called).
+ *
+ * The match-and-mark below has to happen in the same ac_prot_lock critical
+ * section: finding slot i under the lock, dropping the lock, and only then
+ * marking it as being removed would leave a window where ac_add_prot_mm()
+ * can see the slot as free (once ac_mmu_release() clears it from a
+ * concurrent exit_mmap()) and reinitialise ac_prots[i].notifier for an
+ * unrelated mm before the mmu_notifier_unregister() call below runs --
+ * which would then unregister a notifier that no longer belongs to `mm`
+ * at all, corrupting whatever mm it now belongs to. Marking .removing
+ * under the same lock that finds the match closes that window: it stops
+ * ac_add_prot_mm() from reusing the slot (see its free-slot scan) for as
+ * long as this call is in flight, regardless of whether ac_mmu_release()
+ * also fires concurrently and clears .mm out from under it. */
 static void ac_del_prot_mm(struct mm_struct *mm)
 {
     unsigned long flags;
     int i;
+    bool found = false;
 
     spin_lock_irqsave(&ac_prot_lock, flags);
     for (i = 0; i < AC_PROT_MAX; i++) {
-        if (ac_prots[i].mm == mm)
+        if (ac_prots[i].mm == mm && !ac_prots[i].removing) {
+            ac_prots[i].removing = true;
+            found = true;
             break;
+        }
     }
     spin_unlock_irqrestore(&ac_prot_lock, flags);
-    if (i < AC_PROT_MAX)
-        mmu_notifier_unregister(&ac_prots[i].notifier, mm);
+    if (!found)
+        return;
+
+    mmu_notifier_unregister(&ac_prots[i].notifier, mm);
+
+    spin_lock_irqsave(&ac_prot_lock, flags);
+    ac_prots[i].removing = false;
+    spin_unlock_irqrestore(&ac_prot_lock, flags);
 }
 
 /* Fork inheritance already extends *protection* itself to children (see
@@ -1398,7 +1427,13 @@ static int ac_exec_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
     if (current->mm && ac_is_protected_mm(current->mm)) {
         d->old_mm = current->mm;
         mmget(d->old_mm);
-        ac_emit(AC_EV_EXEC, current->pid, current->comm,
+        /* AC_EV_INFO, not AC_EV_EXEC -- this fires on every attempt,
+         * before the outcome (success/failure/rekey result) is known.
+         * ac_exec_ret()/ac_prot_add_worker() emit the one authoritative
+         * AC_EV_EXEC for this exec once that outcome actually lands, so
+         * emitting it here too would double-count every successful
+         * re-exec of a protected process. */
+        ac_emit(AC_EV_INFO, current->pid, current->comm,
                 "execve() invoked (path is a user pointer, not resolved)");
     }
     return 0;
@@ -2175,11 +2210,24 @@ static struct miscdevice ac_misc = {
 /* Called from ac_exit() after ac_unregister_kprobes() and flush_workqueue()
  * (see there for why the flush must come first): no new clone/exec/ioctl
  * path can add or rekey an entry once the kprobes are gone and the
- * workqueue is drained, so this only has to unwind what's already there.
- * mmu_notifier_unregister() sleeps -- module unload is process context, so
- * that's fine -- and invokes ac_mmu_release() synchronously, which is what
- * actually clears each slot and decrements ac_prot_count; there's nothing
- * left for this function to touch directly. */
+ * workqueue is drained (misc_deregister() already ran too, and .owner on
+ * ac_fops means rmmod itself can't happen while any fd is open, so no
+ * ioctl can be in flight either), so this only has to unwind what's
+ * already there. mmu_notifier_unregister() sleeps -- module unload is
+ * process context, so that's fine -- and invokes ac_mmu_release()
+ * synchronously, which is what actually clears each slot and decrements
+ * ac_prot_count; there's nothing left for this function to touch
+ * directly.
+ *
+ * Marks each slot .removing under the same lock that reads it, same
+ * reasoning as ac_del_prot_mm(): although nothing here can reuse a slot
+ * out from under this loop (no producer of new entries is still reachable
+ * at this point), a real process backing one of these mms can still exit
+ * for real at the same moment, racing this function's mmu_notifier_
+ * unregister() call against that mm's own exit_mmap(); marking .removing
+ * costs nothing and keeps the invariant -- a slot only ever has one
+ * in-flight unregister -- true everywhere, not just here by virtue of
+ * unload ordering. */
 static void ac_clear_protected(void)
 {
     int i;
@@ -2189,12 +2237,21 @@ static void ac_clear_protected(void)
         struct mm_struct *mm = NULL;
 
         spin_lock_irqsave(&ac_prot_lock, flags);
-        if (ac_prots[i].mm && ac_prots[i].mm != AC_PROT_RESERVED)
+        if (ac_prots[i].mm && ac_prots[i].mm != AC_PROT_RESERVED &&
+            !ac_prots[i].removing) {
             mm = ac_prots[i].mm;
+            ac_prots[i].removing = true;
+        }
         spin_unlock_irqrestore(&ac_prot_lock, flags);
 
-        if (mm)
-            mmu_notifier_unregister(&ac_prots[i].notifier, mm);
+        if (!mm)
+            continue;
+
+        mmu_notifier_unregister(&ac_prots[i].notifier, mm);
+
+        spin_lock_irqsave(&ac_prot_lock, flags);
+        ac_prots[i].removing = false;
+        spin_unlock_irqrestore(&ac_prot_lock, flags);
     }
 }
 
