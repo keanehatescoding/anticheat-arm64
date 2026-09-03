@@ -37,9 +37,12 @@ set) -- the matching daemon-side option is AC_REPORT_URL=unix://PATH (see
 ac_report() in src/anticheat_daemon.c). This removes the plaintext-
 network-credential exposure noted above for a daemon and server
 co-located on the same host: filesystem permissions on the socket become
-the trust boundary instead of network reachability. The socket is created
-0600 (owner-only) to match Store's own DB-file permissions -- widen that
-if the daemon runs as a different user than this server.
+the trust boundary instead of network reachability. The socket is
+created 0600 (owner-only) to match Store's own DB-file permissions, and
+that mode is reapplied on every start -- a daemon connecting to it must
+run as this server's own user (or root). There's no durable way to widen
+that for a different-user daemon: any group/ACL change made after the
+fact is undone the next time this process (re)starts and rebinds.
 """
 import argparse
 import hmac
@@ -52,6 +55,7 @@ import signal
 import socket
 import socketserver
 import sqlite3
+import stat
 import sys
 import threading
 import time
@@ -126,11 +130,39 @@ class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServe
         # TIME_WAIT, which allow_reuse_address already handles). Without
         # this, every restart after the very first one would fail with
         # "address already in use" against the stale socket file the
-        # previous run left behind.
+        # previous run left behind. But blindly unlinking whatever is
+        # there would (a) delete a regular file someone accidentally
+        # pointed --unix-socket at, and (b) steal the path out from under
+        # a still-running previous instance (e.g. a second `ac_server.py
+        # --unix-socket` invocation against the same path), silently
+        # diverting new connections to this process while the old one
+        # keeps running unaware its socket file is gone. Guard both: only
+        # ever remove a path that's actually a socket, and only after
+        # confirming nothing is listening on it.
         try:
-            os.unlink(self.server_address)
+            st = os.lstat(self.server_address)
         except FileNotFoundError:
             pass
+        else:
+            if not stat.S_ISSOCK(st.st_mode):
+                raise RuntimeError(
+                    "ac_server: --unix-socket path %r exists and is not a "
+                    "socket -- refusing to remove it" % (self.server_address,)
+                )
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                probe.connect(self.server_address)
+            except OSError:
+                pass  # nothing listening -- a stale socket file, safe to reclaim
+            else:
+                raise RuntimeError(
+                    "ac_server: --unix-socket path %r already has an "
+                    "active listener -- refusing to steal it"
+                    % (self.server_address,)
+                )
+            finally:
+                probe.close()
+            os.unlink(self.server_address)
         # Deliberately socketserver.TCPServer.server_bind(), not
         # http.server.HTTPServer.server_bind(): the latter does
         # `host, port = self.server_address[:2]` afterward, assuming a TCP
@@ -150,6 +182,11 @@ class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServe
         # / unix-socket note), not whatever the process umask happens to
         # be at bind time.
         os.chmod(self.server_address, 0o600)
+        # Recorded so a later cleanup unlink (see main()'s shutdown path)
+        # can confirm the path still names *this* socket before removing
+        # it -- not, say, a replacement another process created at the
+        # same path after this one closed it.
+        self._bound_stat = os.stat(self.server_address)
 
     def get_request(self):
         # accept()'s peer address for AF_UNIX is '' (the client end is
@@ -744,6 +781,21 @@ def main():
         )
         sys.exit(1)
 
+    if args.trust_proxy and args.unix_socket:
+        # --trust-proxy makes the handler take X-Forwarded-For at face
+        # value for rate limiting and source_addr. Over the unix-socket
+        # transport every peer is already collapsed to one fixed
+        # placeholder address (see ThreadingUnixHTTPServer.get_request),
+        # so honoring a client-supplied header here wouldn't disambiguate
+        # real peers -- it would let any client on the socket forge an
+        # arbitrary source_addr and dodge the shared rate-limit bucket.
+        sys.stderr.write(
+            "ac_server: --trust-proxy has no meaningful effect over "
+            "--unix-socket and only lets a client forge its source_addr "
+            "-- drop one of the two flags\n"
+        )
+        sys.exit(1)
+
     store = Store(args.db, max_reports_per_client=args.max_reports_per_client)
     rate_limiter = RateLimiter(args.rate_limit, args.rate_window)
     handler = make_handler(
@@ -812,11 +864,21 @@ def main():
             # Tidy up the socket file on a clean exit -- not required for
             # correctness (server_bind() above unlinks a stale one on the
             # next start regardless), just avoids leaving a dead socket
-            # file lying around after a normal shutdown.
+            # file lying around after a normal shutdown. Only remove it if
+            # it's still the same socket this process bound: if another
+            # process has since reclaimed the path (e.g. a fresh instance
+            # started while this one was draining in-flight requests),
+            # unlinking here would pull the path out from under it.
             try:
-                os.unlink(args.unix_socket)
+                cur_stat = os.stat(args.unix_socket)
             except FileNotFoundError:
                 pass
+            else:
+                if (cur_stat.st_dev, cur_stat.st_ino) == (
+                    httpd._bound_stat.st_dev,
+                    httpd._bound_stat.st_ino,
+                ):
+                    os.unlink(args.unix_socket)
 
 
 if __name__ == "__main__":

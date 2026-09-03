@@ -256,19 +256,30 @@ traverse in the first place. This changes what the relevant trust
 boundary *is*, not just narrows it — for the Unix-socket transport it's
 filesystem permissions on the socket path, not network reachability.
 `ac_server.py` creates the socket file `0600` (owner-only, mirroring the
-report DB's own permissions — see `Store.__init__`) and unlinks a stale
-one from a previous run before binding, so anyone able to open that
-socket has already cleared the same bar as reading the SQLite DB
-directly; running the daemon and server as different users who need to
-share the socket requires deliberately widening that permission (e.g. a
-shared group), which is on the operator, the same way a shared
-`AC_BASELINE_DIR` already is. This is additive, not a replacement: plain
-HTTP-over-TCP keeps working unchanged for existing LAN/reverse-proxy
-deployments, and per-source-IP rate limiting doesn't apply in any
-meaningful way to the Unix-socket transport (every connection over it is
-attributed to a single fixed placeholder identity, since there's no
-per-peer network address to key on) — acceptable because reaching the
-socket at all is already permission-gated, unlike an open TCP port.
+report DB's own permissions — see `Store.__init__`) and reapplies that
+mode on every start, so anyone able to open that socket has already
+cleared the same bar as reading the SQLite DB directly. That mode isn't
+durably widenable: a daemon running as a different user than the server
+cannot be accommodated by loosening the socket's group/ACL after the
+fact, since the next (re)start resets it to `0600` again -- the daemon
+and server must run as the same user (or the daemon as root). `0600` on
+the socket file is also not the whole boundary: it only gates *opening*
+the bound socket, not deleting or replacing the path before the server
+binds to it, so the containing directory (e.g. `/run/anticheat/`) must
+itself be writable only by that same user, not by anyone else who might
+squat the path first. Before binding, `ac_server.py` also refuses to
+touch a stale path that turns out not to be a socket, and refuses to
+steal a path something is still actively listening on, rather than
+unconditionally unlinking whatever it finds there. This is additive,
+not a replacement: plain HTTP-over-TCP keeps working unchanged for
+existing LAN/reverse-proxy deployments, and per-source-IP rate limiting
+doesn't apply in any meaningful way to the Unix-socket transport (every
+connection over it is attributed to a single fixed placeholder identity,
+since there's no per-peer network address to key on, and `--trust-proxy`
+is rejected outright alongside `--unix-socket` rather than letting a
+client forge that identity via `X-Forwarded-For`) — acceptable because
+reaching the socket at all is already permission-gated, unlike an open
+TCP port.
 HTTPS with a pinned certificate — the other half of #67 — remains a
 documented follow-up, not attempted here; it's the right answer for a
 genuinely remote, over-the-network deployment, which the Unix-socket

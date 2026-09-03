@@ -902,6 +902,25 @@ else
     else
         fail "expected source_addr \"unix\" (out: $OUT)"
     fi
+
+    # A second instance must not be able to steal the path out from under
+    # the first, still-running one -- server_bind() probes for an active
+    # listener before unlinking anything.
+    if AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
+        python3 ./ac_server.py --unix-socket "$UNIX_SOCK" \
+        --db "$UNIX_TESTDIR/steal.db" \
+        >"$UNIX_TESTDIR/steal.log" 2>&1; then
+        fail "a second --unix-socket instance should not steal an active listener's path"
+    else
+        pass "a second --unix-socket instance refuses to steal an active listener's path"
+    fi
+    # ...and the first instance must still be alive and serving after that.
+    if curl -s --unix-socket "$UNIX_SOCK" http://localhost/banned/x \
+        -H "Authorization: Bearer $ADMIN_KEY" 2>/dev/null | grep -q '"banned"'; then
+        pass "original --unix-socket instance still serving after a steal attempt"
+    else
+        fail "original --unix-socket instance stopped responding after a steal attempt"
+    fi
 fi
 kill "$UNIX_SERVER_PID" 2>/dev/null
 wait "$UNIX_SERVER_PID" 2>/dev/null
@@ -913,7 +932,38 @@ if [ -e "$UNIX_SOCK" ]; then
 else
     pass "unix socket file removed on clean shutdown"
 fi
+
+# A regular file sitting at the --unix-socket path (e.g. a misconfigured
+# PATH) must never be silently unlinked and replaced.
+: >"$UNIX_SOCK"
+if AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
+    python3 ./ac_server.py --unix-socket "$UNIX_SOCK" \
+    --db "$UNIX_TESTDIR/regfile.db" \
+    >"$UNIX_TESTDIR/regfile.log" 2>&1; then
+    fail "server should refuse to start with a regular file at --unix-socket's path"
+else
+    pass "server refuses to start with a regular file at --unix-socket's path"
+fi
+if [ -e "$UNIX_SOCK" ] && [ ! -L "$UNIX_SOCK" ]; then
+    pass "regular file at --unix-socket's path was left untouched"
+else
+    fail "regular file at --unix-socket's path was removed"
+fi
+
 rm -rf "$UNIX_TESTDIR"
+
+# --trust-proxy over --unix-socket would let any client on the socket
+# forge its own source_addr via X-Forwarded-For -- rejected at startup.
+TPUS_TESTDIR="$(mktemp -d /tmp/ac_server_tpus_test.XXXXXXXX)"
+if AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
+    python3 ./ac_server.py --unix-socket "$TPUS_TESTDIR/ac_server.sock" \
+    --db "$TPUS_TESTDIR/ac_server.db" --trust-proxy \
+    >"$TPUS_TESTDIR/server.log" 2>&1; then
+    fail "server should refuse to start with --trust-proxy and --unix-socket together"
+else
+    pass "server refuses to start with --trust-proxy and --unix-socket together"
+fi
+rm -rf "$TPUS_TESTDIR"
 
 # Startup-failure paths: no server needed, just exit code + stderr.
 if AC_SERVER_REPORT_KEY='' AC_SERVER_ADMIN_KEY='' python3 ./ac_server.py \

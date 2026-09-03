@@ -548,12 +548,22 @@ AC_SERVER_REPORT_KEY=<report-key> AC_SERVER_ADMIN_KEY=<admin-key> \
 
 The socket is created `0600` (owner-only, same reasoning as the DB
 file's own permissions), and a stale socket file left behind by a
-previous run is unlinked before binding. `--rate-limit`/`--rate-window`
-still apply to every request, but per-source-IP granularity doesn't mean
-much for a local socket — every connection over it shares one fixed rate
-bucket and is recorded with `source_addr: "unix"` instead of a real
-peer address, since there's no per-peer network address to key on;
-`--trust-proxy` (below) is a TCP-only concept and has no effect here.
+previous run is unlinked before binding — "stale" is checked, not
+assumed: binding refuses to touch the path at all if something's still
+listening on it, or if it exists and isn't a socket. That said, `0600`
+on the socket file itself only stops someone from opening it — it can't
+stop someone who can already write to the socket's *parent directory*
+from deleting or replacing the path out from under the server before it
+binds. Put the socket in a directory only the server's own user (or
+root) can write to, e.g. the `/run/anticheat/` shown above with the
+service's own user as owner. `--rate-limit`/`--rate-window` still apply
+to every request, but per-source-IP granularity doesn't mean much for a
+local socket — every connection over it shares one fixed rate bucket and
+is recorded with `source_addr: "unix"` instead of a real peer address,
+since there's no per-peer network address to key on; `--trust-proxy`
+(below) is a TCP-only concept and is rejected outright alongside
+`--unix-socket` — trusting a client-supplied header here would just let
+that client forge its own `source_addr`.
 
 **Reports never auto-ban.** A report is a client-side daemon's unverified
 claim about itself, running on the exact machine a cheat author controls —
