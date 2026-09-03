@@ -156,6 +156,7 @@ static const char *ev_type_str(unsigned int t)
     case AC_EV_PTRACE:      return "PTRACE-DENIED";
     case AC_EV_PROCESS_VM:  return "PROCESS-VM-DENIED";
     case AC_EV_SYSCALL_HOOK:return "SYSCALL-HOOK";
+    case AC_EV_SYSCALL_REDIRECT: return "SYSCALL-REDIRECT";
     case AC_EV_RWX:         return "RWX";
     case AC_EV_ANON_EXEC:   return "ANON-EXEC";
     case AC_EV_INFO:        return "INFO";
@@ -1494,10 +1495,25 @@ static int cmd_syscalls(void)
     printf("  entries examined : %u\n", c.nr_syscalls);
     printf("  non-NULL entries : %u\n", c.total);
     printf("  hooked           : %u\n", c.hooked);
-    if (c.ok)
+    if (c.baseline_ready) {
+        printf("  boot baseline    : %s\n", c.baseline_sha256);
+        printf("  current checksum : %s%s\n", c.current_sha256,
+               c.checksum_mismatch ? " (MISMATCH)" : "");
+        printf("  redirected       : %u (in-text handler swap since boot)\n",
+               c.redirected);
+    } else {
+        printf("  boot baseline    : unavailable (syscall table not located at load)\n");
+    }
+    if (c.ok && c.redirected == 0 && !c.checksum_mismatch)
         printf("  result           : OK — no hooks detected\n");
     else {
-        printf("  result           : COMPROMISED — syscall hooks present!\n");
+        if (!c.ok)
+            printf("  result           : COMPROMISED — syscall hooks present!\n");
+        if (c.redirected)
+            printf("  result           : COMPROMISED — in-text syscall redirect(s) present!\n");
+        if (c.checksum_mismatch && c.ok && c.redirected == 0)
+            printf("  result           : COMPROMISED — syscall checksum mismatch"
+                   " (handler churn not caught by per-slot checks)!\n");
         return 2;
     }
     ac_close();
@@ -1816,16 +1832,37 @@ static void sig_handler(int sig)
 
 static int check_syscalls_periodic(void)
 {
+    /* Rising-edge state for a checksum-only compromise -- see below. */
+    static int checksum_only_reported;
     struct ac_syscall_check c;
 
     memset(&c, 0, sizeof(c));
     if (ioctl(dev_fd, AC_IOCTL_CHECK_SYSCALLS, &c) < 0)
         return -1;
-    /* Don't log here: the kernel only emits AC_EV_SYSCALL_HOOK into the
-     * event ring on a rising edge (new hook, not a still-hooked slot), and
-     * the main loop's ring drain already logs it at LOG_CRIT. Logging here
-     * too would re-report the same persistent hook at CRIT on every poll
-     * (see #52). */
+    /* Don't log hooked/redirected here: the kernel only emits
+     * AC_EV_SYSCALL_HOOK / AC_EV_SYSCALL_REDIRECT into the event ring on
+     * a rising edge (a new hook or in-text handler swap, not one already
+     * reported), and the main loop's ring drain already logs both at
+     * LOG_CRIT. Logging them here too would re-report the same
+     * persistent hook/redirect at CRIT on every poll (see #52).
+     *
+     * checksum_mismatch has no matching kernel event, though: it exists
+     * specifically to catch handler churn the per-slot walk (and so
+     * those two events) didn't individually flag -- see anticheat.h's
+     * comment on the field. Without a report here, that case is
+     * detected by the kernel every 5s but never logged or acted on by
+     * the daemon at all. Track our own rising edge so it's reported
+     * once per transition, same rationale as #52.
+     */
+    if (c.checksum_mismatch && !c.hooked && !c.redirected) {
+        if (!checksum_only_reported)
+            logmsg(LOG_CRIT, "syscall table checksum mismatch: boot=%s "
+                   "current=%s (handler churn not individually flagged)",
+                   c.baseline_sha256, c.current_sha256);
+        checksum_only_reported = 1;
+    } else {
+        checksum_only_reported = 0;
+    }
     return c.hooked;
 }
 
@@ -3452,7 +3489,8 @@ static int cmd_start(int argc, char **argv)
                     if (e->type == AC_EV_PTRACE || e->type == AC_EV_PROCESS_VM)
                         logmsg(LOG_ALERT, "%s pid=%d comm=%s %s",
                                ev_type_str(e->type), e->pid, e->comm, e->data);
-                    else if (e->type == AC_EV_SYSCALL_HOOK)
+                    else if (e->type == AC_EV_SYSCALL_HOOK ||
+                             e->type == AC_EV_SYSCALL_REDIRECT)
                         logmsg(LOG_CRIT, "%s %s", ev_type_str(e->type), e->data);
                     else
                         logmsg(LOG_INFO, "%s pid=%d comm=%s %s",

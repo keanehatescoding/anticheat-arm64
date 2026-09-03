@@ -84,8 +84,25 @@ expect_out "baseline matches"          "matches baseline" bash -c "$SELFSCAN --h
 echo "== syscall integrity (clean + compromised) =="
 expect_rc  "syscalls clean"           0 ./anticheat syscalls
 expect_out "syscalls OK message"       "no hooks detected" ./anticheat syscalls
+expect_out "syscalls: boot baseline shown" "boot baseline" ./anticheat syscalls
 expect_rc  "syscalls compromised -> rc 2" 2 env AC_MOCK_HOOKED=1 ./anticheat syscalls
 expect_out "syscalls alert"            "COMPROMISED"    env AC_MOCK_HOOKED=1 ./anticheat syscalls
+
+echo "== syscall integrity: in-text redirect baseline (#63) =="
+expect_rc  "syscalls redirected -> rc 2" 2 env AC_MOCK_REDIRECT=1 ./anticheat syscalls
+expect_out "syscalls redirect alert"   "COMPROMISED"    env AC_MOCK_REDIRECT=1 ./anticheat syscalls
+expect_out "syscalls redirect count"   "redirected       : 1" env AC_MOCK_REDIRECT=1 ./anticheat syscalls
+expect_out "syscalls checksum mismatch" "MISMATCH"      env AC_MOCK_REDIRECT=1 ./anticheat syscalls
+
+echo "== syscall integrity: checksum-only mismatch (#63 review fix) =="
+# Handler churn that flips the whole-table checksum without tripping any
+# per-slot hook/redirect counter (e.g. a slot going non-zero -> 0) must
+# still be reported as COMPROMISED with a non-zero exit code, not silently
+# swallowed by a verdict that only looks at out->hooked/out->redirected.
+expect_rc  "syscalls checksum-only -> rc 2" 2 env AC_MOCK_CHECKSUM_ONLY=1 ./anticheat syscalls
+expect_out "syscalls checksum-only alert" "COMPROMISED"  env AC_MOCK_CHECKSUM_ONLY=1 ./anticheat syscalls
+expect_out "syscalls checksum-only mismatch shown" "MISMATCH" env AC_MOCK_CHECKSUM_ONLY=1 ./anticheat syscalls
+expect_out "syscalls checksum-only hooked/redirected both zero" "hooked           : 0" env AC_MOCK_CHECKSUM_ONLY=1 ./anticheat syscalls
 
 echo "== hidden module detection =="
 expect_rc  "modules -> rc 2 (hidden)" 2 ./anticheat modules
@@ -181,6 +198,32 @@ if [ "$hooked_crit_count" -eq 1 ]; then
     pass "start: syscall-hook alert logged exactly once"
 else
     fail "start: expected exactly 1 SYSCALL-HOOK log line, got $hooked_crit_count"
+fi
+
+# Same rising-edge dedup proof as above, for the boot-baseline in-text
+# redirect check (AC_EV_SYSCALL_REDIRECT, #63) -- distinct event type from
+# SYSCALL-HOOK, so this also proves the two aren't conflated.
+redirect_out=$(timeout -k 2 --preserve-status 7 \
+    env AC_MOCK_REDIRECT=1 ./anticheat start --foreground 2>&1)
+redirect_crit_count=$(printf '%s' "$redirect_out" | grep -c "SYSCALL-REDIRECT")
+if [ "$redirect_crit_count" -eq 1 ]; then
+    pass "start: syscall-redirect alert logged exactly once"
+else
+    fail "start: expected exactly 1 SYSCALL-REDIRECT log line, got $redirect_crit_count"
+fi
+
+# checksum_mismatch has no matching kernel event (see #63 review fix), so
+# unlike the two cases above this dedup is entirely daemon-side, in
+# check_syscalls_periodic()'s own rising-edge state -- a distinct code
+# path from the ring-drain dedup exercised above, so it needs its own
+# proof of both "fires at all" and "stays deduplicated across polls".
+checksum_out=$(timeout -k 2 --preserve-status 7 \
+    env AC_MOCK_CHECKSUM_ONLY=1 ./anticheat start --foreground 2>&1)
+checksum_crit_count=$(printf '%s' "$checksum_out" | grep -c "checksum mismatch")
+if [ "$checksum_crit_count" -eq 1 ]; then
+    pass "start: checksum-only mismatch alert logged exactly once"
+else
+    fail "start: expected exactly 1 checksum mismatch log line, got $checksum_crit_count"
 fi
 
 echo

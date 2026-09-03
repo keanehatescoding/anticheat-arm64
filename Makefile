@@ -40,7 +40,7 @@ LLVM := 1
 endif
 
 obj-m += anticheat.o
-anticheat-objs := src/anticheat_module.o
+anticheat-objs := src/anticheat_module.o src/sha256.o
 
 all: module daemon
 

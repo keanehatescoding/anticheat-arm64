@@ -145,11 +145,27 @@ jobs:
         run: |
           # First pass compiles the module; the final modpost link fails only
           # because the prepared tree has no Module.symvers.  Synthesize one
-          # from the object's undefined symbols so the link (a compile smoke
+          # from the objects' undefined symbols so the link (a compile smoke
           # test) succeeds.  Real load-time symbol resolution is validated on
           # a live kernel (see diag.sh).
+          #
+          # Read the object list from the Makefile's own anticheat-objs
+          # rather than hardcoding it here a second time -- src/sha256.o
+          # (added for #63) calling memcpy() is exactly the kind of
+          # newly-linked-in undefined symbol a hardcoded, stale list here
+          # would silently drop from ksymvers and fail modpost on.
+          #
+          # nm printing more than one file at once inserts a "path:"
+          # header line per file into the stream; NF==2 keeps only real
+          # "U symbolname" lines (2 whitespace-separated fields) and
+          # drops those headers (1 field) and the blank separator lines
+          # nm puts around them, which the plain `{print $2}` used when
+          # there was only ever one object here happily let through as a
+          # symbol-less entry -- and modpost's dump-file parser rejects
+          # that outright with "parse error in symbol dump file".
           make KDIR="$PWD/linux-6.12" module 2>&1 | tail -3 || true
-          nm -u src/anticheat_module.o | awk '{print $2}' | sort -u | \
+          objs="$(grep '^anticheat-objs' Makefile | cut -d= -f2)"
+          nm -u $objs | awk 'NF==2 {print $2}' | sort -u | \
             awk '{printf "0x00000000\t%s\tvmlinux\tEXPORT_SYMBOL\t\n", $1}' \
             > "$PWD/ksymvers"
           make KDIR="$PWD/linux-6.12" KBUILD_EXTRA_SYMBOLS="$PWD/ksymvers" module

@@ -5,7 +5,10 @@
  * Defensive security instrumentation only.  Provides:
  *
  *  1. Syscall-table discovery + integrity checking (detects syscall hooks
- *     pointing outside the core kernel text, i.e. classic rootkits).
+ *     pointing outside the core kernel text, i.e. classic rootkits), plus a
+ *     boot-time checksum of every handler address that also catches an
+ *     in-text redirect (e.g. sys_read -> sys_write), which the range check
+ *     alone can't see (see #63).
  *  2. Kernel module enumeration (userspace cross-checks /proc/modules to
  *     detect modules hidden from procfs).
  *  3. Protected process registry; protection is inherited by forked children.
@@ -63,6 +66,7 @@
 #include <asm/unistd.h>
 
 #include "anticheat.h"
+#include "sha256.h"
 
 #ifndef __NR_syscalls
 # define __NR_syscalls 512
@@ -332,10 +336,87 @@ static unsigned long ac_find_syscall_table(void)
  * (the daemon polls this every 5s); see #52. */
 static unsigned long ac_hooked_bitmap[BITS_TO_LONGS(__NR_syscalls)];
 
+/* ------------------------------------------------------------------ */
+/* boot-time syscall-handler-address baseline (#63)                    */
+/*                                                                      */
+/* The range check above (ac_entry_bad() / ac_hooked_bitmap) only ever */
+/* asks "does this entry still point inside core kernel text" -- by    */
+/* design it can't see a hook that redirects one in-text handler to    */
+/* another (e.g. sys_read -> sys_write), which is explicitly out of    */
+/* scope per THREAT_MODEL.md's "Within-core-kernel-text redirects"     */
+/* note. This snapshot closes that specific gap: capture every         */
+/* handler address once, at module load, checksum it, and on every     */
+/* later check compare both the whole-table checksum and each          */
+/* individual slot against that baseline. A slot whose address changed */
+/* while still passing the core-text check is exactly the redirect     */
+/* case the range check can't catch on its own.                        */
+/* ------------------------------------------------------------------ */
+static unsigned long ac_syscall_baseline[__NR_syscalls];
+static char ac_syscall_baseline_hex[65];
+static bool ac_syscall_baseline_ready;
+/* Per-slot rising-edge state for AC_EV_SYSCALL_REDIRECT, same rationale
+ * as ac_hooked_bitmap above (avoid re-emitting every 5s poll). */
+static unsigned long ac_redirect_bitmap[BITS_TO_LONGS(__NR_syscalls)];
+/* Set for slot i once ac_syscall_baseline[i] holds a value ac_kread()
+ * actually returned for it (at boot, or backfilled below) -- including a
+ * successful read of 0, which is why this is a separate bitmap rather
+ * than just testing ac_syscall_baseline[i] for truthiness: a failed
+ * read is also stored as 0, and the two must not be conflated (see
+ * ac_check_syscalls()'s "read_ok" handling below). */
+static unsigned long ac_baseline_captured[BITS_TO_LONGS(__NR_syscalls)];
+/* Serializes ac_check_syscalls() below: AC_IOCTL_CHECK_SYSCALLS is called
+ * with no per-fd state, so the periodic monitor-loop caller and an
+ * on-demand `anticheat syscalls` caller (or several of the latter) can
+ * run concurrently. Without this, two callers racing a slot whose boot
+ * capture failed could each pass the "not yet captured" check and
+ * backfill ac_syscall_baseline[i] from a different live read -- if an
+ * attacker redirects that slot between the two reads, the redirected
+ * address can win the race and become the trusted baseline. The lock
+ * covers the whole read-backfill-hash-bitmap sequence per call, not just
+ * the backfill, since ac_syscall_baseline_hex is rewritten in place and
+ * an unlocked reader (out->baseline_sha256's strscpy()) could otherwise
+ * observe it mid-update.
+ */
+static DEFINE_MUTEX(ac_syscall_check_lock);
+
+/* Called once from ac_init(), after ac_syscall_table is located. A read
+ * failure on any individual slot leaves that slot uncaptured (0, bit
+ * clear in ac_baseline_captured) rather than aborting the whole
+ * baseline -- ac_check_syscalls() below backfills such a slot from the
+ * first later successful read, so a boot-time hiccup on one slot only
+ * narrows (doesn't defeat) redirect detection for it. */
+static void ac_capture_syscall_baseline(void)
+{
+    unsigned long base = ac_syscall_table;
+    unsigned int i;
+
+    if (!base)
+        return;
+
+    for (i = 0; i < __NR_syscalls; i++) {
+        unsigned long e = 0;
+
+        if (!ac_kread(&e, (void *)(base + i * sizeof(e)), sizeof(e)))
+            __set_bit(i, ac_baseline_captured);   /* a successful read of
+                                                     * 0 still counts */
+        else
+            e = 0;
+        ac_syscall_baseline[i] = e;
+    }
+    ac_sha256_hex(ac_syscall_baseline, sizeof(ac_syscall_baseline),
+                  ac_syscall_baseline_hex);
+    ac_syscall_baseline_ready = true;
+    if (ac_verbose)
+        pr_info("syscall handler baseline captured: sha256=%s\n",
+                ac_syscall_baseline_hex);
+}
+
 static int ac_check_syscalls(struct ac_syscall_check *out)
 {
     unsigned long base = ac_syscall_table;
     unsigned int i;
+    ac_sha256_ctx hash;
+    uint8_t digest[32];
 
     memset(out, 0, sizeof(*out));
     out->table_addr = base;
@@ -343,12 +424,76 @@ static int ac_check_syscalls(struct ac_syscall_check *out)
         return -ENODEV;   /* table not located at load time; not an I/O fault */
 
     out->nr_syscalls = __NR_syscalls;
+    out->baseline_ready = ac_syscall_baseline_ready;
+
+    mutex_lock(&ac_syscall_check_lock);
+    ac_sha256_init(&hash);
     for (i = 0; i < __NR_syscalls; i++) {
         unsigned long e = 0;
-        bool bad;
+        bool bad, read_ok, have_baseline;
 
-        if (ac_kread(&e, (void *)(base + i * sizeof(e)), sizeof(e)))
+        read_ok = !ac_kread(&e, (void *)(base + i * sizeof(e)), sizeof(e));
+        have_baseline = ac_syscall_baseline_ready &&
+                        test_bit(i, ac_baseline_captured);
+
+        if (!read_ok) {
+            /* Nothing was actually observed this round. 0 is itself a
+             * value a slot could legitimately hold (see
+             * ac_baseline_captured's comment), so hashing a fabricated 0
+             * here would let a transient ac_kread() failure masquerade as
+             * a real handler change and manufacture a false checksum-only
+             * compromise report. Fall back to whatever's already trusted
+             * for this slot instead, so an unobserved slot's contribution
+             * to the whole-table hash reads as "unchanged". */
+            e = have_baseline ? ac_syscall_baseline[i] : 0;
+        }
+        ac_sha256_update(&hash, &e, sizeof(e));
+
+        if (!read_ok) {
+            /* Leave ac_redirect_bitmap/ac_hooked_bitmap and the backfill
+             * state exactly as they were -- clearing either here would
+             * both hide a condition that's still there and, on the next
+             * successful read of an unchanged-but-still-flagged slot,
+             * re-trigger the event via the rising-edge checks below,
+             * defeating the once-per-transition dedup. */
             continue;
+        }
+
+        if (ac_syscall_baseline_ready) {
+            if (!have_baseline) {
+                /* Boot-time capture never got a reading for this slot
+                 * (ac_table_plausible() already validated hundreds of
+                 * other entries, so this is a narrow per-slot hiccup, not
+                 * a misidentified table). Adopt this first later reading
+                 * -- including a legitimate 0 -- as the baseline now
+                 * instead of leaving the slot permanently exempt from
+                 * redirect detection; this only narrows, same as the
+                 * already-accepted pre-snapshot-redirect gap in
+                 * THREAT_MODEL.md, the window in which a redirect
+                 * installed before the backfill would be captured as
+                 * "normal". */
+                ac_syscall_baseline[i] = e;
+                __set_bit(i, ac_baseline_captured);
+                ac_sha256_hex(ac_syscall_baseline, sizeof(ac_syscall_baseline),
+                              ac_syscall_baseline_hex);
+                clear_bit(i, ac_redirect_bitmap);
+            } else if (e != ac_syscall_baseline[i]) {
+                if (!ac_entry_bad(e)) {
+                    /* still inside core text but a different handler than
+                     * what was there at boot -- the in-text-redirect case. */
+                    out->redirected++;
+                    if (!test_and_set_bit(i, ac_redirect_bitmap))
+                        ac_emit(AC_EV_SYSCALL_REDIRECT, 0, "?",
+                                "syscall[%u] handler changed 0x%lx -> 0x%lx (still core text)",
+                                i, ac_syscall_baseline[i], e);
+                } else {
+                    clear_bit(i, ac_redirect_bitmap);
+                }
+            } else {
+                clear_bit(i, ac_redirect_bitmap);
+            }
+        }
+
         if (!e)
             continue;
         out->total++;
@@ -363,6 +508,16 @@ static int ac_check_syscalls(struct ac_syscall_check *out)
             clear_bit(i, ac_hooked_bitmap);
         }
     }
+    if (ac_syscall_baseline_ready)
+        strscpy(out->baseline_sha256, ac_syscall_baseline_hex,
+                sizeof(out->baseline_sha256));   /* after the loop: reflects
+                                                    * any backfill above */
+    mutex_unlock(&ac_syscall_check_lock);
+    ac_sha256_final(&hash, digest);
+    ac_sha256_hex_digest(digest, out->current_sha256);
+    out->checksum_mismatch = ac_syscall_baseline_ready &&
+        strcmp(out->current_sha256, out->baseline_sha256) != 0;
+
     out->ok = (out->hooked == 0);
     return 0;
 }
@@ -1913,10 +2068,12 @@ static int __init ac_init(void)
         pr_info("text bounds: stext=0x%lx etext=0x%lx\n", ac_stext, ac_etext);
 
     ac_syscall_table = ac_find_syscall_table();
-    if (ac_syscall_table)
+    if (ac_syscall_table) {
         pr_info("syscall table located at 0x%lx\n", ac_syscall_table);
-    else
+        ac_capture_syscall_baseline();
+    } else {
         pr_warn("syscall table not located; syscall integrity checks disabled\n");
+    }
 
     ac_register_kprobes();
 
