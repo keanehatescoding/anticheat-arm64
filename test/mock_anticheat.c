@@ -140,23 +140,40 @@ static void read_comm(int pid, char *out, size_t n)
 }
 
 /* Userspace analog of the real module's "t->flags & PF_KTHREAD" check --
- * see the AC_IOCTL_ADD_PROC comment below. A kernel thread never has an
- * argv, so /proc/<pid>/cmdline reads back 0 bytes; an ordinary process
- * (even one invoked with no arguments) always has at least argv[0], so
- * this doesn't false-positive on real userspace targets. */
+ * see the AC_IOCTL_ADD_PROC comment below. /proc/<pid>/stat field 9 is the
+ * task's raw kernel flags word (see `man 5 proc`), the same value the
+ * module reads off t->flags, so this mirrors PF_KTHREAD exactly instead of
+ * inferring it from an empty /proc/<pid>/cmdline -- a zombie userspace
+ * process also reads back 0 bytes of cmdline and would have been
+ * misclassified as a kernel thread by that heuristic. */
+#define AC_MOCK_PF_KTHREAD 0x00200000UL
 static int is_kthread_like(int pid)
 {
-    char path[64], buf[1];
+    char path[64], line[512], *rparen;
     FILE *f;
-    size_t r;
+    unsigned long flags;
 
-    snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
-    f = fopen(path, "rb");
+    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+    f = fopen(path, "r");
     if (!f)
         return 0;   /* pid gone / unreadable: not our call to make here */
-    r = fread(buf, 1, sizeof(buf), f);
+    if (!fgets(line, sizeof(line), f)) {
+        fclose(f);
+        return 0;
+    }
     fclose(f);
-    return r == 0;
+
+    /* comm is the parenthesized 2nd field and may itself contain ')', so
+     * skip to the *last* ')' before splitting the remaining fields --
+     * same technique `man 5 proc` recommends. */
+    rparen = strrchr(line, ')');
+    if (!rparen)
+        return 0;
+    /* Fields after comm: state, ppid, pgrp, session, tty_nr, tpgid, flags.
+     * flags is the 7th, i.e. the last of these six is skipped first. */
+    if (sscanf(rparen + 1, " %*c %*d %*d %*d %*d %*d %lu", &flags) != 1)
+        return 0;
+    return (flags & AC_MOCK_PF_KTHREAD) != 0;
 }
 
 /* ------------------------------------------------------------------ */
