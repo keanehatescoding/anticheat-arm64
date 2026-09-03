@@ -1,19 +1,24 @@
 /*
  * SPDX-License-Identifier: GPL-2.0
  *
- * test/thread_exit_migration_test.c -- live test helper for
- * ac_exit_pre()'s registry-migration path (ac_replace_prot_task()).
+ * test/thread_exit_migration_test.c -- live test helper for the
+ * mm_struct-keyed protected-process registry's leader-only-exit case
+ * (#62). The registry is keyed by address space, not task_struct, so
+ * this scenario needs no migration logic at all: the shared mm is
+ * untouched by one thread exiting, and the entry (still displayed under
+ * MAIN_TID, the pid it was registered under) simply stays valid for as
+ * long as the mm does.
  *
  * Starts single-threaded, prints its own tid as MAIN_TID, spawns a worker
  * thread that prints its own tid as WORKER_TID and then just waits, and
  * blocks the main/leader thread on a line from stdin. The driver
  * (test.sh) reads both tids, protects this process by MAIN_TID (the
- * leader -- the exact task_struct AC_IOCTL_ADD_PROC registers), then
- * writes a line to unblock the leader thread, which calls pthread_exit()
- * (not exit()/exit_group()) so only the leader thread exits while the
- * worker thread -- and the process as a whole -- keeps running. That is
- * exactly the scenario ac_exit_pre() migrates the registry entry for:
- * the exact registered task exits, but its thread group is still alive.
+ * leader), then writes a line to unblock the leader thread, which calls
+ * pthread_exit() (not exit()/exit_group()) so only the leader thread
+ * exits while the worker thread -- and the process's mm -- keeps
+ * running. That is exactly the scenario that used to require
+ * ac_exit_pre()'s sibling-scan migration (ac_replace_prot_task()) under
+ * the old task-keyed registry, and now requires nothing.
  *
  * Needs root and the module loaded -- see test.sh.
  */
