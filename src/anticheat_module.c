@@ -1624,11 +1624,16 @@ static int ac_exec_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
     d->vfork_inherit = false;
     if (current->vfork_done) {
         if (current->mm && ac_is_protected_mm(current->mm)) {
+            struct task_struct *parent;
+
             d->vfork_inherit = true;
             d->jit_allowed = ac_prot_jit_allowed_mm(current->mm);
-            d->parent_pid = current->real_parent->pid;
-            strscpy(d->parent_comm, current->real_parent->comm,
-                    sizeof(d->parent_comm));
+
+            rcu_read_lock();
+            parent = rcu_dereference(current->real_parent);
+            d->parent_pid = parent->pid;
+            strscpy(d->parent_comm, parent->comm, sizeof(d->parent_comm));
+            rcu_read_unlock();
         }
         return 0;
     }
