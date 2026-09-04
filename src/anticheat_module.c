@@ -46,6 +46,7 @@
 #include <linux/pid_namespace.h>
 #include <linux/mm.h>
 #include <linux/mmap_lock.h>
+#include <linux/mmu_notifier.h>
 #include <linux/vmalloc.h>
 #include <linux/kprobes.h>
 #include <linux/mutex.h>
@@ -58,6 +59,7 @@
 #include <linux/version.h>
 #include <linux/timekeeping.h>
 #include <linux/workqueue.h>
+#include <linux/mempool.h>
 #include <linux/cred.h>
 #include <linux/capability.h>
 #include <linux/ptrace.h>
@@ -75,6 +77,30 @@
 /* forward declarations */
 static void ac_emit(unsigned int type, int pid, const char *comm,
                     const char *fmt, ...);
+/* Defined in the kill-from-workqueue section below; the mm-registration
+ * deferral in the protected-process registry (see AC_PROT_RESERVED and
+ * ac_schedule_prot_add()/ac_schedule_prot_rekey() further down) needs it
+ * declared this early since it queues work from kprobe/kretprobe context
+ * too, for the same reason ac_schedule_kill() does. */
+static struct workqueue_struct *ac_wq;
+
+/* Backing pools for the two deferred-work request structs allocated from
+ * kprobe/kretprobe (atomic) context: struct ac_prot_add_req (fork-inherit/
+ * exec-rekey registration, further down) and struct ac_prot_release_req
+ * (mmu_notifier cleanup for an organically-exited mm, in the registry
+ * section below). A plain kmalloc(GFP_ATOMIC) there can fail under memory
+ * pressure -- silently dropping either request isn't just a missed event:
+ * dropping an add/rekey leaves a should-be-protected mm unregistered
+ * (ptrace/process_vm defenses would let an attacker through), and dropping
+ * a release leaks the slot's mmu_notifier registration and its mm_count
+ * reference permanently. mempool_alloc() falls back to a small pre-reserved
+ * pool instead of returning NULL there, the standard kernel pattern for
+ * atomic-context allocations that must not fail. Sized to AC_PROT_MAX: that
+ * many concurrent in-flight requests already implies as many address
+ * spaces are mid-transition, which is the same order of magnitude the
+ * registry itself is bounded to. */
+static mempool_t *ac_prot_add_pool;
+static mempool_t *ac_prot_release_pool;
 
 /* ------------------------------------------------------------------ */
 /* safe kernel reads                                                   */
@@ -662,14 +688,59 @@ static void ac_commit_events(unsigned int n, u64 removed_before)
 }
 
 /* ------------------------------------------------------------------ */
-/* protected process registry (task-pointer based; namespace-safe)     */
+/* protected process registry (mm_struct-keyed; see #62 / discussion   */
+/* #85 for why -- one entry per address space, torn down via an        */
+/* mmu_notifier .release callback instead of tracking per-thread        */
+/* task_struct exit/exec transitions.                                  */
+/*                                                                      */
+/* mmu_notifier_register()/_unregister() both sleep (they take          */
+/* mm->mmap_lock internally), but registry mutations can also originate */
+/* from kprobe/kretprobe handlers (ac_clone_ret(), the exec kretprobes  */
+/* below), which run in atomic context -- same constraint documented on */
+/* ac_schedule_kill() further down. Those paths never call the notifier */
+/* functions directly: they hand off to ac_schedule_prot_add()/         */
+/* ac_schedule_prot_rekey(), which defer the actual (un)registration to */
+/* ac_wq and run in ordinary process context. AC_IOCTL_ADD_PROC/         */
+/* DEL_PROC and module unload are already process context (ioctl        */
+/* handler, ac_exit()), so they call ac_add_prot_mm()/ac_del_prot_mm()   */
+/* synchronously.                                                       */
 /* ------------------------------------------------------------------ */
 #define AC_PROT_MAX 64
 
+/* Placeholder for a slot that's in the middle of being claimed: the
+ * table-scan-and-claim step (spinlock, can't sleep) and the actual
+ * mmu_notifier_register() call (sleeps) can't happen atomically, so the
+ * slot is marked with this sentinel while the lock is dropped for the
+ * register() call, to stop a concurrent caller from claiming it too.
+ * Never a real mm_struct pointer (kmalloc'd objects are never at this
+ * address); every free-slot scan below naturally skips it since it's
+ * neither NULL nor equal to any real mm pointer. The *dedupe* scan can't
+ * just skip it the same way, though -- see .claiming below -- so it isn't
+ * quite true that no special-casing is needed anywhere else. */
+#define AC_PROT_RESERVED ((struct mm_struct *)1)
+
 struct ac_prot_entry {
-    struct task_struct *task;
-    pid_t pid;                  /* display only */
+    struct mm_struct *mm;        /* NULL = free slot; see AC_PROT_RESERVED */
+    struct mmu_notifier notifier;
+    pid_t pid;                   /* display only, snapshot at register time */
     bool jit_allowed;
+    /* Set under ac_prot_lock for the duration of an in-flight
+     * mmu_notifier_unregister() call on this slot (ac_del_prot_mm(),
+     * ac_clear_protected()) -- see those functions for why a slot can't
+     * be treated as free/reusable just because .mm reads NULL or matches,
+     * until that call has actually returned. */
+    bool removing;
+    /* Meaningful only while .mm == AC_PROT_RESERVED: the real mm this
+     * slot is mid-registering for. AC_PROT_RESERVED itself carries no mm
+     * identity, so without this a second ac_add_prot_mm() call for the
+     * exact same mm -- e.g. two AC_IOCTL_ADD_PROC calls naming two
+     * threads of one process, or one racing ac_prot_add_worker() after an
+     * exec rekey -- can't see that a registration for it is already in
+     * flight, and claims a second slot: two independent notifier
+     * registrations for one address space, inflating ac_prot_count,
+     * double-listing the pid, and leaving one still registered after
+     * ac_del_prot_mm() stops at its first (and only known) match. */
+    struct mm_struct *claiming;
     char comm[AC_MAX_COMM];
 };
 
@@ -729,46 +800,199 @@ static struct task_struct *ac_find_task_in_ns_of(pid_t nr, pid_t ref_pid)
     return target;
 }
 
-static int ac_add_prot_task(struct task_struct *t, bool jit_allowed)
+/* mmu_notifier_register() takes an mm_count reference (mmgrab()) that only
+ * mmu_notifier_unregister() balances (mmdrop(), unconditionally, even if
+ * ->release() already ran) -- calling it is mandatory for every successful
+ * register(), not just a courtesy. ac_del_prot_mm()/ac_clear_protected()
+ * provide that call for the explicit-removal case, but nothing else ever
+ * will for a slot whose mm exited organically: once ac_mmu_release() below
+ * clears e->mm to NULL, no future scan can ever match this slot by mm
+ * pointer again to unregister it. Deferred here via ac_wq, same GFP_ATOMIC/
+ * queue_work() shape as ac_schedule_kill() -- this callback must not call
+ * mmu_notifier_unregister() reentrantly on itself (see ac_mmu_release()'s
+ * own comment), and its calling context isn't guaranteed sleepable. The mm
+ * can't be freed before the worker runs: the very mmgrab() reference this
+ * is balancing is what's keeping mm_count elevated until then. */
+struct ac_prot_release_req {
+    struct work_struct work;
+    struct ac_prot_entry *e;
+    struct mm_struct *mm;
+};
+
+static void ac_prot_release_worker(struct work_struct *w)
+{
+    struct ac_prot_release_req *r =
+        container_of(w, struct ac_prot_release_req, work);
+    unsigned long flags;
+
+    /* ->release() already ran synchronously before this worker was even
+     * queued (that's how we got here), so this call's hlist_unhashed()
+     * check will find it already unhashed and won't re-invoke release() --
+     * it only performs the mdrop() this slot still owes. */
+    mmu_notifier_unregister(&r->e->notifier, r->mm);
+
+    spin_lock_irqsave(&ac_prot_lock, flags);
+    r->e->removing = false;
+    spin_unlock_irqrestore(&ac_prot_lock, flags);
+    mempool_free(r, ac_prot_release_pool);
+}
+
+/* ->release() is invoked either by exit_mmap() when mm_users hits zero
+ * (the normal "process actually exited" path) or synchronously from
+ * within mmu_notifier_unregister() (explicit AC_IOCTL_DEL_PROC / module
+ * unload / a successful exec-rekey's drop of the old entry) -- either way
+ * this is the one and only place a table slot is cleared, so entry removal
+ * can't race itself or be done twice. Must not call
+ * mmu_notifier_unregister() synchronously from in here for the *organic*
+ * case (that would reenter the generic release path we're already inside
+ * of); see ac_prot_release_worker() for why and how that call still
+ * happens, deferred.
+ *
+ * e->removing, already true here whenever ac_del_prot_mm()/
+ * ac_clear_protected() is the one whose in-flight mmu_notifier_unregister()
+ * call triggered this ->release() synchronously, is exactly the signal
+ * needed to tell that apart from a real organic exit_mmap(): AC_EV_EXIT
+ * must fire only for the latter -- the address space is still alive in
+ * the former case (an operator's unprotect, module unload, or a
+ * protected process re-exec'ing), so "protected process exited" would be
+ * a false claim, and the caller's own in-flight unregister() call already
+ * owes no further deferral (it does the mdrop() itself on return). */
+static void ac_mmu_release(struct mmu_notifier *subscription,
+                            struct mm_struct *mm)
+{
+    struct ac_prot_entry *e = container_of(subscription,
+                                            struct ac_prot_entry, notifier);
+    unsigned long flags;
+    pid_t pid;
+    char comm[AC_MAX_COMM];
+    bool removed = false;
+    bool caller_initiated = false;
+    struct ac_prot_release_req *r;
+
+    spin_lock_irqsave(&ac_prot_lock, flags);
+    if (e->mm == mm) {
+        pid = e->pid;
+        strscpy(comm, e->comm, sizeof(comm));
+        caller_initiated = e->removing;
+        e->mm = NULL;
+        if (!caller_initiated)
+            e->removing = true;   /* pins the slot against ac_add_prot_mm()
+                                    * reuse until the deferred worker's
+                                    * unregister() call actually returns */
+        ac_prot_count--;
+        removed = true;
+    }
+    spin_unlock_irqrestore(&ac_prot_lock, flags);
+    if (!removed)
+        return;
+
+    if (caller_initiated) {
+        /* ac_del_prot_mm()/ac_clear_protected() is already inside its own
+         * mmu_notifier_unregister() call for this exact slot; that call
+         * does the mandatory mmdrop() itself on return, so no further
+         * deferral is needed here. */
+        return;
+    }
+
+    ac_emit(AC_EV_EXIT, pid, comm, "protected process exited");
+
+    /* mempool-backed, same reasoning as ac_schedule_prot_add_req() -- a
+     * plain kmalloc(GFP_ATOMIC) failure here would leak this slot's
+     * mm_count reference *permanently* (nothing else will ever call
+     * mmu_notifier_unregister() for it, see the comment above
+     * ac_prot_release_worker()) and pin the slot against reuse forever,
+     * so repeated failures could eventually exhaust AC_PROT_MAX. The NULL
+     * check below is defense in depth, not the expected path. */
+    r = mempool_alloc(ac_prot_release_pool, GFP_ATOMIC);
+    if (!r) {
+        pr_err("anticheat: OOM deferring mmu_notifier cleanup for exited pid %d (%s); mm and slot leaked\n",
+               pid, comm);
+        return;
+    }
+    r->e = e;
+    r->mm = mm;
+    INIT_WORK(&r->work, ac_prot_release_worker);
+    queue_work(ac_wq, &r->work);
+}
+
+static const struct mmu_notifier_ops ac_mmu_notifier_ops = {
+    .release = ac_mmu_release,
+};
+
+/* Register `mm` (already pinned by the caller for the duration of this
+ * call -- this function neither takes nor drops a reference on it) as
+ * protected. Must be called from process context: mmu_notifier_register()
+ * sleeps (mm->mmap_lock). Dedupes by mm pointer, same shape as the old
+ * ac_add_prot_task() but keyed by address space instead of task.
+ *
+ * Two racing calls for the same mm (two AC_IOCTL_ADD_PROC calls naming
+ * different threads of one process, or one racing ac_prot_add_worker()
+ * after an exec rekey) must not both end up claiming a slot: see the
+ * .claiming field's comment for why the dedupe scan checks AC_PROT_RESERVED
+ * slots too, not just fully-registered ones. A slot mid-teardown
+ * (.removing) is deliberately *not* treated as a dedupe match -- reporting
+ * "already protected" for a registration that's about to actually vanish
+ * (ac_del_prot_mm()/ac_clear_protected() completing moments later) would
+ * be a false claim, so this proceeds to register a fresh one instead;
+ * briefly having two independent registrations for the same mm during
+ * that narrow handoff is harmless (the kernel allows it) and self-resolves
+ * once the old one's teardown finishes. */
+static int ac_add_prot_mm(struct mm_struct *mm, pid_t pid, const char *comm,
+                           bool jit_allowed)
 {
     unsigned long flags;
     int i, slot = -1;
-    int ret = 0;
+    int ret;
 
-    /* Kernel threads (PF_KTHREAD) have no userspace memory of their own,
-     * can't be ptrace-attached or process_vm_{read,write}v'd the way a
-     * real protected process can, and are never a legitimate --pid/--comm
-     * target or a legitimate fork-inherit child of one -- see issue #69.
-     * A userspace comm-string match can still resolve to one (many kernel
-     * threads have ordinary-looking, even collidable, comm names, e.g.
-     * "kworker/0:1"), so reject it here rather than silently occupying an
-     * AC_PROT_MAX slot the checks above can never meaningfully protect. */
-    if (t->flags & PF_KTHREAD)
-        return -EINVAL;
-
+    /* Kernel threads (PF_KTHREAD) never own an mm_struct (see issue #69's
+     * concern about them wasting a registry slot) -- get_task_mm() already
+     * returns NULL for one, so every caller here (ac_add_prot_pid(),
+     * ac_clone_ret() via ac_schedule_prot_add()) bails out before ever
+     * reaching this task. No separate PF_KTHREAD check is needed at the
+     * mm layer. */
     spin_lock_irqsave(&ac_prot_lock, flags);
     for (i = 0; i < AC_PROT_MAX; i++) {
-        if (ac_prots[i].task == t) {
+        if (ac_prots[i].mm == mm && !ac_prots[i].removing) {
             ac_prots[i].jit_allowed = jit_allowed;  /* updatable via re-protect */
-            ret = 0;                    /* already protected */
-            goto out;
+            spin_unlock_irqrestore(&ac_prot_lock, flags);
+            return 0;                                /* already protected */
         }
-        if (!ac_prots[i].task && slot < 0)
+        if (ac_prots[i].mm == AC_PROT_RESERVED && ac_prots[i].claiming == mm) {
+            /* Another caller is already mid-register for this exact mm;
+             * its registration will cover it once it lands, so don't also
+             * claim a second slot for it. */
+            spin_unlock_irqrestore(&ac_prot_lock, flags);
+            return 0;
+        }
+        if (!ac_prots[i].mm && !ac_prots[i].removing && slot < 0)
             slot = i;
     }
     if (slot < 0) {
-        ret = -ENOSPC;
-        goto out;
+        spin_unlock_irqrestore(&ac_prot_lock, flags);
+        return -ENOSPC;
     }
-    get_task_struct(t);
-    ac_prots[slot].task = t;
-    ac_prots[slot].pid = t->pid;
-    ac_prots[slot].jit_allowed = jit_allowed;
-    strscpy(ac_prots[slot].comm, t->comm, sizeof(ac_prots[slot].comm));
-    ac_prot_count++;
-out:
+    ac_prots[slot].mm = AC_PROT_RESERVED;
+    ac_prots[slot].claiming = mm;
     spin_unlock_irqrestore(&ac_prot_lock, flags);
-    return ret;
+
+    /* struct mmu_notifier has no ops parameter of its own -- the caller
+     * sets ->ops directly before registering. */
+    ac_prots[slot].notifier.ops = &ac_mmu_notifier_ops;
+    ret = mmu_notifier_register(&ac_prots[slot].notifier, mm);
+
+    spin_lock_irqsave(&ac_prot_lock, flags);
+    if (ret) {
+        ac_prots[slot].mm = NULL;
+        spin_unlock_irqrestore(&ac_prot_lock, flags);
+        return ret;
+    }
+    ac_prots[slot].mm = mm;
+    ac_prots[slot].pid = pid;
+    ac_prots[slot].jit_allowed = jit_allowed;
+    strscpy(ac_prots[slot].comm, comm, sizeof(ac_prots[slot].comm));
+    ac_prot_count++;
+    spin_unlock_irqrestore(&ac_prot_lock, flags);
+    return 0;
 }
 
 static int ac_add_prot_pid(pid_t pid, pid_t ref_pid, bool jit_allowed,
@@ -776,131 +1000,67 @@ static int ac_add_prot_pid(pid_t pid, pid_t ref_pid, bool jit_allowed,
 {
     struct task_struct *t = ref_pid > 0 ? ac_find_task_in_ns_of(pid, ref_pid)
                                          : ac_find_task(pid);
+    struct mm_struct *mm;
     int ret;
 
     if (!t)
         return -ESRCH;
     if (comm_out)
         strscpy(comm_out, t->comm, AC_MAX_COMM);
-    ret = ac_add_prot_task(t, jit_allowed);
+    mm = get_task_mm(t);
+    if (!mm) {
+        put_task_struct(t);
+        return -ESRCH;  /* kernel thread, or already tearing down */
+    }
+    ret = ac_add_prot_mm(mm, t->pid, t->comm, jit_allowed);
     put_task_struct(t);
+    mmput(mm);           /* process context (ioctl): plain mmput() is fine */
     return ret;
 }
 
-static void ac_del_prot_task(struct task_struct *t)
-{
-    unsigned long flags;
-    int i;
-
-    spin_lock_irqsave(&ac_prot_lock, flags);
-    for (i = 0; i < AC_PROT_MAX; i++) {
-        if (ac_prots[i].task == t) {
-            put_task_struct(t);
-            ac_prots[i].task = NULL;
-            ac_prot_count--;
-            break;
-        }
-    }
-    spin_unlock_irqrestore(&ac_prot_lock, flags);
-}
-
-/* Like ac_del_prot_task(), but removes every registry entry belonging to
- * t's thread group rather than requiring t to be the exact task_struct a
- * registration was made for. AC_IOCTL_DEL_PROC resolves the caller-supplied
- * pid to a task_struct fresh via ac_find_task(), which is not necessarily
- * the task the registration was originally made for -- ac_exit_pre() /
- * ac_replace_prot_task() can have since migrated an entry to a live
- * sibling thread, changing which task_struct (and which pid) the registry
- * actually holds for that group. Matching on thread-group membership, the
- * same way ac_is_protected_thread_group()/ac_is_protected_pid() already do
- * for the ptrace/process_vm target checks, means unprotect works via any
- * live thread of the group -- not only the exact pid last shown by
- * AC_IOCTL_LIST_PROTECTED for it.
+/* Unregister `mm` (caller-pinned, same convention as ac_add_prot_mm()).
+ * Process context only: mmu_notifier_unregister() sleeps, and it invokes
+ * ac_mmu_release() synchronously before returning, which does the actual
+ * table cleanup -- so there's no separate removal step here. No-op if
+ * `mm` has no registry entry (including if ac_mmu_release() already ran
+ * for it concurrently, e.g. the process exited right as this was
+ * called).
  *
- * Must not stop at the first match: ac_add_prot_task() only dedupes an
- * exact task_struct, not a thread group, so a group can hold more than one
- * entry at once -- e.g. every thread of an already-protected process gets
- * its own entry via the fork-inherit kretprobe. Stopping early would let
- * AC_IOCTL_DEL_PROC report success while a second entry kept the group
- * protected. No-op (not an error) if t's group has no registry entry at
- * all. */
-static void ac_del_prot_thread_group(struct task_struct *t)
-{
-    unsigned long flags;
-    int i;
-
-    spin_lock_irqsave(&ac_prot_lock, flags);
-    for (i = 0; i < AC_PROT_MAX; i++) {
-        if (ac_prots[i].task && same_thread_group(ac_prots[i].task, t)) {
-            put_task_struct(ac_prots[i].task);
-            ac_prots[i].task = NULL;
-            ac_prot_count--;
-        }
-    }
-    spin_unlock_irqrestore(&ac_prot_lock, flags);
-}
-
-/* Re-point the registry entry tracking `old` at `replacement` instead of
- * deleting it -- used by ac_exit_pre() when the exact task a registration
- * was made for exits but other threads in its group are still alive.
- * ac_is_protected_thread_group() already recognises any thread in a
- * registered group, but only for as long as the registry holds an entry
- * for that group at all; migrating the entry to a live sibling instead of
- * dropping it keeps protection alive for the group's actual lifetime
- * rather than the specific thread that happened to be named at protect
- * time. Takes ownership of the caller's reference on `replacement` (the
- * caller must have already get_task_struct()'d it); drops the reference
- * on `old`.
- *
- * `replacement` can already own a separate registry entry of its own --
- * e.g. an operator separately protected two TIDs of the same thread group
- * (ac_add_prot_task() only dedupes an exact task_struct, not a thread
- * group; see ac_task_jit_allowed()'s comment for the same root cause).
- * Re-pointing `old`'s entry onto `replacement` in that case would leave two
- * entries for the same exact task, each holding its own reference.
- * AC_IOCTL_DEL_PROC's ac_del_prot_thread_group() would still clean up both
- * together, but ac_exit_pre()'s own cleanup path uses the exact-match
- * ac_del_prot_task(), which stops at the first entry it finds for a task --
- * by design, so a sibling's exit can't delete a different thread's entry.
- * If `replacement` itself later exits with two entries pointing at it,
- * that single-match delete leaves the second one permanently dangling
- * (stale AC_PROT_MAX slot, leaked task_struct reference). Detect the
- * duplicate here and retire `old`'s entry outright instead: `replacement`'s
- * own entry already keeps the group protected, so nothing is lost. */
-static void ac_replace_prot_task(struct task_struct *old,
-                                  struct task_struct *replacement)
+ * The match-and-mark below has to happen in the same ac_prot_lock critical
+ * section: finding slot i under the lock, dropping the lock, and only then
+ * marking it as being removed would leave a window where ac_add_prot_mm()
+ * can see the slot as free (once ac_mmu_release() clears it from a
+ * concurrent exit_mmap()) and reinitialise ac_prots[i].notifier for an
+ * unrelated mm before the mmu_notifier_unregister() call below runs --
+ * which would then unregister a notifier that no longer belongs to `mm`
+ * at all, corrupting whatever mm it now belongs to. Marking .removing
+ * under the same lock that finds the match closes that window: it stops
+ * ac_add_prot_mm() from reusing the slot (see its free-slot scan) for as
+ * long as this call is in flight, regardless of whether ac_mmu_release()
+ * also fires concurrently and clears .mm out from under it. */
+static void ac_del_prot_mm(struct mm_struct *mm)
 {
     unsigned long flags;
     int i;
     bool found = false;
-    bool dup = false;
 
     spin_lock_irqsave(&ac_prot_lock, flags);
     for (i = 0; i < AC_PROT_MAX; i++) {
-        if (ac_prots[i].task == replacement) {
-            dup = true;
-            break;
-        }
-    }
-    for (i = 0; i < AC_PROT_MAX; i++) {
-        if (ac_prots[i].task == old) {
-            put_task_struct(old);
-            if (dup) {
-                ac_prots[i].task = NULL;
-                ac_prot_count--;
-            } else {
-                ac_prots[i].task = replacement;
-                ac_prots[i].pid = replacement->pid;
-                strscpy(ac_prots[i].comm, replacement->comm,
-                        sizeof(ac_prots[i].comm));
-            }
+        if (ac_prots[i].mm == mm && !ac_prots[i].removing) {
+            ac_prots[i].removing = true;
             found = true;
             break;
         }
     }
     spin_unlock_irqrestore(&ac_prot_lock, flags);
-    if (!found || dup)
-        put_task_struct(replacement);
+    if (!found)
+        return;
+
+    mmu_notifier_unregister(&ac_prots[i].notifier, mm);
+
+    spin_lock_irqsave(&ac_prot_lock, flags);
+    ac_prots[i].removing = false;
+    spin_unlock_irqrestore(&ac_prot_lock, flags);
 }
 
 /* Fork inheritance already extends *protection* itself to children (see
@@ -908,18 +1068,21 @@ static void ac_replace_prot_task(struct task_struct *old,
  * JIT-marked process's child processes don't generate false anon-exec
  * reports just because the flag reset to false on them.
  *
- * AC_IOCTL_ADD_PROC resolves its pid via a plain PIDTYPE_PID lookup, not
- * necessarily the thread-group leader, and ac_add_prot_task() only dedupes
- * an exact task_struct -- so an operator protecting two different TIDs of
- * the same thread group with different --jit flags leaves two registry
- * entries for one group that disagree on jit_allowed. Pick the first match
- * would make the result depend on scan order (registration/slot-reuse
- * history), which is exactly as arbitrary as it sounds. AND-reduce across
- * every matching entry instead: the group is jit_allowed only if *every*
- * entry for it agrees, so a stray non-jit registration can't be silently
- * shadowed by an earlier jit one -- fail toward the safer (more likely to
- * report) state rather than an arbitrary one. */
-static bool ac_task_jit_allowed(struct task_struct *t)
+ * Dedup in ac_add_prot_mm() is by mm pointer, so there's exactly one entry
+ * per address space in the steady state, and a concurrent ADD_PROC racing
+ * an in-flight register for the same mm no longer creates a second one
+ * either (see the .claiming field's comment). The one remaining source of
+ * a transient duplicate is narrower: ac_add_prot_mm() deliberately doesn't
+ * treat a slot mid-teardown (.removing) as a dedupe match, so a fresh
+ * AC_IOCTL_ADD_PROC racing an in-flight ac_del_prot_mm()/
+ * ac_clear_protected() for the same mm can briefly leave two entries for
+ * it until the old one's teardown finishes (see ac_add_prot_mm()'s own
+ * comment). AND-reduce across every matching entry, same as the old
+ * task-keyed ac_task_jit_allowed(): the mm is jit_allowed only if *every*
+ * entry for it agrees, failing toward the safer (more likely to report)
+ * state rather than depending on scan order or which entry wins the
+ * race. */
+static bool ac_prot_jit_allowed_mm(struct mm_struct *mm)
 {
     unsigned long flags;
     int i;
@@ -928,7 +1091,7 @@ static bool ac_task_jit_allowed(struct task_struct *t)
 
     spin_lock_irqsave(&ac_prot_lock, flags);
     for (i = 0; i < AC_PROT_MAX; i++) {
-        if (ac_prots[i].task && same_thread_group(ac_prots[i].task, t)) {
+        if (ac_prots[i].mm == mm) {
             found = true;
             jit_allowed = jit_allowed && ac_prots[i].jit_allowed;
         }
@@ -937,15 +1100,17 @@ static bool ac_task_jit_allowed(struct task_struct *t)
     return found && jit_allowed;
 }
 
-static bool ac_is_protected_task(struct task_struct *t)
+static bool ac_is_protected_mm(struct mm_struct *mm)
 {
     unsigned long flags;
     int i;
     bool prot = false;
 
+    if (!mm)
+        return false;
     spin_lock_irqsave(&ac_prot_lock, flags);
     for (i = 0; i < AC_PROT_MAX; i++) {
-        if (ac_prots[i].task == t) {
+        if (ac_prots[i].mm == mm) {
             prot = true;
             break;
         }
@@ -954,31 +1119,33 @@ static bool ac_is_protected_task(struct task_struct *t)
     return prot;
 }
 
-/* Like ac_is_protected_task(), but recognises any thread in a protected
- * thread group, not just the exact task_struct that was registered.
- * process_vm_readv(2)/writev(2) (and ptrace(2)) accept any thread ID in a
- * process, not just its tgid, and every thread shares the same mm_struct --
- * so a target-permission check must follow suit or a sibling thread ID that
- * pre-dates protection (never individually registered by the fork-inherit
- * kretprobe) bypasses detection while reaching the exact same memory. Never
- * used for the exit-cleanup path (ac_exit_pre): deregistering on any
- * thread-group member's exit, rather than the exact registered task's own
- * exit, would delist a still-alive process the moment an unrelated worker
- * thread happens to exit. */
-static bool ac_is_protected_thread_group(struct task_struct *t)
+/* current's own mm -- reading current->mm directly (no get_task_mm()) is
+ * safe since a task can't have its own ->mm concurrently freed out from
+ * under itself. */
+static bool ac_is_protected_current(void)
 {
-    unsigned long flags;
-    int i;
-    bool prot = false;
+    return ac_is_protected_mm(current->mm);
+}
 
-    spin_lock_irqsave(&ac_prot_lock, flags);
-    for (i = 0; i < AC_PROT_MAX; i++) {
-        if (ac_prots[i].task && same_thread_group(ac_prots[i].task, t)) {
-            prot = true;
-            break;
-        }
-    }
-    spin_unlock_irqrestore(&ac_prot_lock, flags);
+/* Like ac_is_protected_mm(), but for an arbitrary target task_struct
+ * rather than current -- process_vm_readv(2)/writev(2) and ptrace(2)
+ * accept any thread ID in a process, not just its tgid, and every thread
+ * shares the same mm_struct, so a target-permission check must resolve
+ * the target's mm rather than compare task/thread-group identity. Safe
+ * from kprobe context: get_task_mm() only takes task_lock() (a spinlock)
+ * and bumps mm_users, it doesn't sleep -- but the matching drop uses
+ * mmput_async() rather than plain mmput(), since *that* call can run the
+ * real teardown (sleeps) if it happens to be the last reference, which a
+ * kprobe pre-handler must never risk. */
+static bool ac_is_protected_task_mm(struct task_struct *t)
+{
+    struct mm_struct *mm = get_task_mm(t);
+    bool prot;
+
+    if (!mm)
+        return false;
+    prot = ac_is_protected_mm(mm);
+    mmput_async(mm);
     return prot;
 }
 
@@ -989,11 +1156,141 @@ static bool ac_is_protected_pid(pid_t pid, char *comm_out)
 
     if (!t)
         return false;
-    prot = ac_is_protected_thread_group(t);
+    prot = ac_is_protected_task_mm(t);
     if (prot && comm_out)
         strscpy(comm_out, t->comm, AC_MAX_COMM);
     put_task_struct(t);
     return prot;
+}
+
+/* ------------------------------------------------------------------ */
+/* deferred mm (un)registration -- see the block comment at the top of  */
+/* the registry section above for why kprobe/kretprobe-originated        */
+/* add/rekey requests can't call mmu_notifier_register()/_unregister()   */
+/* directly and must hand off to ac_wq instead.                         */
+/*                                                                      */
+/* Known gap (tracked in issue #87, not fixed here): a child's own      */
+/* exec racing ahead of its own not-yet-run fork-inherit request. If a  */
+/* protected process forks and the child execs before                  */
+/* ac_prot_add_worker() has dequeued and run the fork-inherit request   */
+/* ac_clone_ret() queued for it, ac_exec_entry() finds current->mm not  */
+/* yet in ac_prots[] (registration is still pending, not done) and      */
+/* treats the child as unprotected -- it does nothing, rather than      */
+/* redirecting the in-flight request to the child's new post-exec mm.   */
+/* The worker then goes on to register the child's now-orphaned         */
+/* pre-exec mm, which is a mostly harmless no-op (that mm has no live    */
+/* task using it and organically self-releases moments later, via the   */
+/* very mmput() ac_prot_add_worker() itself does once ac_add_prot_mm()   */
+/* returns -- no permanent slot leak), but leaves a real, narrow window  */
+/* where the freshly-exec'd child is NOT actually covered by             */
+/* ptrace/process_vm defenses despite the inherit policy intending it    */
+/* to be. Properly closing this needs a "pending transition" visible to  */
+/* ac_exec_entry() (and ac_is_protected_mm()'s other callers) so an      */
+/* exec racing an in-flight fork/rekey request can redirect it to the    */
+/* live mm instead of racing past it -- a materially bigger change than  */
+/* anything else in this file's mm-keyed registry, deliberately left for */
+/* a follow-up rather than folded into it under time pressure.           */
+/* ------------------------------------------------------------------ */
+struct ac_prot_add_req {
+    struct work_struct work;
+    struct mm_struct *mm;        /* new mm to register; ref owned by this
+                                   * request until the worker mmput()s it */
+    struct mm_struct *old_mm;    /* exec-rekey only: entry to drop once mm
+                                   * is registered; NULL for a plain fork-
+                                   * inherit add */
+    pid_t new_pid;
+    char new_comm[AC_MAX_COMM];
+    pid_t src_pid;                /* parent (fork) or pre-exec self (exec) */
+    char src_comm[AC_MAX_COMM];
+    bool jit_allowed;
+};
+
+static void ac_prot_add_worker(struct work_struct *w)
+{
+    struct ac_prot_add_req *r = container_of(w, struct ac_prot_add_req, work);
+    int ret = ac_add_prot_mm(r->mm, r->new_pid, r->new_comm, r->jit_allowed);
+
+    if (r->old_mm) {
+        if (ret == 0) {
+            ac_del_prot_mm(r->old_mm);
+            ac_emit(AC_EV_EXEC, r->new_pid, r->new_comm,
+                    "protected pid %d re-exec'd; protection carried to new image",
+                    r->src_pid);
+        } else {
+            ac_emit(AC_EV_INFO, r->src_pid, r->src_comm,
+                    "protected pid %d re-exec'd but NOT re-registered: %d",
+                    r->src_pid, ret);
+        }
+        mmput(r->old_mm);
+    } else {
+        if (ret == 0)
+            ac_emit(AC_EV_FORK, r->new_pid, r->new_comm,
+                    "child of protected pid %d (%s); protection inherited",
+                    r->src_pid, r->src_comm);
+        else
+            ac_emit(AC_EV_INFO, r->new_pid, r->new_comm,
+                    "child of protected pid %d (%s) NOT protected: %d",
+                    r->src_pid, r->src_comm, ret);
+    }
+    mmput(r->mm);
+    mempool_free(r, ac_prot_add_pool);
+}
+
+static void ac_schedule_prot_add_req(struct mm_struct *mm,
+                                      struct mm_struct *old_mm,
+                                      pid_t new_pid, const char *new_comm,
+                                      pid_t src_pid, const char *src_comm,
+                                      bool jit_allowed)
+{
+    /* mempool_alloc() with GFP_ATOMIC falls back to ac_prot_add_pool's
+     * pre-reserved elements instead of returning NULL whenever a plain
+     * kmalloc(GFP_ATOMIC) would have -- see the pool's own comment for why
+     * silently dropping this request (leaving a should-be-protected mm
+     * unregistered) isn't acceptable here. The NULL check below is
+     * defense in depth, not the expected path: it can in principle still
+     * fail if more than AC_PROT_MAX requests are simultaneously
+     * outstanding *and* the underlying allocator is also failing. */
+    struct ac_prot_add_req *r = mempool_alloc(ac_prot_add_pool, GFP_ATOMIC);
+
+    if (!r) {
+        mmput_async(mm);
+        if (old_mm)
+            mmput_async(old_mm);
+        return;
+    }
+    INIT_WORK(&r->work, ac_prot_add_worker);
+    r->mm = mm;
+    r->old_mm = old_mm;
+    r->new_pid = new_pid;
+    strscpy(r->new_comm, new_comm, sizeof(r->new_comm));
+    r->src_pid = src_pid;
+    strscpy(r->src_comm, src_comm, sizeof(r->src_comm));
+    r->jit_allowed = jit_allowed;
+    queue_work(ac_wq, &r->work);
+}
+
+/* Queue `mm` (caller's get_task_mm() reference -- handed off, always
+ * consumed via mmput()/mmput_async() by the worker or on failure here) for
+ * protection inherited from a fork. Callable from kretprobe context
+ * (ac_clone_ret()). */
+static void ac_schedule_prot_add(struct mm_struct *mm, pid_t new_pid,
+                                  const char *new_comm, pid_t parent_pid,
+                                  const char *parent_comm, bool jit_allowed)
+{
+    ac_schedule_prot_add_req(mm, NULL, new_pid, new_comm,
+                              parent_pid, parent_comm, jit_allowed);
+}
+
+/* Queue a rekey from `old_mm` to `new_mm` after a protected task's
+ * execve() replaced its address space. Both are caller-pinned references,
+ * handed off the same way. Callable from kretprobe context (the exec
+ * kretprobes below). */
+static void ac_schedule_prot_rekey(struct mm_struct *old_mm,
+                                    struct mm_struct *new_mm, pid_t pid,
+                                    const char *comm, bool jit_allowed)
+{
+    ac_schedule_prot_add_req(new_mm, old_mm, pid, comm, pid, comm,
+                              jit_allowed);
 }
 
 /* lock state: pinned by AC_IOCTL_LOCK (try_module_get) */
@@ -1018,7 +1315,7 @@ static int ac_list_protected(struct ac_prot_list *out)
 
     spin_lock_irqsave(&ac_prot_lock, flags);
     for (i = 0; i < AC_PROT_MAX && n < AC_MAX_PROTS; i++) {
-        if (!ac_prots[i].task)
+        if (!ac_prots[i].mm || ac_prots[i].mm == AC_PROT_RESERVED)
             continue;
         out->items[n].pid = ac_prots[i].pid;
         out->items[n].jit_allowed = ac_prots[i].jit_allowed;
@@ -1034,8 +1331,6 @@ static int ac_list_protected(struct ac_prot_list *out)
 /* ------------------------------------------------------------------ */
 /* kill-from-workqueue (safe delivery from atomic kprobe context)      */
 /* ------------------------------------------------------------------ */
-static struct workqueue_struct *ac_wq;
-
 struct ac_kill_req {
     struct work_struct work;
     struct pid *pid;
@@ -1103,7 +1398,7 @@ static int ac_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
         /* the protected process itself asks to be traced; PTRACE_TRACEME
          * ignores its arguments, so args->si holds whatever was in the
          * register — report current->pid, not stale garbage */
-        if (ac_is_protected_thread_group(current)) {
+        if (ac_is_protected_current()) {
             strscpy(tcomm, current->comm, sizeof(tcomm));
             target = current->pid;
             deny = true;
@@ -1182,7 +1477,7 @@ static int ac_process_vm_pre(struct kprobe *p, struct pt_regs *regs)
         put_task_struct(t);
         return 0;
     }
-    protected_target = ac_is_protected_thread_group(t);
+    protected_target = ac_is_protected_task_mm(t);
     if (protected_target)
         strscpy(tcomm, t->comm, sizeof(tcomm));
     put_task_struct(t);
@@ -1218,54 +1513,50 @@ static int ac_clone_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
     long child_pid = (long)regs_return_value(regs);
     struct task_struct *child;
-    char pcomm[AC_MAX_COMM];
-    int add_ret;
+    struct mm_struct *child_mm;
+    pid_t cpid;
+    char ccomm[AC_MAX_COMM];
 
     if (child_pid <= 0)
         return 0;
-    if (!ac_is_protected_thread_group(current))
+    if (!ac_is_protected_current())
         return 0;
 
     child = ac_find_task((pid_t)child_pid);
     if (!child)
         return 0;
 
-    /* CLONE_THREAD (e.g. pthread_create()) makes child share current's
-     * thread group rather than start a new one. ac_is_protected_thread_group()
-     * already recognises any live thread of an already-registered group, so
-     * the group's existing registry entry already covers this child -- an
-     * extra entry here would just be a second slot (and a second held
-     * task_struct ref) for the same protected process, exhausting
-     * AC_PROT_MAX under ordinary thread-pool usage. Only give a genuinely
-     * new thread group (real fork()) its own entry. */
-    if (same_thread_group(current, child)) {
-        put_task_struct(child);
+    /* CLONE_VM (e.g. pthread_create(), and vfork() until the child execs
+     * or exits) makes the child share current's mm_struct pointer exactly
+     * -- the registry entry for that mm already covers it, so there's
+     * nothing to register. This is automatic by construction now that the
+     * registry is keyed by address space: unlike the old task-keyed
+     * registry, there's no separate CLONE_THREAD dedup check to
+     * maintain here. Only a genuinely new mm (real fork()) needs its own
+     * entry. */
+    child_mm = get_task_mm(child);
+    cpid = child->pid;
+    strscpy(ccomm, child->comm, sizeof(ccomm));
+    put_task_struct(child);
+    if (!child_mm)
+        return 0;                  /* kernel thread, or already gone */
+    if (child_mm == current->mm) {
+        mmput_async(child_mm);     /* kretprobe context: atomic, no plain mmput() */
         return 0;
     }
 
-    strscpy(pcomm, current->comm, sizeof(pcomm));
-    add_ret = ac_add_prot_task(child, ac_task_jit_allowed(current));
-    if (add_ret != 0) {
-        /* The child is NOT actually in the registry, so it must not be
-         * reported as protected -- an AC_EV_FORK "protection inherited"
-         * here would be a false claim an operator could rely on.
-         * AC_EV_INFO logs at the same LOG_INFO level AC_EV_FORK would
-         * have, so this doesn't change alerting behaviour, only the
-         * message's accuracy. Two distinct causes: AC_PROT_MAX full
-         * (-ENOSPC), or the child is a kernel thread (-EINVAL, see
-         * ac_add_prot_task()) -- report which one rather than assuming
-         * it's always the registry. */
-        ac_emit(AC_EV_INFO, child->pid, child->comm,
-                "child of protected pid %d (%s) NOT protected: %s",
-                current->pid, pcomm,
-                add_ret == -ENOSPC ? "registry full" : "kernel thread");
-        put_task_struct(child);
-        return 0;
-    }
-    ac_emit(AC_EV_FORK, child->pid, child->comm,
-            "child of protected pid %d (%s); protection inherited",
-            current->pid, pcomm);
-    put_task_struct(child);
+    /* Hands the child_mm reference off to the workqueue; released there
+     * (or in ac_schedule_prot_add_req() on kmalloc failure) via
+     * mmput_async(), never a plain mmput() -- this handler runs in
+     * kretprobe (atomic) context, same reasoning as ac_schedule_kill().
+     * The real AC_EV_FORK/AC_EV_INFO event is emitted from the worker
+     * once the actual registration outcome (including -ENOSPC) is known,
+     * not here -- see ac_prot_add_worker(): an event claiming inherited
+     * protection before the deferred registration has even run would be
+     * exactly the kind of false claim the old synchronous code's comment
+     * warned about. */
+    ac_schedule_prot_add(child_mm, cpid, ccomm, current->pid, current->comm,
+                          ac_prot_jit_allowed_mm(current->mm));
     return 0;
 }
 
@@ -1274,56 +1565,172 @@ static struct kretprobe ac_kp_clone = {
     .handler = ac_clone_ret,
     .maxactive = 128,
 };
-static bool ac_kp_clone_ok;
 
-static int ac_exit_pre(struct kprobe *p, struct pt_regs *regs)
+/* execve()/execveat() tracking: a kretprobe, not a plain pre-handler.
+ * Unlike the old task-keyed registry -- where task_struct identity
+ * survives exec, so a protected process needed zero registry work on its
+ * own execve() -- the mm-keyed registry has to actively re-key on exec,
+ * since execve() replaces current->mm via exec_mmap() while current->pid
+ * stays the same. Without this, re-exec of an already-protected process
+ * would silently drop protection.
+ *
+ * entry_handler runs before exec_mmap(), in the role the old pre_handler
+ * played, and pins the *old* mm if it was protected. handler (the ret
+ * probe) runs after the real syscall body returns -- on a successful
+ * exec that's after exec_mmap() already installed the new mm, so
+ * get_task_mm(current) there returns the *new* one and the rekey can be
+ * queued. On a failed exec (nonzero return), current is unchanged and
+ * still owns old_mm -- nothing to rekey, just drop the pin.
+ *
+ * CLONE_VM without CLONE_THREAD -- vfork(), and therefore posix_spawn()/
+ * system()/popen() on a libc that uses it -- makes current->mm literally
+ * the still-live PARENT's mm_struct pointer until this exec (or an exit)
+ * releases it back via mm_release(). If that shared mm happens to be
+ * protected, that protection belongs to the parent, not to current: an
+ * entry_handler here that pinned it as old_mm would have the ret probe
+ * rekey/remove the PARENT's own live registry entry once this exec
+ * succeeds, permanently dropping the parent's protection and logging a
+ * false "protected process exited" for a process that's still running.
+ * current->vfork_done is non-NULL for exactly the duration of that
+ * borrowed-mm window (set at clone time, cleared by mm_release()), so
+ * detecting it here and never touching old_mm/d->old_mm is what keeps the
+ * parent's entry untouched -- ac_clone_ret() already decided at clone time
+ * that this shared period needs no registry work of its own, and that
+ * decision must hold until current gets its own independent mm.
+ *
+ * That still leaves the vfork child itself needing to inherit protection
+ * across its own exec, the same as a plain fork()+exec() child already
+ * does -- current->real_parent is exactly who that inheritance decision
+ * should be attributed to, and it's safe to read without extra locking
+ * here specifically because current->vfork_done being set guarantees the
+ * parent is synchronously blocked waiting on this exec/exit, so it can't
+ * be concurrently reaped or reparented out from under us. The entry
+ * itself is queued the same way ac_clone_ret() queues a fork-inherit
+ * add -- a fresh registration for the new mm, not a rekey -- since there
+ * was never an old_mm entry belonging to current to remove. */
+struct ac_exec_entry_data {
+    struct mm_struct *old_mm;
+    bool vfork_inherit;
+    bool jit_allowed;              /* only meaningful if vfork_inherit */
+    pid_t parent_pid;
+    char parent_comm[AC_MAX_COMM];
+};
+
+static int ac_exec_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-    struct task_struct *replacement = NULL;
+    struct ac_exec_entry_data *d = (struct ac_exec_entry_data *)ri->data;
 
-    if (!ac_is_protected_task(current))
-        return 0;
-    ac_emit(AC_EV_EXIT, current->pid, current->comm,
-            "protected process exited");
+    d->old_mm = NULL;
+    d->vfork_inherit = false;
+    if (current->vfork_done) {
+        if (current->mm && ac_is_protected_mm(current->mm)) {
+            struct task_struct *parent;
 
-    /* current is the exact task this registry entry was made for. If
-     * another thread in its group is still alive, the group as a whole
-     * isn't done -- re-point the entry at that sibling instead of
-     * deleting it, so ac_is_protected_thread_group() keeps recognising
-     * the group for as long as it actually lives, not just until
-     * whichever thread happened to be named at protect time exits.
-     * do_exit() hasn't cleared current's own thread_group linkage yet
-     * at this pre-handler point, so for_each_thread() still sees every
-     * live sibling; PF_EXITING on a candidate means it's already
-     * mid-exit itself, so skip it in favour of one that isn't. */
-    rcu_read_lock();
-    {
-        struct task_struct *t2;
+            d->vfork_inherit = true;
+            d->jit_allowed = ac_prot_jit_allowed_mm(current->mm);
 
-        for_each_thread(current, t2) {
-            if (t2 != current && !(t2->flags & PF_EXITING)) {
-                get_task_struct(t2);
-                replacement = t2;
-                break;
-            }
+            rcu_read_lock();
+            parent = rcu_dereference(current->real_parent);
+            d->parent_pid = parent->pid;
+            strscpy(d->parent_comm, parent->comm, sizeof(d->parent_comm));
+            rcu_read_unlock();
         }
-    }
-    rcu_read_unlock();
-
-    if (replacement)
-        ac_replace_prot_task(current, replacement);
-    else
-        ac_del_prot_task(current);
-    return 0;
-}
-
-static int ac_exec_pre(struct kprobe *p, struct pt_regs *regs)
-{
-    if (!ac_is_protected_thread_group(current))
         return 0;
-    ac_emit(AC_EV_EXEC, current->pid, current->comm,
-            "execve() invoked (path is a user pointer, not resolved)");
+    }
+    if (current->mm && ac_is_protected_mm(current->mm)) {
+        d->old_mm = current->mm;
+        mmget(d->old_mm);
+        /* AC_EV_INFO, not AC_EV_EXEC -- this fires on every attempt,
+         * before the outcome (success/failure/rekey result) is known.
+         * ac_exec_ret()/ac_prot_add_worker() emit the one authoritative
+         * AC_EV_EXEC for this exec once that outcome actually lands, so
+         * emitting it here too would double-count every successful
+         * re-exec of a protected process. */
+        ac_emit(AC_EV_INFO, current->pid, current->comm,
+                "execve() invoked (path is a user pointer, not resolved)");
+    }
     return 0;
 }
+
+static int ac_exec_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct ac_exec_entry_data *d = (struct ac_exec_entry_data *)ri->data;
+    long rc = (long)regs_return_value(regs);
+    struct mm_struct *new_mm;
+
+    if (d->vfork_inherit) {
+        if (rc != 0)
+            return 0;   /* exec failed: still sharing the parent's mm,
+                          * which the parent's own entry keeps covering */
+        new_mm = get_task_mm(current);
+        if (!new_mm)
+            return 0;   /* shouldn't happen on a successful exec */
+        ac_schedule_prot_add(new_mm, current->pid, current->comm,
+                              d->parent_pid, d->parent_comm, d->jit_allowed);
+        return 0;
+    }
+
+    if (!d->old_mm)
+        return 0;
+    if (rc != 0) {
+        mmput_async(d->old_mm);   /* exec failed: current still owns old_mm */
+        return 0;
+    }
+
+    new_mm = get_task_mm(current);
+    if (!new_mm || new_mm == d->old_mm) {
+        /* Shouldn't happen on a successful exec, but don't leak the pin or
+         * attempt a same-mm "rekey" if it somehow does. */
+        mmput_async(d->old_mm);
+        if (new_mm)
+            mmput_async(new_mm);
+        return 0;
+    }
+
+    ac_schedule_prot_rekey(d->old_mm, new_mm, current->pid, current->comm,
+                            ac_prot_jit_allowed_mm(d->old_mm));
+    return 0;
+}
+
+static struct kretprobe ac_kp_execve = {
+    .kp = { .symbol_name = "__x64_sys_execve" },
+    .entry_handler = ac_exec_entry,
+    .handler = ac_exec_ret,
+    .data_size = sizeof(struct ac_exec_entry_data),
+    .maxactive = 64,
+};
+static struct kretprobe ac_kp_execveat = {
+    .kp = { .symbol_name = "__x64_sys_execveat" },
+    .entry_handler = ac_exec_entry,
+    .handler = ac_exec_ret,
+    .data_size = sizeof(struct ac_exec_entry_data),
+    .maxactive = 64,
+};
+static struct kretprobe ac_kp_execve32 = {
+    /* Same reasoning as ac_kp_ptrace32 below: execve/execveat have distinct
+     * COMPAT_SYSCALL_DEFINEs, so the ia32 syscall table entries resolve to
+     * __ia32_compat_sys_execve[at], not the unused generic __ia32_sys_*
+     * stub. */
+    .kp = { .symbol_name = "__ia32_compat_sys_execve" },
+    .entry_handler = ac_exec_entry,
+    .handler = ac_exec_ret,
+    .data_size = sizeof(struct ac_exec_entry_data),
+    .maxactive = 64,
+};
+static struct kretprobe ac_kp_execveat32 = {
+    .kp = { .symbol_name = "__ia32_compat_sys_execveat" },
+    .entry_handler = ac_exec_entry,
+    .handler = ac_exec_ret,
+    .data_size = sizeof(struct ac_exec_entry_data),
+    .maxactive = 64,
+};
+
+static struct kretprobe *ac_kretprobes[] = {
+    &ac_kp_clone, &ac_kp_execve, &ac_kp_execveat,
+    &ac_kp_execve32, &ac_kp_execveat32,
+};
+static bool ac_kretp_ok[ARRAY_SIZE(ac_kretprobes)];
+static unsigned int ac_kretprobes_registered;
 
 static struct kprobe ac_kp_ptrace = {
     .symbol_name = "__x64_sys_ptrace",
@@ -1338,30 +1745,6 @@ static struct kprobe ac_kp_ptrace32 = {
      * never fire for a real 32-bit ptrace() call. */
     .symbol_name = "__ia32_compat_sys_ptrace",
     .pre_handler = ac_ptrace_pre,
-};
-static struct kprobe ac_kp_exit = {
-    .symbol_name = "do_exit",
-    .pre_handler = ac_exit_pre,
-};
-static struct kprobe ac_kp_execve = {
-    .symbol_name = "__x64_sys_execve",
-    .pre_handler = ac_exec_pre,
-};
-static struct kprobe ac_kp_execveat = {
-    .symbol_name = "__x64_sys_execveat",
-    .pre_handler = ac_exec_pre,
-};
-static struct kprobe ac_kp_execve32 = {
-    /* Same reasoning as ac_kp_ptrace32 above: execve/execveat have distinct
-     * COMPAT_SYSCALL_DEFINEs, so the ia32 syscall table entries resolve to
-     * __ia32_compat_sys_execve[at], not the unused generic __ia32_sys_*
-     * stub. */
-    .symbol_name = "__ia32_compat_sys_execve",
-    .pre_handler = ac_exec_pre,
-};
-static struct kprobe ac_kp_execveat32 = {
-    .symbol_name = "__ia32_compat_sys_execveat",
-    .pre_handler = ac_exec_pre,
 };
 static struct kprobe ac_kp_process_vm_readv = {
     .symbol_name = "__x64_sys_process_vm_readv",
@@ -1382,8 +1765,6 @@ static struct kprobe ac_kp_process_vm_writev32 = {
 
 static struct kprobe *ac_kprobes[] = {
     &ac_kp_ptrace, &ac_kp_ptrace32,
-    &ac_kp_exit, &ac_kp_execve, &ac_kp_execveat,
-    &ac_kp_execve32, &ac_kp_execveat32,
     &ac_kp_process_vm_readv, &ac_kp_process_vm_readv32,
     &ac_kp_process_vm_writev, &ac_kp_process_vm_writev32,
 };
@@ -1405,10 +1786,17 @@ static void ac_register_kprobes(void)
                     ac_kprobes[i]->symbol_name, ret);
         }
     }
-    if (register_kretprobe(&ac_kp_clone) == 0)
-        ac_kp_clone_ok = true;
-    else if (ac_verbose)
-        pr_info("kretprobe kernel_clone unavailable\n");
+    for (i = 0; i < ARRAY_SIZE(ac_kretprobes); i++) {
+        int ret = register_kretprobe(ac_kretprobes[i]);
+
+        ac_kretp_ok[i] = (ret == 0);
+        if (ret == 0) {
+            ac_kretprobes_registered++;
+        } else if (ac_verbose) {
+            pr_info("kretprobe %s unavailable: %d\n",
+                    ac_kretprobes[i]->kp.symbol_name, ret);
+        }
+    }
 }
 
 static void ac_unregister_kprobes(void)
@@ -1422,10 +1810,11 @@ static void ac_unregister_kprobes(void)
             unregister_kprobe(ac_kprobes[i]);
     ac_kprobes_registered = 0;
     memset(ac_kp_ok, 0, sizeof(ac_kp_ok));
-    if (ac_kp_clone_ok) {
-        unregister_kretprobe(&ac_kp_clone);
-        ac_kp_clone_ok = false;
-    }
+    for (i = 0; i < ARRAY_SIZE(ac_kretprobes); i++)
+        if (ac_kretp_ok[i])
+            unregister_kretprobe(ac_kretprobes[i]);
+    ac_kretprobes_registered = 0;
+    memset(ac_kretp_ok, 0, sizeof(ac_kretp_ok));
 }
 
 /* ------------------------------------------------------------------ */
@@ -1752,6 +2141,7 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     case AC_IOCTL_DEL_PROC: {
         struct ac_proc_id d;
         struct task_struct *t;
+        struct mm_struct *mm;
 
         if (copy_from_user(&d, uarg, sizeof(d)))
             return -EFAULT;
@@ -1759,8 +2149,15 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                            : ac_find_task(d.pid);
         if (!t)
             return -ESRCH;
-        ac_del_prot_thread_group(t);
+        mm = get_task_mm(t);
         put_task_struct(t);
+        if (!mm)
+            return -ESRCH;
+        /* Process context (ioctl): ac_del_prot_mm() sleeps
+         * (mmu_notifier_unregister()). No-op if d.pid's mm isn't
+         * currently registered. */
+        ac_del_prot_mm(mm);
+        mmput(mm);
         return 0;
     }
     case AC_IOCTL_SCAN_BEGIN: {
@@ -2035,20 +2432,52 @@ static struct miscdevice ac_misc = {
 /* ------------------------------------------------------------------ */
 /* module lifecycle                                                    */
 /* ------------------------------------------------------------------ */
+/* Called from ac_exit() after ac_unregister_kprobes() and flush_workqueue()
+ * (see there for why the flush must come first): no new clone/exec/ioctl
+ * path can add or rekey an entry once the kprobes are gone and the
+ * workqueue is drained (misc_deregister() already ran too, and .owner on
+ * ac_fops means rmmod itself can't happen while any fd is open, so no
+ * ioctl can be in flight either), so this only has to unwind what's
+ * already there. mmu_notifier_unregister() sleeps -- module unload is
+ * process context, so that's fine -- and invokes ac_mmu_release()
+ * synchronously, which is what actually clears each slot and decrements
+ * ac_prot_count; there's nothing left for this function to touch
+ * directly.
+ *
+ * Marks each slot .removing under the same lock that reads it, same
+ * reasoning as ac_del_prot_mm(): although nothing here can reuse a slot
+ * out from under this loop (no producer of new entries is still reachable
+ * at this point), a real process backing one of these mms can still exit
+ * for real at the same moment, racing this function's mmu_notifier_
+ * unregister() call against that mm's own exit_mmap(); marking .removing
+ * costs nothing and keeps the invariant -- a slot only ever has one
+ * in-flight unregister -- true everywhere, not just here by virtue of
+ * unload ordering. */
 static void ac_clear_protected(void)
 {
-    unsigned long flags;
     int i;
 
-    spin_lock_irqsave(&ac_prot_lock, flags);
     for (i = 0; i < AC_PROT_MAX; i++) {
-        if (ac_prots[i].task) {
-            put_task_struct(ac_prots[i].task);
-            ac_prots[i].task = NULL;
+        unsigned long flags;
+        struct mm_struct *mm = NULL;
+
+        spin_lock_irqsave(&ac_prot_lock, flags);
+        if (ac_prots[i].mm && ac_prots[i].mm != AC_PROT_RESERVED &&
+            !ac_prots[i].removing) {
+            mm = ac_prots[i].mm;
+            ac_prots[i].removing = true;
         }
+        spin_unlock_irqrestore(&ac_prot_lock, flags);
+
+        if (!mm)
+            continue;
+
+        mmu_notifier_unregister(&ac_prots[i].notifier, mm);
+
+        spin_lock_irqsave(&ac_prot_lock, flags);
+        ac_prots[i].removing = false;
+        spin_unlock_irqrestore(&ac_prot_lock, flags);
     }
-    ac_prot_count = 0;
-    spin_unlock_irqrestore(&ac_prot_lock, flags);
 }
 
 static int __init ac_init(void)
@@ -2080,6 +2509,20 @@ static int __init ac_init(void)
     if (!ac_wq)
         return -ENOMEM;
 
+    ac_prot_add_pool = mempool_create_kmalloc_pool(AC_PROT_MAX,
+                                                    sizeof(struct ac_prot_add_req));
+    if (!ac_prot_add_pool) {
+        destroy_workqueue(ac_wq);
+        return -ENOMEM;
+    }
+    ac_prot_release_pool = mempool_create_kmalloc_pool(AC_PROT_MAX,
+                                                        sizeof(struct ac_prot_release_req));
+    if (!ac_prot_release_pool) {
+        mempool_destroy(ac_prot_add_pool);
+        destroy_workqueue(ac_wq);
+        return -ENOMEM;
+    }
+
     ac_resolve_text_bounds();
     if (ac_verbose)
         pr_info("text bounds: stext=0x%lx etext=0x%lx\n", ac_stext, ac_etext);
@@ -2098,12 +2541,20 @@ static int __init ac_init(void)
     if (ret) {
         pr_err("misc_register failed: %d\n", ret);
         ac_unregister_kprobes();
+        /* A clone/exec could in principle have fired between
+         * ac_register_kprobes() and here and queued deferred registry
+         * work; drain it before tearing the workqueue down (see the same
+         * reasoning in ac_exit() below). */
+        flush_workqueue(ac_wq);
+        mempool_destroy(ac_prot_release_pool);
+        mempool_destroy(ac_prot_add_pool);
         destroy_workqueue(ac_wq);
         return ret;
     }
 
-    pr_info("loaded (policy=0x%x, %u kprobes, %u protected slots)\n",
-            ac_policy, ac_kprobes_registered, AC_PROT_MAX);
+    pr_info("loaded (policy=0x%x, %u kprobes, %u kretprobes, %u protected slots)\n",
+            ac_policy, ac_kprobes_registered, ac_kretprobes_registered,
+            AC_PROT_MAX);
     return 0;
 }
 
@@ -2111,8 +2562,28 @@ static void __exit ac_exit(void)
 {
     misc_deregister(&ac_misc);
     ac_unregister_kprobes();
+    /* ac_unregister_kprobes() stops new deferred add/rekey work from being
+     * queued, but doesn't wait for work already in flight (queued by a
+     * clone/exec that fired moments before unload) to finish running --
+     * that work calls ac_add_prot_mm()/ac_del_prot_mm(), mutating
+     * ac_prots[] concurrently with ac_clear_protected() below unless it's
+     * drained first. */
+    flush_workqueue(ac_wq);
     ac_clear_protected();
+    /* ac_clear_protected() can itself race a genuinely-live protected
+     * process exiting for real at the same moment: ac_mmu_release() would
+     * see the organic (non-caller-initiated) case for that slot and queue
+     * an ac_prot_release_worker() onto ac_wq to finish the mmdrop() it
+     * owes. destroy_workqueue() expects an already-drained queue, so flush
+     * once more here to catch exactly that. */
+    flush_workqueue(ac_wq);
     destroy_workqueue(ac_wq);
+    /* Safe only now: mempool_destroy() requires every element already
+     * returned, and the two flush_workqueue() calls above guarantee every
+     * ac_prot_add_worker()/ac_prot_release_worker() that could still be
+     * holding one has already run to completion and freed it back. */
+    mempool_destroy(ac_prot_add_pool);
+    mempool_destroy(ac_prot_release_pool);
     pr_info("unloaded\n");
 }
 

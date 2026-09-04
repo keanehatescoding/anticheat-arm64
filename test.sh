@@ -149,7 +149,7 @@ kill -9 "$SPAWNTEST_PID" 2>/dev/null
 wait "$SPAWNTEST_PID" 2>/dev/null
 SPAWNTEST_PID=""
 
-say "registry migration: leader thread exits, worker lives on (ac_replace_prot_task)"
+say "registry survives leader-only exit: mm-keyed entry needs no migration (#62)"
 coproc MIGTEST { ./test/thread_exit_migration_test; }
 read -r _ MAIN_TID <&"${MIGTEST[0]}"
 read -r _ WORKER_TID <&"${MIGTEST[0]}"
@@ -157,7 +157,7 @@ if [ -n "$MAIN_TID" ] && [ -n "$WORKER_TID" ]; then
     # Baseline: confirm an attach to the worker actually succeeds before
     # protection is in place. Without this, an unrelated strace failure
     # (e.g. rc=127 for a missing binary) would be indistinguishable from a
-    # real denial in the post-migration check below and silently pass it.
+    # real denial in the post-exit check below and silently pass it.
     # A successful attach to a live, unprotected process doesn't return on
     # its own -- strace stays attached tracing until the target exits -- so
     # `timeout` kills it and rc=124 is the expected (not a failure) result
@@ -166,7 +166,7 @@ if [ -n "$MAIN_TID" ] && [ -n "$WORKER_TID" ]; then
     timeout 3 strace -p "$WORKER_TID" -e trace=none >/dev/null 2>&1
     baseline_rc=$?
     if [ "$baseline_rc" -ne 0 ] && [ "$baseline_rc" -ne 124 ]; then
-        bad "ptrace baseline attach to worker tid $WORKER_TID failed before protection (rc=$baseline_rc); skipping migration ptrace-denial check"
+        bad "ptrace baseline attach to worker tid $WORKER_TID failed before protection (rc=$baseline_rc); skipping leader-exit ptrace-denial check"
     fi
 
     if ./anticheat protect --pid "$MAIN_TID" >/dev/null; then
@@ -177,37 +177,43 @@ if [ -n "$MAIN_TID" ] && [ -n "$WORKER_TID" ]; then
 
     # unblock the leader thread now that protection is in place; it calls
     # pthread_exit() (not exit()/exit_group()), so only it exits while the
-    # worker thread -- and the process -- keep running.
+    # worker thread -- and the process's mm -- keep running.
     echo go >&"${MIGTEST[1]}"
     sleep 0.5
 
+    # The registry is keyed by mm_struct, not task_struct (#62): the
+    # leader thread exiting doesn't touch the shared mm at all, so the
+    # entry just stays exactly as it was -- still listed under MAIN_TID,
+    # the pid it was registered under, never re-pointed at WORKER_TID.
+    # There's no migration event to observe any more; the only thing
+    # worth asserting here is that protection didn't silently disappear.
     LISTED=$(./anticheat list)
-    if printf '%s' "$LISTED" | grep -q "$WORKER_TID"; then
-        ok "registry entry migrated to worker tid $WORKER_TID after leader exited"
+    if printf '%s' "$LISTED" | grep -q "$MAIN_TID"; then
+        ok "registry entry still listed under leader tid $MAIN_TID after it exited (no migration needed)"
     else
-        bad "registry entry did not migrate to the live worker (list: $LISTED)"
+        bad "registry entry disappeared after leader-only exit (list: $LISTED)"
     fi
 
     if [ "$baseline_rc" -eq 0 ] || [ "$baseline_rc" -eq 124 ]; then
         timeout 3 strace -p "$WORKER_TID" -e trace=none >/dev/null 2>&1
         rc=$?
         if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
-            ok "ptrace attach to migrated (worker) thread still denied (rc=$rc)"
+            ok "ptrace attach to surviving worker thread still denied (rc=$rc)"
         else
-            bad "protection lost after migration (rc=$rc; 124 = hung attached)"
+            bad "protection lost after leader exit (rc=$rc; 124 = hung attached)"
         fi
     fi
 
-    # DEL_PROC must match by thread group: unprotecting via whichever pid
-    # is currently listed (the migrated worker tid, not the original
-    # leader pid) must actually clear the entry.
+    # DEL_PROC resolves by mm, not by exact pid: unprotecting via the
+    # worker's tid (a thread that was never itself named at protect time)
+    # must still clear the one entry covering their shared mm.
     if ./anticheat unprotect --pid "$WORKER_TID" >/dev/null; then
-        ok "unprotect via migrated pid succeeded"
+        ok "unprotect via a sibling (non-registered) tid succeeded"
     else
-        bad "unprotect via migrated pid"
+        bad "unprotect via a sibling tid"
     fi
     sleep 0.2
-    if ./anticheat list | grep -q "$WORKER_TID"; then
+    if ./anticheat list | grep -q "$MAIN_TID"; then
         bad "still listed as protected after unprotect"
     else
         ok "no longer listed as protected after unprotect"
