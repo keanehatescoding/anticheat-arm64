@@ -59,6 +59,7 @@
 #include <linux/version.h>
 #include <linux/timekeeping.h>
 #include <linux/workqueue.h>
+#include <linux/mempool.h>
 #include <linux/cred.h>
 #include <linux/capability.h>
 #include <linux/ptrace.h>
@@ -82,6 +83,24 @@ static void ac_emit(unsigned int type, int pid, const char *comm,
  * declared this early since it queues work from kprobe/kretprobe context
  * too, for the same reason ac_schedule_kill() does. */
 static struct workqueue_struct *ac_wq;
+
+/* Backing pools for the two deferred-work request structs allocated from
+ * kprobe/kretprobe (atomic) context: struct ac_prot_add_req (fork-inherit/
+ * exec-rekey registration, further down) and struct ac_prot_release_req
+ * (mmu_notifier cleanup for an organically-exited mm, in the registry
+ * section below). A plain kmalloc(GFP_ATOMIC) there can fail under memory
+ * pressure -- silently dropping either request isn't just a missed event:
+ * dropping an add/rekey leaves a should-be-protected mm unregistered
+ * (ptrace/process_vm defenses would let an attacker through), and dropping
+ * a release leaks the slot's mmu_notifier registration and its mm_count
+ * reference permanently. mempool_alloc() falls back to a small pre-reserved
+ * pool instead of returning NULL there, the standard kernel pattern for
+ * atomic-context allocations that must not fail. Sized to AC_PROT_MAX: that
+ * many concurrent in-flight requests already implies as many address
+ * spaces are mid-transition, which is the same order of magnitude the
+ * registry itself is bounded to. */
+static mempool_t *ac_prot_add_pool;
+static mempool_t *ac_prot_release_pool;
 
 /* ------------------------------------------------------------------ */
 /* safe kernel reads                                                   */
@@ -815,7 +834,7 @@ static void ac_prot_release_worker(struct work_struct *w)
     spin_lock_irqsave(&ac_prot_lock, flags);
     r->e->removing = false;
     spin_unlock_irqrestore(&ac_prot_lock, flags);
-    kfree(r);
+    mempool_free(r, ac_prot_release_pool);
 }
 
 /* ->release() is invoked either by exit_mmap() when mm_users hits zero
@@ -877,13 +896,16 @@ static void ac_mmu_release(struct mmu_notifier *subscription,
 
     ac_emit(AC_EV_EXIT, pid, comm, "protected process exited");
 
-    r = kmalloc(sizeof(*r), GFP_ATOMIC);
+    /* mempool-backed, same reasoning as ac_schedule_prot_add_req() -- a
+     * plain kmalloc(GFP_ATOMIC) failure here would leak this slot's
+     * mm_count reference *permanently* (nothing else will ever call
+     * mmu_notifier_unregister() for it, see the comment above
+     * ac_prot_release_worker()) and pin the slot against reuse forever,
+     * so repeated failures could eventually exhaust AC_PROT_MAX. The NULL
+     * check below is defense in depth, not the expected path. */
+    r = mempool_alloc(ac_prot_release_pool, GFP_ATOMIC);
     if (!r) {
-        /* Leaks this slot's mm_count reference (see the comment above
-         * ac_prot_release_worker()) rather than risk sleeping/reentering
-         * here to retry -- vanishingly rare (a single small allocation),
-         * logged so it's at least visible rather than silent. */
-        pr_err("anticheat: OOM deferring mmu_notifier cleanup for exited pid %d (%s); mm leaked\n",
+        pr_err("anticheat: OOM deferring mmu_notifier cleanup for exited pid %d (%s); mm and slot leaked\n",
                pid, comm);
         return;
     }
@@ -1143,6 +1165,28 @@ static bool ac_is_protected_pid(pid_t pid, char *comm_out)
 /* the registry section above for why kprobe/kretprobe-originated        */
 /* add/rekey requests can't call mmu_notifier_register()/_unregister()   */
 /* directly and must hand off to ac_wq instead.                         */
+/*                                                                      */
+/* Known gap (tracked in issue #87, not fixed here): a child's own      */
+/* exec racing ahead of its own not-yet-run fork-inherit request. If a  */
+/* protected process forks and the child execs before                  */
+/* ac_prot_add_worker() has dequeued and run the fork-inherit request   */
+/* ac_clone_ret() queued for it, ac_exec_entry() finds current->mm not  */
+/* yet in ac_prots[] (registration is still pending, not done) and      */
+/* treats the child as unprotected -- it does nothing, rather than      */
+/* redirecting the in-flight request to the child's new post-exec mm.   */
+/* The worker then goes on to register the child's now-orphaned         */
+/* pre-exec mm, which is a mostly harmless no-op (that mm has no live    */
+/* task using it and organically self-releases moments later, via the   */
+/* very mmput() ac_prot_add_worker() itself does once ac_add_prot_mm()   */
+/* returns -- no permanent slot leak), but leaves a real, narrow window  */
+/* where the freshly-exec'd child is NOT actually covered by             */
+/* ptrace/process_vm defenses despite the inherit policy intending it    */
+/* to be. Properly closing this needs a "pending transition" visible to  */
+/* ac_exec_entry() (and ac_is_protected_mm()'s other callers) so an      */
+/* exec racing an in-flight fork/rekey request can redirect it to the    */
+/* live mm instead of racing past it -- a materially bigger change than  */
+/* anything else in this file's mm-keyed registry, deliberately left for */
+/* a follow-up rather than folded into it under time pressure.           */
 /* ------------------------------------------------------------------ */
 struct ac_prot_add_req {
     struct work_struct work;
@@ -1186,7 +1230,7 @@ static void ac_prot_add_worker(struct work_struct *w)
                     r->src_pid, r->src_comm, ret);
     }
     mmput(r->mm);
-    kfree(r);
+    mempool_free(r, ac_prot_add_pool);
 }
 
 static void ac_schedule_prot_add_req(struct mm_struct *mm,
@@ -1195,7 +1239,15 @@ static void ac_schedule_prot_add_req(struct mm_struct *mm,
                                       pid_t src_pid, const char *src_comm,
                                       bool jit_allowed)
 {
-    struct ac_prot_add_req *r = kmalloc(sizeof(*r), GFP_ATOMIC);
+    /* mempool_alloc() with GFP_ATOMIC falls back to ac_prot_add_pool's
+     * pre-reserved elements instead of returning NULL whenever a plain
+     * kmalloc(GFP_ATOMIC) would have -- see the pool's own comment for why
+     * silently dropping this request (leaving a should-be-protected mm
+     * unregistered) isn't acceptable here. The NULL check below is
+     * defense in depth, not the expected path: it can in principle still
+     * fail if more than AC_PROT_MAX requests are simultaneously
+     * outstanding *and* the underlying allocator is also failing. */
+    struct ac_prot_add_req *r = mempool_alloc(ac_prot_add_pool, GFP_ATOMIC);
 
     if (!r) {
         mmput_async(mm);
@@ -1538,16 +1590,27 @@ static struct kretprobe ac_kp_clone = {
  * false "protected process exited" for a process that's still running.
  * current->vfork_done is non-NULL for exactly the duration of that
  * borrowed-mm window (set at clone time, cleared by mm_release()), so
- * detecting it here and doing nothing is what keeps the parent's entry
- * untouched -- ac_clone_ret() already decided at clone time that this
- * shared period needs no registry work of its own, and that decision
- * must hold until current gets its own independent mm. This does mean a
- * vfork()'d child of a protected process doesn't itself inherit
- * protection across its exec the way a plain fork()+exec() child would;
- * closing that gap needs the exec path to know the *parent's* identity
- * rather than blindly trusting current->mm, which is out of scope here. */
+ * detecting it here and never touching old_mm/d->old_mm is what keeps the
+ * parent's entry untouched -- ac_clone_ret() already decided at clone time
+ * that this shared period needs no registry work of its own, and that
+ * decision must hold until current gets its own independent mm.
+ *
+ * That still leaves the vfork child itself needing to inherit protection
+ * across its own exec, the same as a plain fork()+exec() child already
+ * does -- current->real_parent is exactly who that inheritance decision
+ * should be attributed to, and it's safe to read without extra locking
+ * here specifically because current->vfork_done being set guarantees the
+ * parent is synchronously blocked waiting on this exec/exit, so it can't
+ * be concurrently reaped or reparented out from under us. The entry
+ * itself is queued the same way ac_clone_ret() queues a fork-inherit
+ * add -- a fresh registration for the new mm, not a rekey -- since there
+ * was never an old_mm entry belonging to current to remove. */
 struct ac_exec_entry_data {
     struct mm_struct *old_mm;
+    bool vfork_inherit;
+    bool jit_allowed;              /* only meaningful if vfork_inherit */
+    pid_t parent_pid;
+    char parent_comm[AC_MAX_COMM];
 };
 
 static int ac_exec_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
@@ -1555,8 +1618,17 @@ static int ac_exec_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
     struct ac_exec_entry_data *d = (struct ac_exec_entry_data *)ri->data;
 
     d->old_mm = NULL;
-    if (current->vfork_done)
+    d->vfork_inherit = false;
+    if (current->vfork_done) {
+        if (current->mm && ac_is_protected_mm(current->mm)) {
+            d->vfork_inherit = true;
+            d->jit_allowed = ac_prot_jit_allowed_mm(current->mm);
+            d->parent_pid = current->real_parent->pid;
+            strscpy(d->parent_comm, current->real_parent->comm,
+                    sizeof(d->parent_comm));
+        }
         return 0;
+    }
     if (current->mm && ac_is_protected_mm(current->mm)) {
         d->old_mm = current->mm;
         mmget(d->old_mm);
@@ -1577,6 +1649,18 @@ static int ac_exec_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
     struct ac_exec_entry_data *d = (struct ac_exec_entry_data *)ri->data;
     long rc = (long)regs_return_value(regs);
     struct mm_struct *new_mm;
+
+    if (d->vfork_inherit) {
+        if (rc != 0)
+            return 0;   /* exec failed: still sharing the parent's mm,
+                          * which the parent's own entry keeps covering */
+        new_mm = get_task_mm(current);
+        if (!new_mm)
+            return 0;   /* shouldn't happen on a successful exec */
+        ac_schedule_prot_add(new_mm, current->pid, current->comm,
+                              d->parent_pid, d->parent_comm, d->jit_allowed);
+        return 0;
+    }
 
     if (!d->old_mm)
         return 0;
@@ -2417,6 +2501,20 @@ static int __init ac_init(void)
     if (!ac_wq)
         return -ENOMEM;
 
+    ac_prot_add_pool = mempool_create_kmalloc_pool(AC_PROT_MAX,
+                                                    sizeof(struct ac_prot_add_req));
+    if (!ac_prot_add_pool) {
+        destroy_workqueue(ac_wq);
+        return -ENOMEM;
+    }
+    ac_prot_release_pool = mempool_create_kmalloc_pool(AC_PROT_MAX,
+                                                        sizeof(struct ac_prot_release_req));
+    if (!ac_prot_release_pool) {
+        mempool_destroy(ac_prot_add_pool);
+        destroy_workqueue(ac_wq);
+        return -ENOMEM;
+    }
+
     ac_resolve_text_bounds();
     if (ac_verbose)
         pr_info("text bounds: stext=0x%lx etext=0x%lx\n", ac_stext, ac_etext);
@@ -2440,6 +2538,8 @@ static int __init ac_init(void)
          * work; drain it before tearing the workqueue down (see the same
          * reasoning in ac_exit() below). */
         flush_workqueue(ac_wq);
+        mempool_destroy(ac_prot_release_pool);
+        mempool_destroy(ac_prot_add_pool);
         destroy_workqueue(ac_wq);
         return ret;
     }
@@ -2470,6 +2570,12 @@ static void __exit ac_exit(void)
      * once more here to catch exactly that. */
     flush_workqueue(ac_wq);
     destroy_workqueue(ac_wq);
+    /* Safe only now: mempool_destroy() requires every element already
+     * returned, and the two flush_workqueue() calls above guarantee every
+     * ac_prot_add_worker()/ac_prot_release_worker() that could still be
+     * holding one has already run to completion and freed it back. */
+    mempool_destroy(ac_prot_add_pool);
+    mempool_destroy(ac_prot_release_pool);
     pr_info("unloaded\n");
 }
 
