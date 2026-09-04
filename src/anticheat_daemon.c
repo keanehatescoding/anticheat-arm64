@@ -2592,6 +2592,7 @@ static void ac_scan_implicit_layer_dir(const char *dir,
         char path[PATH_MAX];
         size_t namelen = strlen(de->d_name);
         int fd;
+        struct stat st;
         char *buf;
         ssize_t n;
         struct ac_implicit_layer *layer;
@@ -2599,9 +2600,38 @@ static void ac_scan_implicit_layer_dir(const char *dir,
         if (namelen < 5 || strcmp(de->d_name + namelen - 5, ".json") != 0)
             continue;
         snprintf(path, sizeof(path), "%s/%s", dir, de->d_name);
-        fd = open(path, O_RDONLY);
+        /* Fix #97: two of the scanned directories live under the target
+         * process's own home directory (attacker-writable). A `.json`-named
+         * FIFO with no writer would hang a plain O_RDONLY open() forever,
+         * stalling the periodic scan -- so open O_NONBLOCK (open returns
+         * immediately on FIFOs) then fstat()/S_ISREG() to reject anything
+         * that isn't a regular file (FIFO, socket, device) before reading.
+         * Deliberately no O_NOFOLLOW: the Vulkan loader itself follows
+         * symlinks, so skipping symlinked manifests would make a
+         * `evil.json -> payload.json` symlink invisible to this scan while
+         * still loaded by the real loader -- a scan-evasion blind spot
+         * worse than the low-severity symlink-read it would prevent
+         * (a symlinked root-readable non-JSON file fails closed in the
+         * json_extract below with no read-back channel to the attacker).
+         * Following symlinks keeps detection parity with the loader; the
+         * FIFO/special-file risk holds through a symlink too and is still
+         * closed by the S_ISREG gate below. */
+        fd = open(path, O_RDONLY | O_NONBLOCK);
         if (fd < 0)
             continue;
+        if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+            close(fd);
+            continue;
+        }
+        /* O_NONBLOCK was only needed to make the FIFO-with-no-writer
+         * open() return instead of blocking; a regular file reads the
+         * same either way, but clear it so the subsequent read() has
+         * plain blocking semantics. */
+        {
+            int fl = fcntl(fd, F_GETFL);
+            if (fl >= 0)
+                (void)fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+        }
         buf = malloc(AC_MANIFEST_MAX_BYTES);
         if (!buf) {
             close(fd);
@@ -3020,6 +3050,79 @@ struct ac_resolved_addr {
     struct sockaddr_storage addr;
 };
 
+/* Fix #98: the forked DNS-resolve child below never exec()s, so every fd
+ * the daemon holds at fork time (log file, /dev/anticheat handle,
+ * ac_server sockets, ...) would otherwise be inherited into a process
+ * that only needs its result pipe -- where glibc's NSS plugin chain
+ * inside getaddrinfo() could reach them. Close everything above stdio
+ * except keep_fd before resolving: close_range() first (kernel-side,
+ * no ceiling, O(n) in the kernel), then /proc/self/fd enumeration
+ * (complete regardless of fd numbers), then an uncapped
+ * sysconf(_SC_OPEN_MAX) sweep as a last resort for no-/proc + pre-5.9
+ * kernels. No artificial cap: a capped sweep could leave a high-numbered
+ * inherited fd (e.g. 9000) open and reachable by NSS code. */
+static void ac_close_extra_fds(int keep_fd)
+{
+#ifdef __linux__
+    /* close_range(2): close [first, last] in one syscall. Split around
+     * keep_fd so the result pipe survives. On success both halves are
+     * done -- return without touching /proc at all. On ENOSYS (pre-5.9
+     * kernel) or any other error, fall through to the portable paths. */
+    if (keep_fd <= 2) {
+        if (close_range(3, ~0U, 0) == 0)
+            return;
+    } else {
+        int r1 = 0, r2 = 0;
+
+        if (keep_fd > 3)
+            r1 = close_range(3, (unsigned int)keep_fd - 1, 0);
+        r2 = close_range((unsigned int)keep_fd + 1, ~0U, 0);
+        if (r1 == 0 && r2 == 0)
+            return;
+    }
+#endif
+    {
+        DIR *d = opendir("/proc/self/fd");
+
+        if (d) {
+            int dir_fd = dirfd(d);
+            struct dirent *de;
+
+            while ((de = readdir(d)) != NULL) {
+                char *end;
+                long fd;
+
+                if (de->d_name[0] == '.')
+                    continue;
+                fd = strtol(de->d_name, &end, 10);
+                if (*end != '\0')
+                    continue;
+                if (fd <= 2 || fd == keep_fd || fd == dir_fd)
+                    continue;
+                close((int)fd);
+            }
+            closedir(d);
+            return;
+        }
+    }
+    {
+        /* Last resort: /proc unavailable and close_range missing/failed.
+         * Sweep the real descriptor table size -- no cap, so a high fd
+         * can't survive. Slow for huge RLIMIT_NOFILE, but this path only
+         * runs on pre-5.9 kernels without /proc mounted. */
+        long maxfd = sysconf(_SC_OPEN_MAX);
+        long fd;
+
+        if (maxfd < 0)
+            maxfd = 1024;
+        for (fd = 3; fd < maxfd; fd++) {
+            if (fd == keep_fd)
+                continue;
+            close((int)fd);
+        }
+    }
+}
+
 /* getaddrinfo() has no built-in timeout: against a slow or blackholed DNS
  * path it can block for the resolver's own timeout, which runs well past
  * AC_REPORT_TIMEOUT_SEC. ac_report() runs synchronously in the daemon's
@@ -3057,9 +3160,10 @@ static int ac_resolve_timeout(const char *host, const char *port,
          * fd is held). This child only needs the write end of its own
          * pipe; drop the rest before doing anything else so a resolve
          * triggered mid-scan doesn't leave a second, redundant reference
-         * to the device alive in a second process. */
-        if (dev_fd >= 0)
-            close(dev_fd);
+         * to the device alive in a second process -- and so NSS plugins
+         * loaded by getaddrinfo() below can't reach the log fd, report
+         * sockets, or any other daemon fd (fix #98). */
+        ac_close_extra_fds(pfd[1]);
         memset(&hints, 0, sizeof(hints));
         hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
@@ -3165,7 +3269,10 @@ static void ac_json_escape(const char *in, char *out, size_t outsz)
 /* /etc/machine-id is the standard systemd-provided stable-per-install
  * identifier; falling back to the hostname keeps reporting useful (if
  * less precise) on a system where it's absent rather than disabling
- * reporting outright. */
+ * reporting outright. The hostname fallback is sanitized to the server's
+ * CLIENT_ID_RE ([A-Za-z0-9._-]{1,128}) so an unusual hostname (spaces,
+ * non-ASCII, quotes) can't get the report rejected with a 400 or corrupt
+ * the JSON body -- fix #96. */
 static void ac_report_client_id(char *out, size_t outsz)
 {
     FILE *f = fopen("/etc/machine-id", "r");
@@ -3183,8 +3290,23 @@ static void ac_report_client_id(char *out, size_t outsz)
         }
         fclose(f);
     }
-    if (gethostname(out, outsz) == 0 && out[0])
+    if (outsz == 0)
         return;
+    if (gethostname(out, outsz) == 0) {
+        char *p;
+
+        out[outsz - 1] = '\0';
+        for (p = out; *p; p++) {
+            unsigned char c = (unsigned char)*p;
+
+            if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                  (c >= '0' && c <= '9') || c == '.' || c == '_' ||
+                  c == '-'))
+                *p = '_';
+        }
+        if (out[0])
+            return;
+    }
     snprintf(out, outsz, "unknown");
 }
 
@@ -3298,7 +3420,7 @@ static void ac_report(const char *event_type, const char *detail)
 {
     const char *url = getenv("AC_REPORT_URL");
     const char *key = getenv("AC_REPORT_KEY");
-    char client_id[128], et_esc[64], detail_esc[600];
+    char client_id[128], client_id_esc[256], et_esc[64], detail_esc[600];
     char body[1024], req[2048], resp[64];
     struct ac_report_dest dest;
     struct ac_resolved_addr addrs[AC_RESOLVE_MAX];
@@ -3313,12 +3435,19 @@ static void ac_report(const char *event_type, const char *detail)
         return;   /* ac_report_parse_url() already logged what's wrong */
 
     ac_report_client_id(client_id, sizeof(client_id));
+    /* Defense in depth for #96: even though ac_report_client_id()
+     * sanitizes the hostname fallback to CLIENT_ID_RE, escape client_id
+     * like the other two fields so no future caller can reintroduce a
+     * JSON-injection path. 256 holds the 127-char max at 2x expansion
+     * (quote/backslash doubling); a control-char-heavy /etc/machine-id
+     * would truncate here, safely, the same way detail already can. */
+    ac_json_escape(client_id, client_id_esc, sizeof(client_id_esc));
     ac_json_escape(event_type, et_esc, sizeof(et_esc));
     ac_json_escape(detail, detail_esc, sizeof(detail_esc));
     snprintf(body, sizeof(body),
              "{\"client_id\":\"%s\",\"event_type\":\"%s\",\"detail\":\"%s\","
              "\"ts\":%lld}",
-             client_id, et_esc, detail_esc, (long long)time(NULL));
+             client_id_esc, et_esc, detail_esc, (long long)time(NULL));
 
     if (dest.is_unix) {
         struct sockaddr_un sun;
