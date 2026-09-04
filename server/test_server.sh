@@ -22,6 +22,7 @@ fail() { printf '  \033[1;31mFAIL\033[0m  %s\n' "$*"; FAIL=1; }
 
 SERVER_PID=""
 RL_SERVER_PID=""
+CAP_SERVER_PID=""
 TERM_SERVER_PID=""
 TERM_KILLER_PID=""
 TP_SERVER_PID=""
@@ -36,6 +37,7 @@ cleanup() {
     chmod 644 "$DB" "$DB-wal" "$DB-shm" 2>/dev/null
     [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
     [ -n "$RL_SERVER_PID" ] && kill "$RL_SERVER_PID" 2>/dev/null
+    [ -n "$CAP_SERVER_PID" ] && kill "$CAP_SERVER_PID" 2>/dev/null
     [ -n "$TERM_SERVER_PID" ] && kill "$TERM_SERVER_PID" 2>/dev/null
     [ -n "$TERM_KILLER_PID" ] && kill "$TERM_KILLER_PID" 2>/dev/null
     [ -n "$TP_SERVER_PID" ] && kill "$TP_SERVER_PID" 2>/dev/null
@@ -44,6 +46,7 @@ cleanup() {
     [ -n "$UNIX_SERVER_PID" ] && kill "$UNIX_SERVER_PID" 2>/dev/null
     wait "$SERVER_PID" 2>/dev/null
     wait "$RL_SERVER_PID" 2>/dev/null
+    wait "$CAP_SERVER_PID" 2>/dev/null
     wait "$TERM_SERVER_PID" 2>/dev/null
     wait "$TERM_KILLER_PID" 2>/dev/null
     wait "$TP_SERVER_PID" 2>/dev/null
@@ -182,6 +185,44 @@ then
     pass "DB and -wal/-shm private (0600) both freshly created and normalized from 0644"
 else
     fail "DB/-wal/-shm permission check failed (see FAIL lines above)"
+fi
+
+# 0c. Store-as-library must not permanently mutate the process-wide umask
+# (#99): set a known permissive umask, construct a Store, then confirm the
+# umask is unchanged and the freshly created DB is still 0600 via the
+# explicit chmod path (not via a leaked umask).
+if python3 - "$$" <<'PYEOF'
+import os
+import sys
+sys.path.insert(0, ".")
+from ac_server import Store
+os.umask(0o022)
+def cur():
+    v = os.umask(0o022)
+    os.umask(v)
+    return v
+path = f"/tmp/ac_server_test_umask_{sys.argv[1]}.db"
+for p in (path, path + "-wal", path + "-shm"):
+    try:
+        os.remove(p)
+    except FileNotFoundError:
+        pass
+Store(path)
+ok = cur() == 0o022
+try:
+    ok = ok and (os.stat(path).st_mode & 0o777) == 0o600
+finally:
+    for p in (path, path + "-wal", path + "-shm"):
+        try:
+            os.remove(p)
+        except FileNotFoundError:
+            pass
+sys.exit(0 if ok else 1)
+PYEOF
+then
+    pass "Store() leaves the process umask unchanged and still creates the DB 0600"
+else
+    fail "Store() mutated the process umask or created a non-0600 DB"
 fi
 
 # 1. report with correct key -> 201
@@ -965,6 +1006,104 @@ else
 fi
 rm -rf "$TPUS_TESTDIR"
 
+# Concurrent-connection cap (#100): a dedicated low-limit instance. Two
+# held-open partial-header connections occupy every slot; a third complete
+# request must be refused fast with 503 (not parked behind the slow ones),
+# and the server must serve normally again once the holders go away.
+CAP_PORT=18810
+CAP_DB="/tmp/ac_server_cap_test_$$.db"
+rm -f "$CAP_DB" "$CAP_DB-wal" "$CAP_DB-shm"
+AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
+    python3 ./ac_server.py --host 127.0.0.1 --port "$CAP_PORT" --db "$CAP_DB" \
+    --rate-limit 1000 --rate-window 60 --max-connections 2 \
+    >/tmp/ac_server_cap_test_$$.log 2>&1 &
+CAP_SERVER_PID=$!
+CAP_BASE="http://127.0.0.1:$CAP_PORT"
+
+CAP_READY=0
+for _ in $(seq 1 50); do
+    if curl -s "$CAP_BASE/banned/x" -H "Authorization: Bearer $ADMIN_KEY" 2>/dev/null \
+        | grep -q '"banned"'; then
+        CAP_READY=1
+        break
+    fi
+    sleep 0.1
+done
+
+if [ "$CAP_READY" -eq 1 ]; then
+    if python3 - "$CAP_PORT" "$ADMIN_KEY" <<'PYEOF'
+import socket
+import sys
+import time
+port = int(sys.argv[1])
+admin_key = sys.argv[2]
+holds = []
+for _ in range(2):
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    # Partial headers, no terminating blank line: the handler thread blocks
+    # waiting for the rest (up to its per-read timeout), holding the slot.
+    s.sendall(
+        b"GET /banned/x HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer "
+        + admin_key.encode() + b"\r\n"
+    )
+    holds.append(s)
+time.sleep(0.5)
+probe = socket.create_connection(("127.0.0.1", port), timeout=5)
+probe.settimeout(5)
+probe.sendall(
+    b"GET /banned/x HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer "
+    + admin_key.encode() + b"\r\nConnection: close\r\n\r\n"
+)
+t0 = time.time()
+try:
+    data = probe.recv(4096)
+except Exception:
+    data = b""
+dt = time.time() - t0
+probe.close()
+for s in holds:
+    s.close()
+# Refused fast (well under the handler's own 10s per-read timeout) with a
+# retryable 503 carrying Retry-After -- not a hang behind the holders.
+ok = b"503" in data and b"Retry-After" in data and dt < 8
+if not ok:
+    sys.stderr.write(f"cap probe: {len(data)} bytes in {dt:.1f}s: {data[:120]!r}\n")
+    sys.exit(1)
+# Slots must be released once the holders go away: poll briefly rather
+# than asserting on a single immediate request, so a slow CI scheduler
+# can't turn a just-freed slot into a false failure.
+import http.client
+ok2 = False
+for _ in range(20):
+    try:
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        c.request("GET", "/banned/x", headers={"Authorization": f"Bearer {admin_key}"})
+        r = c.getresponse()
+        body = r.read()
+        c.close()
+        if r.status == 200 and b"banned" in body:
+            ok2 = True
+            break
+    except Exception:
+        pass
+    time.sleep(0.25)
+if not ok2:
+    sys.stderr.write("cap probe: server did not recover after holders closed\n")
+    sys.exit(1)
+PYEOF
+    then
+        pass "over-cap connection refused fast with 503+Retry-After, server recovers after"
+    else
+        fail "concurrent-connection cap probe failed (see details above)"
+    fi
+else
+    fail "connection-cap test server never became ready on port $CAP_PORT"
+fi
+kill "$CAP_SERVER_PID" 2>/dev/null
+wait "$CAP_SERVER_PID" 2>/dev/null
+CAP_SERVER_PID=""
+rm -f "$CAP_DB" "$CAP_DB-wal" "$CAP_DB-shm" "/tmp/ac_server_cap_test_$$.log"
+
 # Startup-failure paths: no server needed, just exit code + stderr.
 if AC_SERVER_REPORT_KEY='' AC_SERVER_ADMIN_KEY='' python3 ./ac_server.py \
     --port 18804 --db "/tmp/ac_server_nokeys_$$.db" >/tmp/ac_nokeys_$$.log 2>&1; then
@@ -990,6 +1129,15 @@ else
     pass "server refuses to start with --rate-limit 0"
 fi
 rm -f "/tmp/ac_badrl_$$.log"
+
+if AC_SERVER_REPORT_KEY=r AC_SERVER_ADMIN_KEY=a python3 ./ac_server.py \
+    --port 18811 --db "/tmp/ac_server_badcap_$$.db" --max-connections 0 \
+    >/tmp/ac_badcap_$$.log 2>&1; then
+    fail "server should refuse to start with --max-connections 0"
+else
+    pass "server refuses to start with --max-connections 0"
+fi
+rm -f "/tmp/ac_badcap_$$.log"
 
 # an -old key that overlaps the other tier's current key is just as much
 # a tier-separation break as report-key == admin-key -- must be rejected

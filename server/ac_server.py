@@ -112,8 +112,101 @@ def now_ts():
 
 UNIX_CLIENT_ADDRESS = ("unix", 0)
 
+DEFAULT_MAX_CONNECTIONS = 50
 
-class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+
+class BoundedThreadingMixIn(socketserver.ThreadingMixIn):
+    """Cap concurrent handler threads so a burst of slow-trickling
+    connections can't unboundedly grow the thread count (#100).
+
+    ThreadingHTTPServer spawns one OS thread per accepted connection with
+    no cap: each connection already has a per-read `timeout` plus an
+    absolute CONNECTION_DEADLINE_SEC watchdog, but a client opening many
+    connections at once and trickling bytes just under those bounds can
+    still force one thread per connection for the full deadline window.
+    Bounding here also bounds clean-shutdown latency, since
+    daemon_threads=False makes server_close() join every handler thread.
+
+    Rejects excess connections with an immediate 503 + close instead of
+    queueing: queueing in the accept loop would stall legitimate clients
+    behind attacker-held slots, and the daemon client already retries
+    report POSTs. The semaphore is per-server-instance (created in
+    __init__, before any accept loop runs), so separate test instances
+    in the same process don't share a budget."""
+
+    def __init__(self, *args, max_connections=DEFAULT_MAX_CONNECTIONS,
+                 **kwargs):
+        self._conn_semaphore = threading.Semaphore(max_connections)
+        self.max_connections = max_connections
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        # Non-blocking: never park the accept loop behind attacker-held
+        # slots. An accepted-but-unhandled connection still holds its fd,
+        # so prompt close (not a wait with timeout) is what actually
+        # bounds fd/thread pressure under a many-connection burst.
+        if not self._conn_semaphore.acquire(blocking=False):
+            self._reject_overloaded(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            # ThreadingMixIn.process_request() spawns a thread and start()
+            # itself can raise (thread/resource limit): then
+            # process_request_thread() never runs, so its finally-release
+            # never fires. Release here and re-raise so the caller's
+            # handle_error/shutdown_request path still runs -- otherwise
+            # repeated failures leak the semaphore to zero and every later
+            # connection gets 503 even after load drops.
+            self._conn_semaphore.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            # Released even if finish_request() raises: handle_error() is
+            # inside ThreadingMixIn.process_request_thread, but a bug in
+            # shutdown_request() itself must still not leak a slot forever.
+            self._conn_semaphore.release()
+
+    def _reject_overloaded(self, request):
+        # Best-effort 503 so a legitimate daemon bursting past the cap
+        # gets a retryable signal instead of a bare reset; failures here
+        # (peer already gone, unix-socket edge) just fall through to the
+        # close -- the point is bounding, not the status line.
+        try:
+            body = b'{"error": "server busy"}'
+            request.sendall(
+                b"HTTP/1.1 503 Service Unavailable\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: " + str(len(body)).encode("ascii")
+                + b"\r\nConnection: close\r\nRetry-After: 5\r\n\r\n"
+                + body
+            )
+        except OSError:
+            pass
+        finally:
+            # shutdown(SHUT_WR) before close: closing a socket with unread
+            # request bytes still queued can RST and discard the 503 we
+            # just sent. shutdown_request() does the SHUT_WR-then-close
+            # sequence so the client actually receives the retryable
+            # response.
+            try:
+                self.shutdown_request(request)
+            except OSError:
+                pass
+
+
+class BoundedThreadingHTTPServer(BoundedThreadingMixIn,
+                                 http.server.HTTPServer):
+    """TCP variant of the bounded mixin above -- the direct replacement
+    for http.server.ThreadingHTTPServer at the call site in main()."""
+
+    pass
+
+
+class ThreadingUnixHTTPServer(BoundedThreadingMixIn, http.server.HTTPServer):
     """The --unix-socket transport: same request handling as
     ThreadingHTTPServer, just over an AF_UNIX SOCK_STREAM socket bound to
     a filesystem path instead of a TCP (host, port). http.server.HTTPServer
@@ -238,16 +331,22 @@ class Store:
         # The DB (and its -wal/-shm siblings, recreated on every checkpoint)
         # hold raw report detail text, source IPs, and ban reasons -- private
         # regardless of the launching environment's umask, not just under the
-        # exact systemd unit that happens to set UMask=0077.
-        os.umask(0o077)
-        # The umask above only governs files created from here on -- an
-        # upgrade from a pre-fix deployment can already have a world-
-        # readable DB (and -wal/-shm) on disk that sqlite3.connect() would
-        # otherwise reuse as-is. Normalize any that already exist too.
-        for suffix in ("", "-wal", "-shm"):
-            path = self.db_path + suffix
-            if os.path.exists(path):
-                os.chmod(path, 0o600)
+        # exact systemd unit that happens to set UMask=0077. Deliberately no
+        # os.umask() call here: umask is process-wide with no thread-local or
+        # context-manager scoping in the stdlib, so a constructor that sets it
+        # permanently mutates every future file creation in the importing
+        # process (#99) -- surprising for anything using Store as a library
+        # (tests, admin scripts). The daemon entry point (main() below) sets
+        # a restrictive umask once at startup, before any handler thread
+        # exists, which covers every file SQLite creates afterwards without
+        # racing. A per-_connect() scoped umask would close the later-file
+        # gap for library users too, but umask races process-wide under
+        # ThreadingHTTPServer concurrency, so explicit chmod (per-file,
+        # thread-safe) is used here instead. Normalize any pre-existing
+        # files: an upgrade from a pre-fix deployment can already have a
+        # world-readable DB (and -wal/-shm) on disk that sqlite3.connect()
+        # would otherwise reuse as-is.
+        self._ensure_private()
         # SQLite only ever allows one writer at a time, even in WAL mode --
         # under ThreadingHTTPServer, every write-handling thread opens its
         # own connection and would otherwise all race for that single
@@ -284,6 +383,30 @@ class Store:
         )
         conn.commit()
         conn.close()
+        # Fresh files (or -wal/-shm siblings checkpoint-created above) may
+        # have been created under the importer's own umask when Store is
+        # used as a library (no main() umask in effect) -- lock them down
+        # explicitly so library use still lands at 0600 without touching
+        # the process-wide umask to get there.
+        self._ensure_private()
+
+    def _ensure_private(self):
+        """chmod any existing DB/-wal/-shm files to 0600. Per-file and
+        thread-safe, unlike umask -- safe to call from __init__ (both
+        before table creation for the upgrade case and after, for the
+        fresh-creation-as-library case) and after writes (SQLite can
+        recreate -wal/-shm on any checkpoint, including well after
+        __init__ when Store is used as a library without main()'s umask).
+        A vanishing file between the exists check and the chmod (another
+        thread's connection checkpointing the WAL away) just means there
+        is nothing left to lock down."""
+        for suffix in ("", "-wal", "-shm"):
+            path = self.db_path + suffix
+            if os.path.exists(path):
+                try:
+                    os.chmod(path, 0o600)
+                except FileNotFoundError:
+                    pass
 
     def _connect(self):
         conn = sqlite3.connect(self.db_path, timeout=5)
@@ -307,6 +430,12 @@ class Store:
                         (client_id, client_id, self.max_reports_per_client),
                     )
                 conn.commit()
+                # SQLite may have (re)created -wal/-shm on this write; lock
+                # them down while the connection is still open (they exist
+                # now, not just at __init__ time). Harmless under the daemon
+                # (main()'s umask already made them 0600); what actually
+                # needs it is Store-as-library use with no such umask.
+                self._ensure_private()
             finally:
                 conn.close()
 
@@ -342,6 +471,7 @@ class Store:
                     (client_id, reason, now_ts()),
                 )
                 conn.commit()
+                self._ensure_private()
             finally:
                 conn.close()
 
@@ -351,6 +481,7 @@ class Store:
             try:
                 cur = conn.execute("DELETE FROM bans WHERE client_id = ?", (client_id,))
                 conn.commit()
+                self._ensure_private()
                 return cur.rowcount > 0
             finally:
                 conn.close()
@@ -717,6 +848,15 @@ def main():
         help="rate-limit window in seconds (default: 60)",
     )
     ap.add_argument(
+        "--max-connections",
+        type=int,
+        default=DEFAULT_MAX_CONNECTIONS,
+        help="cap on concurrent connections (handler threads); excess "
+        "connections are refused with an immediate 503 + close instead of "
+        "spawning unbounded threads under a many-slow-connection burst "
+        "(default: %d)" % DEFAULT_MAX_CONNECTIONS,
+    )
+    ap.add_argument(
         "--trust-proxy",
         action="store_true",
         help="trust the last hop of the X-Forwarded-For header as the "
@@ -781,6 +921,10 @@ def main():
         )
         sys.exit(1)
 
+    if args.max_connections <= 0:
+        sys.stderr.write("ac_server: --max-connections must be positive\n")
+        sys.exit(1)
+
     if args.trust_proxy and args.unix_socket:
         # --trust-proxy makes the handler take X-Forwarded-For at face
         # value for rate limiting and source_addr. Over the unix-socket
@@ -796,15 +940,28 @@ def main():
         )
         sys.exit(1)
 
+    # Restrictive umask for the daemon's own lifetime, set once here while
+    # still single-threaded (before Store() creates any file and before the
+    # accept loop spawns handler threads). This is what keeps every file
+    # SQLite creates afterwards -- DB plus -wal/-shm siblings recreated on
+    # every checkpoint -- at 0600 regardless of the launching environment.
+    # It lives here, not in Store.__init__, precisely so importing Store as
+    # a library never mutates the importer's process-wide umask (#99).
+    os.umask(0o077)
     store = Store(args.db, max_reports_per_client=args.max_reports_per_client)
     rate_limiter = RateLimiter(args.rate_limit, args.rate_window)
     handler = make_handler(
         store, report_keys, admin_keys, rate_limiter, args.trust_proxy
     )
     if args.unix_socket:
-        httpd = ThreadingUnixHTTPServer(args.unix_socket, handler)
+        httpd = ThreadingUnixHTTPServer(
+            args.unix_socket, handler, max_connections=args.max_connections
+        )
     else:
-        httpd = http.server.ThreadingHTTPServer((args.host, args.port), handler)
+        httpd = BoundedThreadingHTTPServer(
+            (args.host, args.port), handler,
+            max_connections=args.max_connections,
+        )
     # Drain in-flight requests on shutdown instead of abandoning them.
     # ThreadingHTTPServer defaults daemon_threads=True, under which
     # server_close() below does NOT wait for handler threads still running
