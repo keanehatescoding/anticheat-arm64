@@ -694,9 +694,10 @@ static void ac_commit_events(unsigned int n, u64 removed_before)
  * slot is marked with this sentinel while the lock is dropped for the
  * register() call, to stop a concurrent caller from claiming it too.
  * Never a real mm_struct pointer (kmalloc'd objects are never at this
- * address); every free-slot / dedupe scan below naturally skips it since
- * it's neither NULL nor equal to any real mm pointer -- no special-casing
- * needed anywhere except where it's set/cleared here. */
+ * address); every free-slot scan below naturally skips it since it's
+ * neither NULL nor equal to any real mm pointer. The *dedupe* scan can't
+ * just skip it the same way, though -- see .claiming below -- so it isn't
+ * quite true that no special-casing is needed anywhere else. */
 #define AC_PROT_RESERVED ((struct mm_struct *)1)
 
 struct ac_prot_entry {
@@ -710,6 +711,17 @@ struct ac_prot_entry {
      * be treated as free/reusable just because .mm reads NULL or matches,
      * until that call has actually returned. */
     bool removing;
+    /* Meaningful only while .mm == AC_PROT_RESERVED: the real mm this
+     * slot is mid-registering for. AC_PROT_RESERVED itself carries no mm
+     * identity, so without this a second ac_add_prot_mm() call for the
+     * exact same mm -- e.g. two AC_IOCTL_ADD_PROC calls naming two
+     * threads of one process, or one racing ac_prot_add_worker() after an
+     * exec rekey -- can't see that a registration for it is already in
+     * flight, and claims a second slot: two independent notifier
+     * registrations for one address space, inflating ac_prot_count,
+     * double-listing the pid, and leaving one still registered after
+     * ac_del_prot_mm() stops at its first (and only known) match. */
+    struct mm_struct *claiming;
     char comm[AC_MAX_COMM];
 };
 
@@ -889,7 +901,20 @@ static const struct mmu_notifier_ops ac_mmu_notifier_ops = {
  * call -- this function neither takes nor drops a reference on it) as
  * protected. Must be called from process context: mmu_notifier_register()
  * sleeps (mm->mmap_lock). Dedupes by mm pointer, same shape as the old
- * ac_add_prot_task() but keyed by address space instead of task. */
+ * ac_add_prot_task() but keyed by address space instead of task.
+ *
+ * Two racing calls for the same mm (two AC_IOCTL_ADD_PROC calls naming
+ * different threads of one process, or one racing ac_prot_add_worker()
+ * after an exec rekey) must not both end up claiming a slot: see the
+ * .claiming field's comment for why the dedupe scan checks AC_PROT_RESERVED
+ * slots too, not just fully-registered ones. A slot mid-teardown
+ * (.removing) is deliberately *not* treated as a dedupe match -- reporting
+ * "already protected" for a registration that's about to actually vanish
+ * (ac_del_prot_mm()/ac_clear_protected() completing moments later) would
+ * be a false claim, so this proceeds to register a fresh one instead;
+ * briefly having two independent registrations for the same mm during
+ * that narrow handoff is harmless (the kernel allows it) and self-resolves
+ * once the old one's teardown finishes. */
 static int ac_add_prot_mm(struct mm_struct *mm, pid_t pid, const char *comm,
                            bool jit_allowed)
 {
@@ -901,14 +926,21 @@ static int ac_add_prot_mm(struct mm_struct *mm, pid_t pid, const char *comm,
      * concern about them wasting a registry slot) -- get_task_mm() already
      * returns NULL for one, so every caller here (ac_add_prot_pid(),
      * ac_clone_ret() via ac_schedule_prot_add()) bails out before ever
-     * reaching this function with such a task. No separate PF_KTHREAD
-     * check is needed at the mm layer. */
+     * reaching this task. No separate PF_KTHREAD check is needed at the
+     * mm layer. */
     spin_lock_irqsave(&ac_prot_lock, flags);
     for (i = 0; i < AC_PROT_MAX; i++) {
-        if (ac_prots[i].mm == mm) {
+        if (ac_prots[i].mm == mm && !ac_prots[i].removing) {
             ac_prots[i].jit_allowed = jit_allowed;  /* updatable via re-protect */
             spin_unlock_irqrestore(&ac_prot_lock, flags);
             return 0;                                /* already protected */
+        }
+        if (ac_prots[i].mm == AC_PROT_RESERVED && ac_prots[i].claiming == mm) {
+            /* Another caller is already mid-register for this exact mm;
+             * its registration will cover it once it lands, so don't also
+             * claim a second slot for it. */
+            spin_unlock_irqrestore(&ac_prot_lock, flags);
+            return 0;
         }
         if (!ac_prots[i].mm && !ac_prots[i].removing && slot < 0)
             slot = i;
@@ -918,6 +950,7 @@ static int ac_add_prot_mm(struct mm_struct *mm, pid_t pid, const char *comm,
         return -ENOSPC;
     }
     ac_prots[slot].mm = AC_PROT_RESERVED;
+    ac_prots[slot].claiming = mm;
     spin_unlock_irqrestore(&ac_prot_lock, flags);
 
     /* struct mmu_notifier has no ops parameter of its own -- the caller
