@@ -769,17 +769,63 @@ static struct task_struct *ac_find_task_in_ns_of(pid_t nr, pid_t ref_pid)
     return target;
 }
 
+/* mmu_notifier_register() takes an mm_count reference (mmgrab()) that only
+ * mmu_notifier_unregister() balances (mmdrop(), unconditionally, even if
+ * ->release() already ran) -- calling it is mandatory for every successful
+ * register(), not just a courtesy. ac_del_prot_mm()/ac_clear_protected()
+ * provide that call for the explicit-removal case, but nothing else ever
+ * will for a slot whose mm exited organically: once ac_mmu_release() below
+ * clears e->mm to NULL, no future scan can ever match this slot by mm
+ * pointer again to unregister it. Deferred here via ac_wq, same GFP_ATOMIC/
+ * queue_work() shape as ac_schedule_kill() -- this callback must not call
+ * mmu_notifier_unregister() reentrantly on itself (see ac_mmu_release()'s
+ * own comment), and its calling context isn't guaranteed sleepable. The mm
+ * can't be freed before the worker runs: the very mmgrab() reference this
+ * is balancing is what's keeping mm_count elevated until then. */
+struct ac_prot_release_req {
+    struct work_struct work;
+    struct ac_prot_entry *e;
+    struct mm_struct *mm;
+};
+
+static void ac_prot_release_worker(struct work_struct *w)
+{
+    struct ac_prot_release_req *r =
+        container_of(w, struct ac_prot_release_req, work);
+    unsigned long flags;
+
+    /* ->release() already ran synchronously before this worker was even
+     * queued (that's how we got here), so this call's hlist_unhashed()
+     * check will find it already unhashed and won't re-invoke release() --
+     * it only performs the mdrop() this slot still owes. */
+    mmu_notifier_unregister(&r->e->notifier, r->mm);
+
+    spin_lock_irqsave(&ac_prot_lock, flags);
+    r->e->removing = false;
+    spin_unlock_irqrestore(&ac_prot_lock, flags);
+    kfree(r);
+}
+
 /* ->release() is invoked either by exit_mmap() when mm_users hits zero
  * (the normal "process actually exited" path) or synchronously from
  * within mmu_notifier_unregister() (explicit AC_IOCTL_DEL_PROC / module
- * unload) -- either way this is the one and only place a table slot is
- * cleared, so entry removal can't race itself or be done twice. Must not
- * call mmu_notifier_unregister() from in here (that's the caller's job,
- * or exit_mmap()'s); just drop our own bookkeeping. AC_EV_EXIT is emitted
- * from here rather than a do_exit() hook so it fires exactly once, only
- * when the address space is actually gone -- unlike the old task-keyed
- * registry's ac_exit_pre(), this never fires for a leader-only
- * pthread_exit() while sibling threads (and the mm) are still alive. */
+ * unload / a successful exec-rekey's drop of the old entry) -- either way
+ * this is the one and only place a table slot is cleared, so entry removal
+ * can't race itself or be done twice. Must not call
+ * mmu_notifier_unregister() synchronously from in here for the *organic*
+ * case (that would reenter the generic release path we're already inside
+ * of); see ac_prot_release_worker() for why and how that call still
+ * happens, deferred.
+ *
+ * e->removing, already true here whenever ac_del_prot_mm()/
+ * ac_clear_protected() is the one whose in-flight mmu_notifier_unregister()
+ * call triggered this ->release() synchronously, is exactly the signal
+ * needed to tell that apart from a real organic exit_mmap(): AC_EV_EXIT
+ * must fire only for the latter -- the address space is still alive in
+ * the former case (an operator's unprotect, module unload, or a
+ * protected process re-exec'ing), so "protected process exited" would be
+ * a false claim, and the caller's own in-flight unregister() call already
+ * owes no further deferral (it does the mdrop() itself on return). */
 static void ac_mmu_release(struct mmu_notifier *subscription,
                             struct mm_struct *mm)
 {
@@ -789,18 +835,50 @@ static void ac_mmu_release(struct mmu_notifier *subscription,
     pid_t pid;
     char comm[AC_MAX_COMM];
     bool removed = false;
+    bool caller_initiated = false;
+    struct ac_prot_release_req *r;
 
     spin_lock_irqsave(&ac_prot_lock, flags);
     if (e->mm == mm) {
         pid = e->pid;
         strscpy(comm, e->comm, sizeof(comm));
+        caller_initiated = e->removing;
         e->mm = NULL;
+        if (!caller_initiated)
+            e->removing = true;   /* pins the slot against ac_add_prot_mm()
+                                    * reuse until the deferred worker's
+                                    * unregister() call actually returns */
         ac_prot_count--;
         removed = true;
     }
     spin_unlock_irqrestore(&ac_prot_lock, flags);
-    if (removed)
-        ac_emit(AC_EV_EXIT, pid, comm, "protected process exited");
+    if (!removed)
+        return;
+
+    if (caller_initiated) {
+        /* ac_del_prot_mm()/ac_clear_protected() is already inside its own
+         * mmu_notifier_unregister() call for this exact slot; that call
+         * does the mandatory mmdrop() itself on return, so no further
+         * deferral is needed here. */
+        return;
+    }
+
+    ac_emit(AC_EV_EXIT, pid, comm, "protected process exited");
+
+    r = kmalloc(sizeof(*r), GFP_ATOMIC);
+    if (!r) {
+        /* Leaks this slot's mm_count reference (see the comment above
+         * ac_prot_release_worker()) rather than risk sleeping/reentering
+         * here to retry -- vanishingly rare (a single small allocation),
+         * logged so it's at least visible rather than silent. */
+        pr_err("anticheat: OOM deferring mmu_notifier cleanup for exited pid %d (%s); mm leaked\n",
+               pid, comm);
+        return;
+    }
+    r->e = e;
+    r->mm = mm;
+    INIT_WORK(&r->work, ac_prot_release_worker);
+    queue_work(ac_wq, &r->work);
 }
 
 static const struct mmu_notifier_ops ac_mmu_notifier_ops = {
@@ -1414,7 +1492,27 @@ static struct kretprobe ac_kp_clone = {
  * exec that's after exec_mmap() already installed the new mm, so
  * get_task_mm(current) there returns the *new* one and the rekey can be
  * queued. On a failed exec (nonzero return), current is unchanged and
- * still owns old_mm -- nothing to rekey, just drop the pin. */
+ * still owns old_mm -- nothing to rekey, just drop the pin.
+ *
+ * CLONE_VM without CLONE_THREAD -- vfork(), and therefore posix_spawn()/
+ * system()/popen() on a libc that uses it -- makes current->mm literally
+ * the still-live PARENT's mm_struct pointer until this exec (or an exit)
+ * releases it back via mm_release(). If that shared mm happens to be
+ * protected, that protection belongs to the parent, not to current: an
+ * entry_handler here that pinned it as old_mm would have the ret probe
+ * rekey/remove the PARENT's own live registry entry once this exec
+ * succeeds, permanently dropping the parent's protection and logging a
+ * false "protected process exited" for a process that's still running.
+ * current->vfork_done is non-NULL for exactly the duration of that
+ * borrowed-mm window (set at clone time, cleared by mm_release()), so
+ * detecting it here and doing nothing is what keeps the parent's entry
+ * untouched -- ac_clone_ret() already decided at clone time that this
+ * shared period needs no registry work of its own, and that decision
+ * must hold until current gets its own independent mm. This does mean a
+ * vfork()'d child of a protected process doesn't itself inherit
+ * protection across its exec the way a plain fork()+exec() child would;
+ * closing that gap needs the exec path to know the *parent's* identity
+ * rather than blindly trusting current->mm, which is out of scope here. */
 struct ac_exec_entry_data {
     struct mm_struct *old_mm;
 };
@@ -1424,6 +1522,8 @@ static int ac_exec_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
     struct ac_exec_entry_data *d = (struct ac_exec_entry_data *)ri->data;
 
     d->old_mm = NULL;
+    if (current->vfork_done)
+        return 0;
     if (current->mm && ac_is_protected_mm(current->mm)) {
         d->old_mm = current->mm;
         mmget(d->old_mm);
@@ -2329,6 +2429,13 @@ static void __exit ac_exit(void)
      * drained first. */
     flush_workqueue(ac_wq);
     ac_clear_protected();
+    /* ac_clear_protected() can itself race a genuinely-live protected
+     * process exiting for real at the same moment: ac_mmu_release() would
+     * see the organic (non-caller-initiated) case for that slot and queue
+     * an ac_prot_release_worker() onto ac_wq to finish the mmdrop() it
+     * owes. destroy_workqueue() expects an already-drained queue, so flush
+     * once more here to catch exactly that. */
+    flush_workqueue(ac_wq);
     destroy_workqueue(ac_wq);
     pr_info("unloaded\n");
 }
