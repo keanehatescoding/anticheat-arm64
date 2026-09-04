@@ -1068,17 +1068,20 @@ static void ac_del_prot_mm(struct mm_struct *mm)
  * JIT-marked process's child processes don't generate false anon-exec
  * reports just because the flag reset to false on them.
  *
- * Dedup in ac_add_prot_mm() is by mm pointer, so there's normally exactly
- * one entry per address space -- but AC_IOCTL_ADD_PROC resolves its pid
- * via a plain PIDTYPE_PID lookup, not necessarily the thread-group leader,
- * and two concurrent ADD_PROC calls naming different tids of the same
- * still-registering process can each pass ac_add_prot_mm()'s dedupe check
- * before either has finished registering (see the AC_PROT_RESERVED
- * window), leaving two entries for one mm. AND-reduce across every
- * matching entry, same as the old task-keyed ac_task_jit_allowed(): the
- * mm is jit_allowed only if *every* entry for it agrees, failing toward
- * the safer (more likely to report) state rather than depending on scan
- * order. */
+ * Dedup in ac_add_prot_mm() is by mm pointer, so there's exactly one entry
+ * per address space in the steady state, and a concurrent ADD_PROC racing
+ * an in-flight register for the same mm no longer creates a second one
+ * either (see the .claiming field's comment). The one remaining source of
+ * a transient duplicate is narrower: ac_add_prot_mm() deliberately doesn't
+ * treat a slot mid-teardown (.removing) as a dedupe match, so a fresh
+ * AC_IOCTL_ADD_PROC racing an in-flight ac_del_prot_mm()/
+ * ac_clear_protected() for the same mm can briefly leave two entries for
+ * it until the old one's teardown finishes (see ac_add_prot_mm()'s own
+ * comment). AND-reduce across every matching entry, same as the old
+ * task-keyed ac_task_jit_allowed(): the mm is jit_allowed only if *every*
+ * entry for it agrees, failing toward the safer (more likely to report)
+ * state rather than depending on scan order or which entry wins the
+ * race. */
 static bool ac_prot_jit_allowed_mm(struct mm_struct *mm)
 {
     unsigned long flags;
