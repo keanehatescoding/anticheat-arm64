@@ -214,7 +214,15 @@ echo "== booting via virtme-ng =="
 # arrives, so a cancellation partway through still leaves a real partial
 # log on disk -- see the CONSOLE_LOG assignment above for why that's not
 # just under $WORKDIR.
-vng --run "$KDIR" --memory 3072M --exec "$PAYLOAD" 2>&1 | tee "$CONSOLE_LOG" || true
+#
+# --arch aarch64, always: this is now an ARM64-only tree (see the KARCH
+# block above), so the kernel just built under $KDIR is always an arm64
+# tree regardless of host. vng infers the target arch from the *host*
+# machine when --arch is omitted, not from the kernel tree it's handed --
+# confirmed against a real run on an x86_64 runner, where the omission
+# made it try (and fail: "cannot find qemu for x86_64") to boot with
+# qemu-system-x86_64, which this script never installs.
+vng --arch aarch64 --run "$KDIR" --memory 3072M --exec "$PAYLOAD" 2>&1 | tee "$CONSOLE_LOG" || true
 
 if ! grep -q "AC_KASAN_BOOT: payload complete" "$CONSOLE_LOG"; then
     echo "FAIL: payload never reported completion -- boot, insmod, or the in-VM script likely crashed/hung before finishing. See $CONSOLE_LOG." >&2
