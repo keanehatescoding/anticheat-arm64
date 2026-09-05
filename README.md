@@ -729,10 +729,13 @@ see the architecture-abstraction block in `src/anticheat_module.c`), CI
 builds and tests both `ARCH=x86_64` and `ARCH=arm64` kernel trees, and
 the userspace daemon builds for both (its one x86-only piece, the CPUID
 hypervisor bit in `vmcheck`, compiles to a stub on ARM64 where the
-architecture-independent DMI/SMBIOS check still applies). ARM64 support
-has had compile-level CI coverage plus x86-64 live testing, but not yet
-the same live-kernel soak testing the x86-64 path has — treat it as
-supported-but-newer, and file bugs with `dmesg` output as usual
+architecture-independent DMI/SMBIOS check still applies). ARM64 has been
+cross-compiled against ARM64 6.12 headers (zero warnings, `file` confirms
+`ARM aarch64`, all 12 `__arm64_sys_*`/`__arm64_compat_sys_*` probe symbols
+present with no x86 leftovers) and its daemon unit tests plus the full
+mock suite run green under `qemu-aarch64` — but live-kernel testing so far
+is x86-64 only, so treat ARM64 as supported-but-newer, and file bugs with
+`dmesg` output as usual
 (see `TROUBLESHOOTING.md`).
 
 Requires a C compiler for the userspace daemon. The kernel module additionally
