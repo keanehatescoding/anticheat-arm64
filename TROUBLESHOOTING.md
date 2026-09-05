@@ -32,13 +32,11 @@ before the backtrace.
 **A kprobe path specifically implicated** (all `pr_fmt`-prefixed, all in
 `src/anticheat_module.c`):
 
-- `ac_ptrace_pre` — the native/compat `ptrace` kprobe (`__x64_sys_ptrace`/
-  `__ia32_sys_ptrace`-family on x86-64, `__arm64_sys_ptrace`/
-  `__arm64_compat_sys_ptrace` on ARM64)
+- `ac_ptrace_pre` — the native/compat `ptrace` kprobe
+  (`__arm64_sys_ptrace`/`__arm64_compat_sys_ptrace`)
 - `ac_exit_pre` — the `do_exit` kprobe
 - `ac_exec_pre` — the native/compat `execve`/`execveat` kprobes
-  (`__x64_sys_execve`/`__x64_sys_execveat`-family on x86-64,
-  `__arm64_sys_execve`/`__arm64_sys_execveat`-family on ARM64)
+  (`__arm64_sys_execve`/`__arm64_sys_execveat` and their compat twins)
 - `ac_clone_ret` — the `kernel_clone` kretprobe (fork/exec inheritance)
 - `ac_kill_worker` — the deferred `SIGKILL` of a ptrace offender, running
   in the `anticheat` workqueue rather than kprobe context (the only thing

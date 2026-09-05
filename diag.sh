@@ -67,7 +67,7 @@ echo "== syscalls =="
 
 echo
 echo "== kallsyms cross-check (root) =="
-grep -E " (__x64_sys_read|__x64_sys_write|__arm64_sys_read|__arm64_sys_write|sys_call_table)$" /proc/kallsyms
+grep -E " (__arm64_sys_read|__arm64_sys_write|sys_call_table)$" /proc/kallsyms
 
 echo
 echo "== dmesg: after load (discovery diagnostics) =="

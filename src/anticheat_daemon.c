@@ -37,7 +37,7 @@
  *   scan --pid N --check-implicit-layers   implicit Vulkan-layer manifest check (heuristic)
  *   syscalls               verify syscall table integrity
  *   modules                list modules + detect hidden modules
- *   vmcheck                VM/hypervisor detection (heuristic, CPUID + DMI)
+ *   vmcheck                VM/hypervisor detection (heuristic, DMI)
  *   events [--watch]       dump pending security events (--watch: poll)
  *   lock | unlock          pin / unpin the kernel module
  *   start [--foreground]   monitoring daemon (poll events + periodic checks)
@@ -59,12 +59,6 @@
 #include <time.h>
 #include <dirent.h>
 #include <ctype.h>
-/* <cpuid.h> (and the __cpuid() intrinsic) only exist on x86; the
- * hypervisor-bit check below is compiled out on other architectures
- * (see detect_hypervisor_cpuid()), where the DMI check still applies. */
-#if defined(__x86_64__) || defined(__i386__)
-#include <cpuid.h>
-#endif
 #include <elf.h>
 #include <netdb.h>
 #include <poll.h>
@@ -908,8 +902,8 @@ static int baseline_save_record(const char *blpath, unsigned long long inode,
  * doesn't carry one), -1 on any parse/read/bounds failure. Every
  * failure is inconclusive, never a positive detection -- a malformed or
  * unexpected-shape ELF file is a skip, same as an unreadable one.
- * x86-64 and AArch64 Linux are both ELFCLASS64 / little-endian, so this
- * parses either architecture's libraries unchanged. */
+ * AArch64 Linux is ELFCLASS64 / little-endian, so this parses native
+ * libraries unchanged. */
 static int elf_find_symbol_offset(int fd, const char *symbol, uint64_t *offset_out,
                                    uint64_t *size_out)
 {
@@ -1700,14 +1694,14 @@ static int cmd_modules(void)
 /* ------------------------------------------------------------------ */
 /* command: vmcheck                                                    */
 /* ------------------------------------------------------------------ */
-/* Two independent, purely-userspace signals that the OS itself (not any
- * specific process) is running inside a virtual machine. Neither needs
- * the kernel module or any elevated privilege: CPUID and
- * /sys/class/dmi/id/ files both already return the real, authoritative
- * hardware/firmware answer to any process on the machine, so routing
- * this through anticheat_module.c would add ioctl surface for no
- * security benefit -- same reasoning as the LD_PRELOAD/Vulkan-layer
- * checks above, which are also pure userspace reads.
+/* A purely-userspace signal that the OS itself (not any specific
+ * process) is running inside a virtual machine: the DMI/SMBIOS strings
+ * under /sys/class/dmi/id/, which already return the real,
+ * authoritative firmware answer to any process on the machine, so
+ * routing this through anticheat_module.c would add ioctl surface for
+ * no security benefit -- same reasoning as the LD_PRELOAD/Vulkan-layer
+ * checks above, which are also pure userspace reads. (AArch64 has no
+ * CPUID-style hypervisor signal, so this check is DMI-only.)
  *
  * Heuristic like those checks too: running in a VM is completely normal
  * for plenty of legitimate reasons (cloud gaming, CI, testing,
@@ -1716,54 +1710,10 @@ static int cmd_modules(void)
  * LOG_WARNING/LOG_INFO, never LOG_ALERT/LOG_CRIT.
  *
  * Known, unavoidable limitation: a hypervisor can be explicitly
- * configured to hide the CPUID leaf below (VMware's
- * "hypervisor.cpuid.v0 = FALSE", VirtualBox's equivalent, KVM/QEMU CPUID
- * masking) and to override the DMI strings below (QEMU's -smbios flag).
- * That defeats both checks here -- a property of the technique itself,
+ * configured to override the DMI strings below (QEMU's -smbios flag).
+ * That defeats the check -- a property of the technique itself,
  * not a bug to fix (see THREAT_MODEL.md's "Explicitly out of scope").
  */
-
-/* CPUID leaf 1, ECX bit 31: the standard "running under a hypervisor"
- * signal essentially every hypervisor sets by default. __cpuid() (not
- * the leaf-range-checked __get_cpuid()) is used deliberately -- leaf
- * 0x40000000 below is a hypervisor-reserved leaf, not a standard one,
- * and __get_cpuid() would refuse to read past whatever leaf 0 reports
- * as the max standard leaf. Returns 1 if the bit is set (and fills
- * vendor_out with the 12-char vendor ID string from leaf 0x40000000,
- * only architecturally defined once the presence bit is set), 0
- * otherwise. x86 only: AArch64 has no architectural hypervisor-present
- * bit, so this check is compiled to a stub there and `vmcheck` rests on
- * the DMI/SMBIOS check below (which is architecture-independent). */
-static int detect_hypervisor_cpuid(char *vendor_out, size_t outsz)
-{
-#if !defined(__x86_64__) && !defined(__i386__)
-    if (vendor_out && outsz)
-        vendor_out[0] = '\0';
-    return 0;
-#else
-    unsigned int eax, ebx, ecx, edx;
-
-    if (vendor_out && outsz)
-        vendor_out[0] = '\0';
-
-    __cpuid(1, eax, ebx, ecx, edx);
-    if (!(ecx & (1u << 31)))
-        return 0;
-
-    /* "KVMKVMKVM\0\0\0", "VMwareVMware", "VBoxVBoxVBox", "Microsoft Hv",
-     * "XenVMMXenVMM", "TCGTCGTCGTCG" (QEMU's own software CPU
-     * emulation, distinct from KVM-accelerated QEMU), "prl hyperv  "
-     * (Parallels), "bhyve bhyve " are the known real-world values. */
-    if (vendor_out && outsz >= 13) {
-        __cpuid(0x40000000, eax, ebx, ecx, edx);
-        memcpy(vendor_out + 0, &ebx, 4);
-        memcpy(vendor_out + 4, &ecx, 4);
-        memcpy(vendor_out + 8, &edx, 4);
-        vendor_out[12] = '\0';
-    }
-    return 1;
-#endif
-}
 
 static int read_dmi_field(const char *name, char *out, size_t outsz)
 {
@@ -1787,9 +1737,7 @@ static int read_dmi_field(const char *name, char *out, size_t outsz)
     return 0;
 }
 
-/* Corroborating signal, not authoritative on its own: catches a
- * hypervisor that masks the CPUID leaf above but leaves default
- * BIOS/DMI strings in place. sys_vendor/product_name/board_vendor are
+/* DMI/SMBIOS-string check: sys_vendor/product_name/board_vendor are
  * typically world-readable (unlike product_uuid/serial_number, which
  * are root-only and deliberately not read here -- nothing here needs
  * them); a permission or read failure just leaves that field empty
@@ -1855,34 +1803,23 @@ static int detect_hypervisor_dmi(char *out, size_t outsz)
 
 static int cmd_vmcheck(void)
 {
-    char cpuid_vendor[16];
     char dmi_desc[192];
-    int cpuid_hit, dmi_hit;
+    int dmi_hit;
 
-    cpuid_hit = detect_hypervisor_cpuid(cpuid_vendor, sizeof(cpuid_vendor));
     dmi_hit = detect_hypervisor_dmi(dmi_desc, sizeof(dmi_desc));
 
     printf("VM/hypervisor check:\n");
-#if !defined(__x86_64__) && !defined(__i386__)
-    printf("  CPUID hypervisor bit : not applicable on this architecture "
-           "(x86 only)\n");
-#else
-    if (cpuid_hit)
-        printf("  CPUID hypervisor bit : present (vendor id: %s)\n", cpuid_vendor);
-    else
-        printf("  CPUID hypervisor bit : not present\n");
-#endif
     if (dmi_hit)
         printf("  DMI/SMBIOS strings   : %s\n", dmi_desc);
     else
         printf("  DMI/SMBIOS strings   : no known VM vendor string found\n");
 
-    if (cpuid_hit || dmi_hit) {
+    if (dmi_hit) {
         printf("  result               : running inside a virtual machine\n"
                "    (informational only -- common for entirely legitimate\n"
                "     reasons: cloud gaming, CI, testing, GPU-passthrough\n"
                "     streaming rigs. Not a verdict -- and not something a\n"
-               "     hypervisor configured to hide these signatures would\n"
+               "     hypervisor configured to hide this signature would\n"
                "     even show here. See THREAT_MODEL.md.)\n");
     } else {
         printf("  result               : no hypervisor detected\n");
@@ -3779,20 +3716,14 @@ static int cmd_start(int argc, char **argv)
          * hidden modules can. LOG_WARNING/LOG_INFO only, deliberately
          * never LOG_ALERT/LOG_CRIT -- see cmd_vmcheck()'s own comment
          * block for why this must never auto-feed the ban pipeline. */
-        char cpuid_vendor[16];
         char dmi_desc[192];
-        int cpuid_hit = detect_hypervisor_cpuid(cpuid_vendor, sizeof(cpuid_vendor));
         int dmi_hit = detect_hypervisor_dmi(dmi_desc, sizeof(dmi_desc));
 
-        if (cpuid_hit)
-            logmsg(LOG_WARNING, "running inside a virtual machine "
-                   "(CPUID vendor id: %s%s%s) -- informational, not a verdict",
-                   cpuid_vendor, dmi_hit ? "; " : "", dmi_hit ? dmi_desc : "");
-        else if (dmi_hit)
+        if (dmi_hit)
             logmsg(LOG_WARNING, "running inside a virtual machine "
                    "(%s) -- informational, not a verdict", dmi_desc);
         else
-            logmsg(LOG_INFO, "no hypervisor detected (CPUID/DMI checks)");
+            logmsg(LOG_INFO, "no hypervisor detected (DMI check)");
     }
     {
         time_t next_sys = 0, next_mod = 0, next_scan = 0, next_baseline = 0;

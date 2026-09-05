@@ -35,9 +35,9 @@ userspace daemon/CLI that talks to it over a small ioctl interface
 
 1. **Syscall table discovery + integrity.** The module locates
    `sys_call_table` without `kallsyms_lookup_name` (not exported since 5.7):
-   it resolves the read/write syscall handler addresses with kprobes
-   (`__x64_sys_read`/`__x64_sys_write` on x86-64,
-   `__arm64_sys_read`/`__arm64_sys_write` on ARM64), then scans the kernel
+   it resolves the `__arm64_sys_read`/`__arm64_sys_write` handler addresses
+   with kprobes, then scans the kernel image for the 8-byte slot equal to
+   the read
    handler and cross-validates with the write handler. Every table entry is
    then checked to lie inside the core kernel text (`[_stext, _etext)`) and
    outside any loaded module — the classic rootkit hook (redirecting a
@@ -60,9 +60,8 @@ userspace daemon/CLI that talks to it over a small ioctl interface
    reuse). **Protection is inherited by forked children** (tracked with a
    kretprobe on `kernel_clone`).
 
-4. **ptrace denial.** A kprobe on the native `ptrace` syscall wrapper (plus
-   the 32-bit compat entry: `__x64_sys_ptrace`/`__ia32_compat_sys_ptrace` on
-   x86-64, `__arm64_sys_ptrace`/`__arm64_compat_sys_ptrace` on ARM64)
+4. **ptrace denial.** A kprobe on `__arm64_sys_ptrace` (plus the 32-bit
+   compat entry `__arm64_compat_sys_ptrace`)
    intercepts attach/debug requests against protected processes. The request
    argument is rewritten to an invalid value, so the syscall fails cleanly
    with `-EIO` and has **no side effects** (the attach never happens). Per
@@ -76,11 +75,10 @@ userspace daemon/CLI that talks to it over a small ioctl interface
    process's memory, and the same kill policy applies.
 
 5. **Fork / exec / exit tracing.** kretprobe on `kernel_clone` (inheritance +
-   events), kprobe pre-handlers on `do_exit` and the native/compat `execve`[at]
-   wrappers (`__x64_sys_execve[at]`/`__ia32_compat_sys_execve[at]` on x86-64,
-   `__arm64_sys_execve[at]`/`__arm64_compat_sys_execve[at]` on ARM64;
-   execve/execveat have distinct compat syscall definitions, so the 32-bit
-   syscall table entry is the compat wrapper, not the generic stub). Fork inheritance and exec tracing
+   events), kprobe pre-handlers on `do_exit` and `__arm64_sys_execve[at]`/
+   `__arm64_compat_sys_execve[at]` (execve/execveat have distinct compat
+   syscall definitions, so the 32-bit syscall table entry is the compat
+   wrapper, not the generic stub). Fork inheritance and exec tracing
    key off thread-group membership, not the exact registered `task_struct`,
    so a worker thread of a protected process that calls `fork()`/`execve()`
    is covered too.
@@ -433,35 +431,16 @@ above, whether the OS is virtualized is a fact about the machine as a
 whole that can't change mid-session, so `cmd_start()` runs it once at
 startup and logs the result rather than polling it on a timer.
 
-Two independent, purely userspace signals, needing no kernel module
-involvement at all — CPUID and `/sys/class/dmi/id/` both already return
-the real, authoritative hardware/firmware answer to any process on the
-machine, so routing this through `anticheat_module.c` would add ioctl
-surface for no security benefit:
+A purely userspace signal, needing no kernel module involvement at
+all — the DMI/SMBIOS strings under `/sys/class/dmi/id/` already return
+the real, authoritative firmware answer to any process on the machine,
+so routing this through `anticheat_module.c` would add ioctl surface for
+no security benefit. (AArch64 has no CPUID-style hypervisor signal, so
+there is no CPUID leg here — DMI only. The x86-64 side, including its
+CPUID check, lives in the sibling `anticheat_x86-64` repo.)
 
-- **CPUID hypervisor-present bit** (leaf 1, ECX bit 31, x86 only —
-  AArch64 has no architectural hypervisor-present bit, so on ARM64
-  `vmcheck` reports this signal as not applicable and rests on the DMI
-  check below) — the standard
-  signal essentially every hypervisor sets by default. If set, leaf
-  `0x40000000`'s EBX/ECX/EDX (only architecturally defined once the
-  presence bit is set) give a 12-character vendor ID string identifying
-  which one — `KVMKVMKVM\0\0\0`, `VMwareVMware`, `VBoxVBoxVBox`,
-  `Microsoft Hv`, `XenVMMXenVMM`, `TCGTCGTCGTCG` (QEMU's own software CPU
-  emulation, distinct from KVM-accelerated QEMU), `prl hyperv␠␠`
-  (Parallels), `bhyve bhyve␠` (where `␠` denotes an ASCII space — spaces
-  are part of these vendor ID strings, but literal trailing spaces
-  inside a code span are stripped/ambiguous in Markdown rendering).
-  `__cpuid()` is used rather than the leaf-range-checked
-  `__get_cpuid()` deliberately — leaf `0x40000000` is
-  a hypervisor-reserved leaf, not a standard one, and the checked
-  function would refuse to read past whatever leaf 0 reports as the max
-  standard leaf.
 - **DMI/SMBIOS strings** (`sys_vendor`, `product_name`, `board_vendor`
-  under `/sys/class/dmi/id/`, typically world-readable) — a corroborating
-  signal, not authoritative on its own, that also catches a hypervisor
-  that masks the CPUID leaf above but leaves default BIOS/DMI strings in
-  place. `Microsoft Corporation` is matched only in combination with a
+  under `/sys/class/dmi/id/`, typically world-readable). `Microsoft Corporation` is matched only in combination with a
   `product_name` containing `Virtual Machine` (Hyper-V's actual value),
   not on `sys_vendor` alone — real Microsoft Surface hardware also
   reports `sys_vendor=Microsoft Corporation` and would otherwise be a
@@ -477,10 +456,8 @@ startup check log at `LOG_WARNING`/`LOG_INFO`, never `LOG_ALERT`/
 operator without auto-accumulating as a report against a `client_id`).
 
 **Known, unavoidable limitation.** A hypervisor can be explicitly
-configured to hide the CPUID leaf above (VMware's
-`hypervisor.cpuid.v0 = FALSE`, VirtualBox's equivalent, KVM/QEMU CPUID
-masking) and to override the DMI strings above (QEMU's `-smbios` flag).
-That defeats both checks — a property of the technique itself, not a
+configured to override the DMI strings above (QEMU's `-smbios` flag).
+That defeats the check — a property of the technique itself, not a
 bug more engineering closes (see `THREAT_MODEL.md`).
 
 ### Ban-pipeline reporting (server-side)
@@ -722,21 +699,17 @@ STRESS_CONCURRENCY=50 ./server/stress_test.sh` for a longer soak locally.
 
 ## Build
 
-**x86-64 and 64-bit ARM (AArch64) supported.** The kernel module hooks
-the architecture's own syscall-wrapper kprobe symbols (`__x64_sys_*`/
-`__ia32_*` on x86-64, `__arm64_sys_*`/`__arm64_compat_sys_*` on ARM64 —
-see the architecture-abstraction block in `src/anticheat_module.c`), CI
-builds and tests both `ARCH=x86_64` and `ARCH=arm64` kernel trees, and
-the userspace daemon builds for both (its one x86-only piece, the CPUID
-hypervisor bit in `vmcheck`, compiles to a stub on ARM64 where the
-architecture-independent DMI/SMBIOS check still applies). ARM64 has been
-cross-compiled against ARM64 6.12 headers (zero warnings, `file` confirms
-`ARM aarch64`, all 12 `__arm64_sys_*`/`__arm64_compat_sys_*` probe symbols
-present with no x86 leftovers) and its daemon unit tests plus the full
-mock suite run green under `qemu-aarch64` — but live-kernel testing so far
-is x86-64 only, so treat ARM64 as supported-but-newer, and file bugs with
-`dmesg` output as usual
-(see `TROUBLESHOOTING.md`).
+**ARM64 (AArch64) only** — x86-64 lives in the sibling `anticheat_x86-64`
+repo. The kernel module hooks the `__arm64_sys_*`/`__arm64_compat_sys_*`
+kprobe symbols and refuses to build anywhere else (an explicit `#error`
+guard in `src/anticheat_module.c`), CI cross-compiles against `ARCH=arm64`
+kernel trees, and the AUR/Fedora/Debian packages are ARM64-only. The
+userspace daemon itself is portable C, so it builds anywhere for
+development (native `make daemon` works on any Linux host), but releases
+ship the `aarch64` binary. The module has been cross-compiled against
+ARM64 6.12 headers (zero warnings, all 12 probe symbols present) and the
+daemon unit tests plus the full mock suite run green under `qemu-aarch64`;
+file bugs with `dmesg` output as usual (see `TROUBLESHOOTING.md`).
 
 Requires a C compiler for the userspace daemon. The kernel module additionally
 needs kernel headers for a kernel **>= 6.12** (it uses `sized_strscpy`, the
@@ -857,9 +830,8 @@ rather than a real quality bar. Run it locally the same way CI does:
 Needs a Linux host (ideally with `/dev/kvm` — falls back to much slower
 QEMU/TCG software emulation without it), `virtme-ng`
 (`pipx install virtme-ng`, or `pip install virtme-ng` in a venv — recent
-distros mark the system Python as externally-managed), `qemu-system-x86`
-(x86 hosts) or `qemu-system-arm` (ARM hosts — the script picks the
-matching `ARCH=` automatically),
+distros mark the system Python as externally-managed), `qemu-system-aarch64`,
+`aarch64-linux-gnu-gcc` when building on a non-ARM host,
 and the same kernel build deps the `module` CI job uses (`bc flex bison
 libelf-dev libssl-dev dwarves`).
 
@@ -1014,18 +986,11 @@ design).
   window around a known handler — both cover all legitimate handlers.
 - Kernel addresses are KASLR-randomized at boot; kprobe lookups return
   *runtime* addresses, so the table scan uses the live image (no hardcoded
-  vmlinux offsets). On x86-64 with IBT the kprobe reports the ftrace call
-  site (4 bytes after the `endbr64`), while the syscall table stores the
-  symbol start — the module detects `endbr64` (0xf3 0x0f 0x1e 0xfa) and
-  normalizes before scanning. On ARM64 the kprobe reports the function
-  start directly, so no normalization is needed.
-- Syscall-wrapper argument unpacking is per architecture: the
-  `__x64_sys_*`/`__ia32_sys_*` wrappers receive `struct pt_regs *` in
-  `%rdi` and unpack the syscall arguments from that frame (native args in
-  `args->di`/`args->si`, ia32-compat args in `args->bx`/`args->cx`), while
-  the `__arm64_sys_*`/`__arm64_compat_sys_*` wrappers receive it in `x0`
-  (`regs->regs[0]`) with both native and compat args in
-  `args->regs[0]`/`args->regs[1]`. Either way, the ptrace/process_vm
+  vmlinux offsets).
+- The `__arm64_sys_*`/`__arm64_compat_sys_*` wrappers receive
+  `struct pt_regs *` in `x0` (`regs->regs[0]`) and unpack the syscall
+  arguments from that frame (both native and compat args in
+  `args->regs[0]`/`args->regs[1]`). The ptrace/process_vm
   kprobes read/rewrite the request/pid in the frame, not in the kprobe's
   own `regs` (which holds the frame pointer).
 - The module-list walk races with concurrent module load/unload
@@ -1048,9 +1013,7 @@ design).
   device as root, drops all privileges on the same process while keeping
   the fd open, and confirms the next ioctl is rejected with `-EPERM`
   (`sudo ./test.sh` runs it as part of the live suite).
-- ptrace denial works on the standard native/compat `ptrace` entries
-  (`__x64_sys_ptrace`/`__ia32_compat_sys_ptrace` on x86-64,
-  `__arm64_sys_ptrace`/`__arm64_compat_sys_ptrace` on ARM64);
+- ptrace denial works on `__arm64_sys_ptrace`/`__arm64_compat_sys_ptrace`;
   `process_vm_readv`/`process_vm_writev`
   are covered too, via their
   own native/compat kprobes (see "ptrace denial" above). A cheat reaching
@@ -1095,10 +1058,9 @@ design).
   does not stop `SIGKILL` from a root-privileged attacker — nothing in this
   design can, without a much larger effort to hide/harden the daemon process
   itself, which brings its own detection-evasion tradeoffs.
-- `vmcheck`'s CPUID/DMI hypervisor detection can be defeated outright by a
-  hypervisor deliberately configured to hide both signatures (VMware's
-  `hypervisor.cpuid.v0 = FALSE`, VirtualBox's equivalent, KVM/QEMU CPUID
-  masking, and QEMU's `-smbios` flag for the DMI side) — a fundamental
+- `vmcheck`'s DMI hypervisor detection can be defeated outright by a
+  hypervisor deliberately configured to hide the signature (QEMU's
+  `-smbios` flag) — a fundamental
   limit of any hypervisor-presence check, not a gap more engineering
   closes.
 

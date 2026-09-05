@@ -20,6 +20,18 @@ jobs:
       - name: Build with warnings-as-errors, run the full mock suite
         run: make ci
 
+      # The userspace daemon is portable C, but this project ships it for
+      # ARM64 -- prove the target-arch build compiles with warnings-as-
+      # errors too (the module job below does the same for the daemon
+      # alongside the LKM; this keeps the failure attribution in the
+      # userspace job where it belongs).
+      - name: Cross-build the daemon for aarch64 (compile check)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+          make CC=aarch64-linux-gnu-gcc CFLAGS="-O2 -Wall -Wextra -Werror" daemon
+          file anticheat | grep -q 'aarch64\|ARM aarch64'
+
       - name: Build the privilege-drop test helper (compile check only)
         run: make CFLAGS="-O2 -Wall -Wextra -Werror" priv-drop-test
 
@@ -86,8 +98,18 @@ jobs:
   # prepares a linux-6.12 LTS source tree with defconfig and builds the LKM
   # against it, so the build is deterministic and independent of the runner's
   # own (older) kernel headers.
+  # --- kernel module: cross-compile against a pinned ARM64 tree ---
+  # The module is ARM64-only (the #error guard in src/anticheat_module.c
+  # rejects any other target) and the runners are x86_64, so every
+  # kernel-tree step here cross-compiles (ARCH=arm64,
+  # CROSS_COMPILE=aarch64-linux-gnu-). CI prepares a linux-6.12 LTS source
+  # tree with defconfig and builds the LKM against it, so the build is
+  # deterministic and independent of the runner's own (older, wrong-arch)
+  # kernel headers. Compile-only: no DKMS/signing run (DKMS targets the
+  # installing machine's own kernel at install time, not a cross tree --
+  # see scripts/dkms-install.sh).
   module:
-    name: kernel module build (linux-6.12 headers)
+    name: kernel module cross-build (linux-6.12 arm64 headers)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -96,9 +118,9 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq bc flex bison libelf-dev libssl-dev dwarves
+          sudo apt-get install -y -qq bc flex bison libelf-dev libssl-dev dwarves gcc-aarch64-linux-gnu sparse
 
-      - name: Fetch and prepare kernel headers (6.12 LTS, x86_64)
+      - name: Fetch and prepare kernel headers (6.12 LTS, arm64)
         run: |
           # --retry-all-errors: a plain `curl -fsSL | tar -xJ` pipe seen
           # failing in practice with a mid-stream HTTP/2 PROTOCOL_ERROR
@@ -115,33 +137,14 @@ jobs:
             https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.tar.xz
           tar -xJf linux-6.12.tar.xz
           rm -f linux-6.12.tar.xz
-          make -C linux-6.12 ARCH=x86_64 defconfig
-          # defconfig alone leaves module signing off, so modules_prepare
-          # below never builds scripts/sign-file -- the DKMS build +
-          # signing smoke test step further down needs that tool; without
-          # it DKMS silently skips signing and that step's own
-          # `grep -q sig_id` assertion fails.
-          #
-          # MODULE_SIG_HASH has no prompt of its own -- it's a plain
-          # `string` symbol whose value is derived entirely from which
-          # MODULE_SIG_SHA* boolean choice is enabled (see kernel/module/
-          # Kconfig). Setting it directly via --set-val looked like it
-          # worked, but olddefconfig recomputes it from the choice on the
-          # next line and silently discards the forced value -- verified
-          # against a real build: it landed on sha1 (this kernel's
-          # apparent choice default), not sha256, even though the .config
-          # line briefly said otherwise. Enable the actual choice symbol
-          # instead so the derived value is stable under olddefconfig.
-          ./linux-6.12/scripts/config --file linux-6.12/.config \
-            --enable MODULE_SIG \
-            --enable MODULE_SIG_SHA256
-          make -C linux-6.12 ARCH=x86_64 olddefconfig
-          grep -qx 'CONFIG_MODULE_SIG_SHA256=y' linux-6.12/.config
-          grep -qx 'CONFIG_MODULE_SIG_HASH="sha256"' linux-6.12/.config
-          make -C linux-6.12 ARCH=x86_64 scripts
-          make -C linux-6.12 ARCH=x86_64 modules_prepare
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          make -C linux-6.12 defconfig
+          make -C linux-6.12 olddefconfig
+          make -C linux-6.12 scripts
+          make -C linux-6.12 modules_prepare
 
-      - name: Build the LKM
+      - name: Cross-build the LKM
         run: |
           # First pass compiles the module; the final modpost link fails only
           # because the prepared tree has no Module.symvers.  Synthesize one
@@ -151,9 +154,9 @@ jobs:
           #
           # Read the object list from the Makefile's own anticheat-objs
           # rather than hardcoding it here a second time -- src/sha256.o
-          # (added for #63) calling memcpy() is exactly the kind of
-          # newly-linked-in undefined symbol a hardcoded, stale list here
-          # would silently drop from ksymvers and fail modpost on.
+          # calling memcpy() is exactly the kind of newly-linked-in
+          # undefined symbol a hardcoded, stale list here would silently
+          # drop from ksymvers and fail modpost on.
           #
           # nm printing more than one file at once inserts a "path:"
           # header line per file into the stream; NF==2 keeps only real
@@ -163,6 +166,8 @@ jobs:
           # there was only ever one object here happily let through as a
           # symbol-less entry -- and modpost's dump-file parser rejects
           # that outright with "parse error in symbol dump file".
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
           make KDIR="$PWD/linux-6.12" module 2>&1 | tail -3 || true
           objs="$(grep '^anticheat-objs' Makefile | cut -d= -f2)"
           nm -u $objs | awk 'NF==2 {print $2}' | sort -u | \
@@ -170,6 +175,7 @@ jobs:
             > "$PWD/ksymvers"
           make KDIR="$PWD/linux-6.12" KBUILD_EXTRA_SYMBOLS="$PWD/ksymvers" module
           test -s anticheat.ko
+          file anticheat.ko | grep -q 'aarch64\|ARM aarch64'
           modinfo ./anticheat.ko | head -6
 
       - name: Upload module artifact
@@ -181,8 +187,8 @@ jobs:
 
       # --- static analysis (sparse) ---
       # Kbuild has first-class sparse support built in (C=1/C=2), so this
-      # needs no custom integration -- just the tool and a re-invocation
-      # of the same build with checking turned on. C=2 (not C=1) is used
+      # needs no custom integration -- just a re-invocation of the same
+      # cross-build with checking turned on. C=2 (not C=1) is used
       # deliberately: C=1 only re-checks files Kbuild decides need
       # recompiling, and anticheat_module.o was already built to
       # completion by the step above; C=2 forces sparse over every file
@@ -192,14 +198,13 @@ jobs:
       # C=2/CF= flags alone are enough for Kbuild's .cmd dependency
       # tracking to recompile the object under sparse this time).
       #
-      # Fails the job on any finding. The first run against this module
-      # (before this comment existed) came back completely clean -- zero
-      # warnings across the whole ~1400 lines of hand-rolled kprobe/
-      # syscall-table code -- so there's a real, verified-clean baseline
-      # to hold, not a guess that one exists.
+      # Fails the job on any finding. The last full run against this
+      # module came back completely clean, so there's a real,
+      # verified-clean baseline to hold, not a guess that one exists.
       - name: Static analysis (sparse)
         run: |
-          sudo apt-get install -y -qq sparse
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
           make KDIR="$PWD/linux-6.12" KBUILD_EXTRA_SYMBOLS="$PWD/ksymvers" \
             C=2 CF="-D__CHECK_ENDIAN__" module 2>&1 | tee sparse.log
           if grep -qE '(warning|error):' sparse.log; then
@@ -222,116 +227,6 @@ jobs:
           name: sparse-log
           path: sparse.log
           if-no-files-found: error
-
-      # --- DKMS path: exercises dkms.conf + Secure Boot signing end to end ---
-      # This is the same packaging a player's machine actually uses (see
-      # scripts/dkms-install.sh), not just a raw `make module`. It reuses
-      # the already-prepared 6.12 tree above instead of the runner's own
-      # kernel, since DKMS always targets a specific kernel version's
-      # module tree and the runner's live kernel has no matching headers.
-      - name: DKMS build + signing smoke test
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq dkms
-
-          # Read from dkms.conf rather than hardcoding "1.0.0" here: unlike
-          # release.yml's check-version job, nothing else in this workflow
-          # would catch this drifting from dkms.conf's own PACKAGE_VERSION
-          # if it's ever bumped without updating this step too.
-          PKG_VER="$(awk -F'"' '/^PACKAGE_VERSION=/{print $2}' dkms.conf)"
-
-          # Point DKMS at the prepared tree via a synthetic version + a
-          # /lib/modules/<ver>/build symlink -- the same shape a real
-          # kernel-postinst hook sees for a just-installed, not-yet-booted
-          # kernel.
-          KVER="$(make -s -C linux-6.12 kernelversion)-ci"
-          sudo mkdir -p "/lib/modules/${KVER}"
-          sudo ln -sf "$PWD/linux-6.12" "/lib/modules/${KVER}/build"
-
-          # Same setup scripts/dkms-install.sh does: a system-wide
-          # framework.conf.d fragment pointing DKMS's built-in signing at a
-          # key it will self-generate, plus the parent directory it won't
-          # create on its own. (DKMS ignores MOK_SIGNING_KEY/MOK_CERTIFICATE
-          # if set directly in dkms.conf -- verified against a real build;
-          # only the system-wide framework.conf(.d) path actually wires up
-          # signing. See the note in dkms.conf.)
-          sudo install -d -m 0700 /var/lib/anticheat/mok
-          sudo install -d -m 0755 /etc/dkms/framework.conf.d
-          printf 'mok_signing_key="/var/lib/anticheat/mok/mok.priv"\nmok_certificate="/var/lib/anticheat/mok/mok.der"\n' \
-            | sudo tee /etc/dkms/framework.conf.d/anticheat.conf >/dev/null
-
-          sudo mkdir -p "/usr/src/anticheat-${PKG_VER}"
-          sudo cp -a Makefile dkms.conf src "/usr/src/anticheat-${PKG_VER}/"
-
-          sudo dkms add -m anticheat -v "$PKG_VER"
-
-          # Same undefined-symbol workaround as the manual build above: the
-          # prepared-but-never-linked tree has no Module.symvers.
-          sudo env KBUILD_EXTRA_SYMBOLS="$PWD/ksymvers" \
-            dkms build -m anticheat -v "$PKG_VER" -k "$KVER"
-
-          sudo dkms status -m anticheat
-          built_ko="$(find "/var/lib/dkms/anticheat/${PKG_VER}/${KVER}" \
-            -name 'anticheat.ko' -print -quit)"
-          test -n "$built_ko" && test -s "$built_ko"
-          # sig_id alone only proves *some* signature was applied, not
-          # which hash -- check sig_hashalgo too, the actual built-module
-          # confirmation that the sha256 requested in .config (checked
-          # earlier, before the build) is what really got used.
-          modinfo_out="$(modinfo "$built_ko" | tee /dev/stderr)"
-          printf '%s' "$modinfo_out" | grep -q '^sig_id:\s*PKCS#7$'
-          printf '%s' "$modinfo_out" | grep -q '^sig_hashalgo:\s*sha256$'
-
-  # --- kernel module: ARM64 cross-compile smoke test ---
-  # Same 6.12 floor kernel as the x86_64 module job above, but prepared
-  # for arm64 and built with the aarch64 cross toolchain -- proves the
-  # CONFIG_ARM64 paths in src/anticheat_module.c (syscall-wrapper symbol
-  # names, pt_regs argument unpacking) actually compile. Compile-only:
-  # no DKMS/signing run (that targets the runner's own x86_64 kernel)
-  # and no sparse pass (kept on the native job).
-  module-arm64:
-    name: kernel module cross-build (linux-6.12 arm64 headers)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install toolchain
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq bc flex bison libelf-dev libssl-dev dwarves gcc-aarch64-linux-gnu
-
-      - name: Fetch and prepare kernel headers (6.12 LTS, arm64)
-        run: |
-          # Same download-to-a-file-with-retries shape as the x86_64 job
-          # above -- see its comment for why this isn't piped straight
-          # into tar.
-          curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors \
-            -o linux-6.12.tar.xz \
-            https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.tar.xz
-          tar -xJf linux-6.12.tar.xz
-          rm -f linux-6.12.tar.xz
-          make -C linux-6.12 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
-          make -C linux-6.12 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
-          make -C linux-6.12 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- scripts
-          make -C linux-6.12 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_prepare
-
-      - name: Cross-build the LKM for arm64
-        run: |
-          # Same synthesized-Module.symvers workaround as the x86_64 job:
-          # the prepared tree was never linked, so modpost needs a symbol
-          # list to link against. The object list is read from the
-          # Makefile's own anticheat-objs, not hardcoded here.
-          export ARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          make KDIR="$PWD/linux-6.12" module 2>&1 | tail -3 || true
-          objs="$(grep '^anticheat-objs' Makefile | cut -d= -f2)"
-          nm -u $objs | awk 'NF==2 {print $2}' | sort -u | \
-            awk '{printf "0x00000000\t%s\tvmlinux\tEXPORT_SYMBOL\t\n", $1}' \
-            > "$PWD/ksymvers"
-          make KDIR="$PWD/linux-6.12" KBUILD_EXTRA_SYMBOLS="$PWD/ksymvers" module
-          test -s anticheat.ko
-          file anticheat.ko | grep -q 'aarch64\|ARM aarch64'
 
       - name: Cross-build the daemon for aarch64 (compile check)
         run: |
@@ -407,7 +302,7 @@ jobs:
       - name: Install kernel build deps, QEMU, and virtme-ng
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq bc flex bison libelf-dev libssl-dev dwarves qemu-system-x86
+          sudo apt-get install -y -qq bc flex bison libelf-dev libssl-dev dwarves qemu-system-aarch64 gcc-aarch64-linux-gnu
           # pipx, not pip: recent Ubuntu images mark the system Python as
           # externally-managed (PEP 668), so a plain `pip install --user`
           # fails outright; pipx is GitHub's own documented workaround for

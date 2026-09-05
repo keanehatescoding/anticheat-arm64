@@ -42,8 +42,8 @@ rebuilt independently):
   the `mokutil --import` command for you to run manually. See
   `%description dkms` in the spec.
 
-`x86-64` and 64-bit ARM (`ExclusiveArch: x86_64 aarch64`) — see README.md's "Build" section
-for why.
+ARM64 only (`ExclusiveArch: aarch64`) — see README.md's "Build" section
+for why (x86-64 lives in the sibling `anticheat_x86-64` repo).
 
 ## Not yet verified
 
@@ -52,9 +52,9 @@ machine — see `packaging/aur/README.md`), this spec has **not** been run
 through a real `rpmbuild`/`rpmlint`/`dnf install` cycle — none of
 `rpmbuild`, `rpmlint`, or `rpmdevtools` were available in the environment
 this was authored in. Before relying on this for a real install, build it
-and check `rpmlint ~/rpmbuild/RPMS/x86_64/hypranticheat*.rpm` comes back
+and check `rpmlint ~/rpmbuild/RPMS/aarch64/hypranticheat*.rpm` comes back
 clean, and run through a real
-`dnf install ~/rpmbuild/RPMS/x86_64/hypranticheat*.rpm` /
+`dnf install ~/rpmbuild/RPMS/aarch64/hypranticheat*.rpm` /
 `dnf remove hypranticheat-dkms` cycle on a disposable VM (the DKMS + MOK
 setup mutates real system state — `/etc/dkms/`, `/var/lib/dkms/`, the
 running kernel's module tree — same reason the AUR README gives for not

@@ -15,13 +15,13 @@ BuildRequires:  gcc
 BuildRequires:  make
 Requires:       glibc
 
-# Supported on x86-64 and 64-bit ARM: the kernel module hooks the
-# architecture's own syscall-wrapper kprobe symbols (see the
-# architecture-abstraction block in src/anticheat_module.c) -- see
-# README.md's "Build" section. ExclusiveArch (rather than just
-# documenting it) makes an accidental %{?dist}-wide rebuild fail loudly
-# instead of shipping a package that can never actually load its module.
-ExclusiveArch:  x86_64 aarch64
+# ARM64 only: the kernel module hooks the __arm64_sys_*/
+# __arm64_compat_sys_* kprobe symbols -- see README.md's "Build"
+# section. (x86-64 lives in the sibling anticheat_x86-64 repo.)
+# ExclusiveArch (rather than just documenting it) makes an
+# accidental %{?dist}-wide rebuild fail loudly instead of shipping a
+# package that can never actually load its module.
+ExclusiveArch:  aarch64
 
 %description
 A Linux kernel-mode anticheat: a loadable kernel module (LKM) performing
@@ -43,7 +43,7 @@ Summary:        Kernel module (DKMS) for a kernel-mode anticheat
 Requires:       dkms >= 3.0
 Requires:       %{name} = %{version}-%{release}
 Provides:       anticheat-dkms
-ExclusiveArch:  x86_64 aarch64
+ExclusiveArch:  aarch64
 
 %description dkms
 Kernel module source for hypranticheat (syscall/module integrity, ptrace

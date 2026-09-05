@@ -13,8 +13,8 @@ dpkg-buildpackage -us -uc -b
 
 (`-us -uc`: don't try to GPG-sign the source/changes files, which needs a
 key most build machines won't have configured. Drop them to sign a real
-release build.) This produces `../hypranticheat_<ver>_amd64.deb` and
-`../hypranticheat-dkms_<ver>_amd64.deb` (`.deb`s land in the parent
+release build.) This produces `../hypranticheat_<ver>_arm64.deb` and
+`../hypranticheat-dkms_<ver>_arm64.deb` (`.deb`s land in the parent
 directory by convention, not `debian/`). Remove the staged `debian/`
 directory afterwards (`rm -rf debian`) so it doesn't get committed by
 accident.

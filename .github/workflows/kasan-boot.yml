@@ -41,7 +41,7 @@ jobs:
       - name: Install kernel build deps, QEMU, and virtme-ng
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq bc flex bison libelf-dev libssl-dev dwarves qemu-system-x86
+          sudo apt-get install -y -qq bc flex bison libelf-dev libssl-dev dwarves qemu-system-aarch64 gcc-aarch64-linux-gnu
           # pipx, not pip: recent Ubuntu images mark the system Python as
           # externally-managed (PEP 668), so a plain `pip install --user`
           # fails outright; pipx is GitHub's own documented workaround for

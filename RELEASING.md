@@ -56,8 +56,7 @@ the same protocol" case this guards against), independent of whatever
    ```
 
 5. The tag push triggers `.github/workflows/release.yml`, which builds
-   the userspace daemon for both supported architectures (packaged as
-   permission-preserving `anticheat-<tag>-x86_64.tar.gz` and
+   the userspace daemon for ARM64 (packaged as a permission-preserving
    `anticheat-<tag>-aarch64.tar.gz` — a bare binary asset doesn't reliably
    keep its executable bit through a GitHub Release download) and
    creates a Release at that tag with both attached — this is the actual

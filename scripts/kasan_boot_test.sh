@@ -18,8 +18,9 @@
 # per-push for exactly that reason: GitHub-hosted runners don't reliably
 # offer /dev/kvm), virtme-ng ("pipx install virtme-ng" -- recent distros
 # mark the system Python as externally-managed, so plain `pip install`
-# outside a venv typically fails), qemu-system-x86 on x86 hosts /
-# qemu-system-arm on ARM hosts, and the usual kernel
+# outside a venv typically fails), qemu-system-aarch64, aarch64-linux-gnu-gcc
+# when building on a non-ARM host (native build needs no cross toolchain),
+# and the usual kernel
 # build deps (bc flex bison libelf-dev libssl-dev dwarves).
 #
 # Run locally: ./scripts/kasan_boot_test.sh
@@ -72,15 +73,19 @@ tar -xJf "$WORKDIR/linux-$KVER.tar.xz" -C "$WORKDIR"
 rm -f "$WORKDIR/linux-$KVER.tar.xz"
 
 echo "== configuring: defconfig + KASAN/lockdep debug fragment =="
-# Architecture-aware: x86_64 on x86 hosts, arm64 on ARM hosts (the module
-# supports both -- see the architecture-abstraction block in
-# src/anticheat_module.c). virtme-ng boots the matching QEMU target for
-# whichever tree this builds.
+# ARM64-only project (x86-64 lives in the sibling anticheat_x86-64
+# repo): always build an arm64 tree. On a non-ARM host that means
+# cross-compiling (needs aarch64-linux-gnu-gcc); natively on ARM64 the
+# empty prefix is a plain native build. Exported so every make below --
+# including the module/daemon builds further down -- inherits it.
+KARCH=arm64
+CROSS_COMPILE=
 case "$(uname -m)" in
-    aarch64|arm64) KARCH=arm64 ;;
-    *)             KARCH=x86_64 ;;
+    aarch64|arm64) ;;
+    *)             CROSS_COMPILE=aarch64-linux-gnu- ;;
 esac
-make -C "$KDIR" ARCH="$KARCH" defconfig
+export ARCH="$KARCH" CROSS_COMPILE
+make -C "$KDIR" defconfig
 
 # Generic KASAN (not SW/HW tags -- this targets a plain QEMU guest with
 # no MTE/tag-capable hardware involved) + full lockdep validation.
@@ -102,7 +107,7 @@ make -C "$KDIR" ARCH="$KARCH" defconfig
     --enable PROVE_LOCKING \
     --enable DEBUG_ATOMIC_SLEEP \
     --set-val FRAME_WARN 0
-make -C "$KDIR" ARCH="$KARCH" olddefconfig
+make -C "$KDIR" olddefconfig
 
 # scripts/config --enable doesn't fail the build if a requested symbol
 # silently didn't stick (e.g. a missing dependency) -- verify explicitly
@@ -116,7 +121,7 @@ for sym in CONFIG_KASAN CONFIG_KASAN_GENERIC CONFIG_LOCKDEP CONFIG_PROVE_LOCKING
 done
 
 echo "== building the kernel (full build, not modules_prepare -- this is slow) =="
-make -C "$KDIR" ARCH="$KARCH" -j"$(nproc)" all
+make -C "$KDIR" -j"$(nproc)" all
 
 echo "== building anticheat.ko against this tree =="
 make -C "$REPO_ROOT" KDIR="$KDIR" module
