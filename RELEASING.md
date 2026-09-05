@@ -56,10 +56,11 @@ the same protocol" case this guards against), independent of whatever
    ```
 
 5. The tag push triggers `.github/workflows/release.yml`, which builds
-   the userspace daemon (packaged as a permission-preserving
-   `anticheat-<tag>-x86_64.tar.gz` — a bare binary asset doesn't reliably
+   the userspace daemon for both supported architectures (packaged as
+   permission-preserving `anticheat-<tag>-x86_64.tar.gz` and
+   `anticheat-<tag>-aarch64.tar.gz` — a bare binary asset doesn't reliably
    keep its executable bit through a GitHub Release download) and
-   creates a Release at that tag with it attached — this is the actual
+   creates a Release at that tag with both attached — this is the actual
    point of tagging a version: CI-built artifacts from a plain push are
    ephemeral (expire, aren't a stable download link); a Release's
    attached assets are permanent.
@@ -77,12 +78,12 @@ the same protocol" case this guards against), independent of whatever
    `scripts/dkms-install.sh`, or the AUR package build a real one
    against the installing machine's own kernel instead.
 6. Sanity-check the published Release before announcing anything:
-   download the daemon archive, `tar -xzf` it, confirm the extracted
+   download each daemon archive, `tar -xzf` it, confirm the extracted
    binary is executable without a manual `chmod`, and run its `--help`/
    `status` against the userspace mock (`make test-mock`-style, doesn't
    need root). This is **not** a substitute for real load-time testing of
    the kernel module on a live kernel — see point 5 above — just a check
-   that the one asset actually shipped isn't obviously broken.
+   that the assets actually shipped aren't obviously broken.
 7. Update the AUR package (`PKGBUILD`) to match:
 
    ```sh

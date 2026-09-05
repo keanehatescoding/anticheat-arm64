@@ -59,8 +59,34 @@ jobs:
           path: anticheat-${{ github.ref_name }}-x86_64.tar.gz
           if-no-files-found: error
 
+  # Same daemon, cross-compiled for 64-bit ARM -- the daemon is plain
+  # userspace C with no x86-only code left (the CPUID check is compiled
+  # out on non-x86; see detect_hypervisor_cpuid()), so this is a real,
+  # runnable aarch64 binary, published alongside the x86_64 one below.
+  build-daemon-aarch64:
+    name: build userspace daemon (aarch64)
+    needs: check-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install cross toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+      - name: Cross-build with warnings-as-errors
+        run: make CC=aarch64-linux-gnu-gcc CFLAGS="-O2 -Wall -Wextra -Werror" daemon
+      - name: Archive with the executable bit preserved
+        # Same reasoning as the x86_64 job above -- permissions only
+        # survive inside an archive, not on a bare asset download.
+        run: tar -czf "anticheat-${GITHUB_REF_NAME}-aarch64.tar.gz" anticheat
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-daemon-aarch64
+          path: anticheat-${{ github.ref_name }}-aarch64.tar.gz
+          if-no-files-found: error
+
   # Same linux-6.12-headers compile-smoke-test build ci.yml's module job
-  # already does on every push -- see that job's own comments for why
+  # (x86_64 flavor) already does on every push -- see that job's own comments for why
   # each step is there (MODULE_SIG_SHA256 vs. olddefconfig, the
   # synthesized Module.symvers workaround). Kept in sync with ci.yml by
   # hand rather than factored into a shared reusable workflow, since
@@ -146,12 +172,12 @@ jobs:
     # Still gated on build-module succeeding (don't ship a release where
     # the module doesn't even compile against the stated floor kernel)
     # even though its artifact isn't one of the published assets below.
-    needs: [build-daemon, build-module]
+    needs: [build-daemon, build-daemon-aarch64, build-module]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Download the daemon archive only
+      - name: Download the daemon archives only
         # Deliberately not build-module's .ko -- see its own upload
         # step's comment for why that artifact isn't fit to publish as
         # a generic downloadable module.
@@ -163,6 +189,13 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-daemon
+          path: release
+
+      - name: Download the aarch64 daemon archive
+        # Same pin reasoning as above.
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-daemon-aarch64
           path: release
 
       - name: Create the release
@@ -181,8 +214,8 @@ jobs:
             `make module`, `scripts/dkms-install.sh`, or the AUR
             package under `packaging/aur/`.
 
-            The daemon archive above preserves its executable bit;
-            extract it with `tar -xzf anticheat-*-x86_64.tar.gz` before
+            The daemon archives above preserve their executable bit;
+            extract the one matching your machine with `tar -xzf anticheat-*-<arch>.tar.gz` before
             running it. See `TROUBLESHOOTING.md` if `insmod` fails on
             the module you build yourself, and `RELEASING.md` for how
             this release's assets were built.

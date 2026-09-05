@@ -18,7 +18,8 @@
 # per-push for exactly that reason: GitHub-hosted runners don't reliably
 # offer /dev/kvm), virtme-ng ("pipx install virtme-ng" -- recent distros
 # mark the system Python as externally-managed, so plain `pip install`
-# outside a venv typically fails), qemu-system-x86, and the usual kernel
+# outside a venv typically fails), qemu-system-x86 on x86 hosts /
+# qemu-system-arm on ARM hosts, and the usual kernel
 # build deps (bc flex bison libelf-dev libssl-dev dwarves).
 #
 # Run locally: ./scripts/kasan_boot_test.sh
@@ -71,10 +72,18 @@ tar -xJf "$WORKDIR/linux-$KVER.tar.xz" -C "$WORKDIR"
 rm -f "$WORKDIR/linux-$KVER.tar.xz"
 
 echo "== configuring: defconfig + KASAN/lockdep debug fragment =="
-make -C "$KDIR" ARCH=x86_64 defconfig
+# Architecture-aware: x86_64 on x86 hosts, arm64 on ARM hosts (the module
+# supports both -- see the architecture-abstraction block in
+# src/anticheat_module.c). virtme-ng boots the matching QEMU target for
+# whichever tree this builds.
+case "$(uname -m)" in
+    aarch64|arm64) KARCH=arm64 ;;
+    *)             KARCH=x86_64 ;;
+esac
+make -C "$KDIR" ARCH="$KARCH" defconfig
 
-# Generic KASAN (not SW/HW tags -- this targets a plain x86_64 QEMU
-# guest, no MTE/tag-capable hardware involved) + full lockdep validation.
+# Generic KASAN (not SW/HW tags -- this targets a plain QEMU guest with
+# no MTE/tag-capable hardware involved) + full lockdep validation.
 # CONFIG_FRAME_WARN=0 because KASAN's redzones legitimately inflate stack
 # frame sizes past the default warning threshold; that's expected
 # instrumentation overhead, not a bug in this module's own code.
@@ -93,7 +102,7 @@ make -C "$KDIR" ARCH=x86_64 defconfig
     --enable PROVE_LOCKING \
     --enable DEBUG_ATOMIC_SLEEP \
     --set-val FRAME_WARN 0
-make -C "$KDIR" ARCH=x86_64 olddefconfig
+make -C "$KDIR" ARCH="$KARCH" olddefconfig
 
 # scripts/config --enable doesn't fail the build if a requested symbol
 # silently didn't stick (e.g. a missing dependency) -- verify explicitly
@@ -107,7 +116,7 @@ for sym in CONFIG_KASAN CONFIG_KASAN_GENERIC CONFIG_LOCKDEP CONFIG_PROVE_LOCKING
 done
 
 echo "== building the kernel (full build, not modules_prepare -- this is slow) =="
-make -C "$KDIR" ARCH=x86_64 -j"$(nproc)" all
+make -C "$KDIR" ARCH="$KARCH" -j"$(nproc)" all
 
 echo "== building anticheat.ko against this tree =="
 make -C "$REPO_ROOT" KDIR="$KDIR" module

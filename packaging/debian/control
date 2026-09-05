@@ -8,7 +8,7 @@ Rules-Requires-Root: no
 Homepage: https://github.com/keanehatescoding/hypranticheat
 
 Package: hypranticheat
-Architecture: amd64
+Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}
 Recommends: hypranticheat-dkms
 Description: userspace daemon/CLI for a kernel-mode anticheat
@@ -23,15 +23,15 @@ Description: userspace daemon/CLI for a kernel-mode anticheat
  without it the daemon can only run against its userspace mock.
 
 Package: hypranticheat-dkms
-Architecture: amd64
+Architecture: any
 Depends: dkms (>= 3.0), ${misc:Depends}
 Provides: anticheat-dkms
 Description: kernel module (DKMS) for a kernel-mode anticheat
  Kernel module source for hypranticheat (syscall/module integrity,
  ptrace denial, RWX/anon-exec detection), registered with DKMS so it is
  rebuilt automatically on every kernel package upgrade. Building it
- needs Linux kernel headers for the running kernel; only x86-64 is
- supported.
+ needs Linux kernel headers for the running kernel; x86-64 and 64-bit
+ ARM (arm64) are supported.
  .
  On install this package also points DKMS's built-in Secure Boot
  signing at a self-generated Machine Owner Key (MOK) under

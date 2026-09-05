@@ -35,8 +35,9 @@ userspace daemon/CLI that talks to it over a small ioctl interface
 
 1. **Syscall table discovery + integrity.** The module locates
    `sys_call_table` without `kallsyms_lookup_name` (not exported since 5.7):
-   it resolves the `__x64_sys_read`/`__x64_sys_write` handler addresses with
-   kprobes, then scans the kernel image for the 8-byte slot equal to the read
+   it resolves the read/write syscall handler addresses with kprobes
+   (`__x64_sys_read`/`__x64_sys_write` on x86-64,
+   `__arm64_sys_read`/`__arm64_sys_write` on ARM64), then scans the kernel
    handler and cross-validates with the write handler. Every table entry is
    then checked to lie inside the core kernel text (`[_stext, _etext)`) and
    outside any loaded module — the classic rootkit hook (redirecting a
@@ -59,7 +60,9 @@ userspace daemon/CLI that talks to it over a small ioctl interface
    reuse). **Protection is inherited by forked children** (tracked with a
    kretprobe on `kernel_clone`).
 
-4. **ptrace denial.** A kprobe on `__x64_sys_ptrace` (and the ia32 entry)
+4. **ptrace denial.** A kprobe on the native `ptrace` syscall wrapper (plus
+   the 32-bit compat entry: `__x64_sys_ptrace`/`__ia32_compat_sys_ptrace` on
+   x86-64, `__arm64_sys_ptrace`/`__arm64_compat_sys_ptrace` on ARM64)
    intercepts attach/debug requests against protected processes. The request
    argument is rewritten to an invalid value, so the syscall fails cleanly
    with `-EIO` and has **no side effects** (the attach never happens). Per
@@ -67,16 +70,17 @@ userspace daemon/CLI that talks to it over a small ioctl interface
    SIGKILLed from a private workqueue (safe from atomic kprobe context).
    `process_vm_readv`/`process_vm_writev` — the standard way to read or
    write another process's memory without ever calling `ptrace(2)` — get
-   the same treatment via their own kprobes (native and ia32 entries): the
+   the same treatment via their own kprobes (native and compat entries): the
    pid argument is rewritten to an invalid value, so the syscall fails
    cleanly with `-ESRCH` before touching a single byte of the protected
    process's memory, and the same kill policy applies.
 
 5. **Fork / exec / exit tracing.** kretprobe on `kernel_clone` (inheritance +
-   events), kprobe pre-handlers on `do_exit` and `__x64_sys_execve[at]`/
-   `__ia32_compat_sys_execve[at]` (execve/execveat have distinct compat
-   syscall definitions, so the ia32 syscall table entry is the compat
-   wrapper, not the generic ia32 stub). Fork inheritance and exec tracing
+   events), kprobe pre-handlers on `do_exit` and the native/compat `execve`[at]
+   wrappers (`__x64_sys_execve[at]`/`__ia32_compat_sys_execve[at]` on x86-64,
+   `__arm64_sys_execve[at]`/`__arm64_compat_sys_execve[at]` on ARM64;
+   execve/execveat have distinct compat syscall definitions, so the 32-bit
+   syscall table entry is the compat wrapper, not the generic stub). Fork inheritance and exec tracing
    key off thread-group membership, not the exact registered `task_struct`,
    so a worker thread of a protected process that calls `fork()`/`execve()`
    is covered too.
@@ -435,7 +439,10 @@ the real, authoritative hardware/firmware answer to any process on the
 machine, so routing this through `anticheat_module.c` would add ioctl
 surface for no security benefit:
 
-- **CPUID hypervisor-present bit** (leaf 1, ECX bit 31) — the standard
+- **CPUID hypervisor-present bit** (leaf 1, ECX bit 31, x86 only —
+  AArch64 has no architectural hypervisor-present bit, so on ARM64
+  `vmcheck` reports this signal as not applicable and rests on the DMI
+  check below) — the standard
   signal essentially every hypervisor sets by default. If set, leaf
   `0x40000000`'s EBX/ECX/EDX (only architecturally defined once the
   presence bit is set) give a 12-character vendor ID string identifying
@@ -715,11 +722,18 @@ STRESS_CONCURRENCY=50 ./server/stress_test.sh` for a longer soak locally.
 
 ## Build
 
-**x86-64 only.** The kernel module hooks `__x64_sys_*`/`__ia32_sys_*` kprobe
-symbols specifically, CI only builds/tests against `ARCH=x86_64` kernel trees,
-and nothing here has been ported or tested on ARM64 or any other
-architecture. This is a stated scope boundary, not an oversight yet to be
-noticed as a bug report — porting is unscoped work (see `THREAT_MODEL.md`).
+**x86-64 and 64-bit ARM (AArch64) supported.** The kernel module hooks
+the architecture's own syscall-wrapper kprobe symbols (`__x64_sys_*`/
+`__ia32_*` on x86-64, `__arm64_sys_*`/`__arm64_compat_sys_*` on ARM64 —
+see the architecture-abstraction block in `src/anticheat_module.c`), CI
+builds and tests both `ARCH=x86_64` and `ARCH=arm64` kernel trees, and
+the userspace daemon builds for both (its one x86-only piece, the CPUID
+hypervisor bit in `vmcheck`, compiles to a stub on ARM64 where the
+architecture-independent DMI/SMBIOS check still applies). ARM64 support
+has had compile-level CI coverage plus x86-64 live testing, but not yet
+the same live-kernel soak testing the x86-64 path has — treat it as
+supported-but-newer, and file bugs with `dmesg` output as usual
+(see `TROUBLESHOOTING.md`).
 
 Requires a C compiler for the userspace daemon. The kernel module additionally
 needs kernel headers for a kernel **>= 6.12** (it uses `sized_strscpy`, the
@@ -840,7 +854,9 @@ rather than a real quality bar. Run it locally the same way CI does:
 Needs a Linux host (ideally with `/dev/kvm` — falls back to much slower
 QEMU/TCG software emulation without it), `virtme-ng`
 (`pipx install virtme-ng`, or `pip install virtme-ng` in a venv — recent
-distros mark the system Python as externally-managed), `qemu-system-x86`,
+distros mark the system Python as externally-managed), `qemu-system-x86`
+(x86 hosts) or `qemu-system-arm` (ARM hosts — the script picks the
+matching `ARCH=` automatically),
 and the same kernel build deps the `module` CI job uses (`bc flex bison
 libelf-dev libssl-dev dwarves`).
 
@@ -998,11 +1014,17 @@ design).
   vmlinux offsets). On x86-64 with IBT the kprobe reports the ftrace call
   site (4 bytes after the `endbr64`), while the syscall table stores the
   symbol start — the module detects `endbr64` (0xf3 0x0f 0x1e 0xfa) and
-  normalizes before scanning.
-- The `__x64_sys_*`/`__ia32_sys_*` wrappers receive `struct pt_regs *` in
-  `%rdi` and unpack the syscall arguments from that frame, so the ptrace
-  kprobe reads/rewrites the request in the frame (`args->di`), not in the
-  kprobe's own `regs` (which holds the frame pointer).
+  normalizes before scanning. On ARM64 the kprobe reports the function
+  start directly, so no normalization is needed.
+- Syscall-wrapper argument unpacking is per architecture: the
+  `__x64_sys_*`/`__ia32_sys_*` wrappers receive `struct pt_regs *` in
+  `%rdi` and unpack the syscall arguments from that frame (native args in
+  `args->di`/`args->si`, ia32-compat args in `args->bx`/`args->cx`), while
+  the `__arm64_sys_*`/`__arm64_compat_sys_*` wrappers receive it in `x0`
+  (`regs->regs[0]`) with both native and compat args in
+  `args->regs[0]`/`args->regs[1]`. Either way, the ptrace/process_vm
+  kprobes read/rewrite the request/pid in the frame, not in the kprobe's
+  own `regs` (which holds the frame pointer).
 - The module-list walk races with concurrent module load/unload
   (`module_mutex` is not exported). It is safe (single pass, preemption
   disabled, hard-capped at 1024 entries) but a worst-case snapshot may
@@ -1023,10 +1045,12 @@ design).
   device as root, drops all privileges on the same process while keeping
   the fd open, and confirms the next ioctl is rejected with `-EPERM`
   (`sudo ./test.sh` runs it as part of the live suite).
-- ptrace denial works on the standard `__x64_sys_ptrace` /
-  `__ia32_compat_sys_ptrace` entries; `process_vm_readv`/`process_vm_writev`
+- ptrace denial works on the standard native/compat `ptrace` entries
+  (`__x64_sys_ptrace`/`__ia32_compat_sys_ptrace` on x86-64,
+  `__arm64_sys_ptrace`/`__arm64_compat_sys_ptrace` on ARM64);
+  `process_vm_readv`/`process_vm_writev`
   are covered too, via their
-  own native/ia32 kprobes (see "ptrace denial" above). A cheat reaching
+  own native/compat kprobes (see "ptrace denial" above). A cheat reaching
   process memory through some other kernel path entirely (not `ptrace(2)`
   or `process_vm_{read,write}v`) is still out of scope for v1.
 - Protected pids are matched via the caller's pid namespace by default:

@@ -282,6 +282,62 @@ jobs:
           printf '%s' "$modinfo_out" | grep -q '^sig_id:\s*PKCS#7$'
           printf '%s' "$modinfo_out" | grep -q '^sig_hashalgo:\s*sha256$'
 
+  # --- kernel module: ARM64 cross-compile smoke test ---
+  # Same 6.12 floor kernel as the x86_64 module job above, but prepared
+  # for arm64 and built with the aarch64 cross toolchain -- proves the
+  # CONFIG_ARM64 paths in src/anticheat_module.c (syscall-wrapper symbol
+  # names, pt_regs argument unpacking) actually compile. Compile-only:
+  # no DKMS/signing run (that targets the runner's own x86_64 kernel)
+  # and no sparse pass (kept on the native job).
+  module-arm64:
+    name: kernel module cross-build (linux-6.12 arm64 headers)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bc flex bison libelf-dev libssl-dev dwarves gcc-aarch64-linux-gnu
+
+      - name: Fetch and prepare kernel headers (6.12 LTS, arm64)
+        run: |
+          # Same download-to-a-file-with-retries shape as the x86_64 job
+          # above -- see its comment for why this isn't piped straight
+          # into tar.
+          curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors \
+            -o linux-6.12.tar.xz \
+            https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.tar.xz
+          tar -xJf linux-6.12.tar.xz
+          rm -f linux-6.12.tar.xz
+          make -C linux-6.12 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+          make -C linux-6.12 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          make -C linux-6.12 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- scripts
+          make -C linux-6.12 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_prepare
+
+      - name: Cross-build the LKM for arm64
+        run: |
+          # Same synthesized-Module.symvers workaround as the x86_64 job:
+          # the prepared tree was never linked, so modpost needs a symbol
+          # list to link against. The object list is read from the
+          # Makefile's own anticheat-objs, not hardcoded here.
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          make KDIR="$PWD/linux-6.12" module 2>&1 | tail -3 || true
+          objs="$(grep '^anticheat-objs' Makefile | cut -d= -f2)"
+          nm -u $objs | awk 'NF==2 {print $2}' | sort -u | \
+            awk '{printf "0x00000000\t%s\tvmlinux\tEXPORT_SYMBOL\t\n", $1}' \
+            > "$PWD/ksymvers"
+          make KDIR="$PWD/linux-6.12" KBUILD_EXTRA_SYMBOLS="$PWD/ksymvers" module
+          test -s anticheat.ko
+          file anticheat.ko | grep -q 'aarch64\|ARM aarch64'
+
+      - name: Cross-build the daemon for aarch64 (compile check)
+        run: |
+          make CC=aarch64-linux-gnu-gcc CFLAGS="-O2 -Wall -Wextra -Werror" daemon
+          file anticheat | grep -q 'aarch64\|ARM aarch64'
+
   # --- path filter: only the real-module fuzz seed job below is gated on
   # this. userspace/module above always run -- CONTRIBUTING.md documents
   # ci.yml as always running on every push/PR, and this filter must not

@@ -42,7 +42,7 @@ rebuilt independently):
   the `mokutil --import` command for you to run manually. See
   `%description dkms` in the spec.
 
-`x86-64` only (`ExclusiveArch: x86_64`) — see README.md's "Build" section
+`x86-64` and 64-bit ARM (`ExclusiveArch: x86_64 aarch64`) — see README.md's "Build" section
 for why.
 
 ## Not yet verified

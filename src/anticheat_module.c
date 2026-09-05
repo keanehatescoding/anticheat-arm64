@@ -74,6 +74,86 @@
 # define __NR_syscalls 512
 #endif
 
+/* ------------------------------------------------------------------ */
+/* architecture abstraction (x86-64 + ARM64)                            */
+/* ------------------------------------------------------------------ */
+/*
+ * The module supports x86-64 and ARM64 (AArch64). Syscall-wrapper
+ * symbol names are per-architecture: x86-64 uses __x64_sys_* /
+ * __ia32_* (native vs. 32-bit compat), ARM64 uses __arm64_sys_* /
+ * __arm64_compat_sys_*. CONFIG_ARM64 is only defined when building
+ * against an ARM64 kernel tree (via Kbuild's autoconf.h), so the
+ * #else branch below unambiguously means x86-64 -- the module has no
+ * other supported target. Probe registration itself is still tolerant:
+ * ac_register_kprobes() logs (but tolerates) any symbol the running
+ * kernel doesn't have, e.g. a compat entry on a kernel built without
+ * CONFIG_COMPAT.
+ */
+#if defined(CONFIG_ARM64)
+# define AC_SYM_SYS_READ         "__arm64_sys_read"
+# define AC_SYM_SYS_WRITE        "__arm64_sys_write"
+# define AC_SYM_PTRACE           "__arm64_sys_ptrace"
+# define AC_SYM_PTRACE32         "__arm64_compat_sys_ptrace"
+# define AC_SYM_PVM_READV        "__arm64_sys_process_vm_readv"
+# define AC_SYM_PVM_READV32      "__arm64_compat_sys_process_vm_readv"
+# define AC_SYM_PVM_WRITEV       "__arm64_sys_process_vm_writev"
+# define AC_SYM_PVM_WRITEV32     "__arm64_compat_sys_process_vm_writev"
+# define AC_SYM_EXECVE           "__arm64_sys_execve"
+# define AC_SYM_EXECVEAT         "__arm64_sys_execveat"
+# define AC_SYM_EXECVE32         "__arm64_compat_sys_execve"
+# define AC_SYM_EXECVEAT32       "__arm64_compat_sys_execveat"
+#else
+# define AC_SYM_SYS_READ         "__x64_sys_read"
+# define AC_SYM_SYS_WRITE        "__x64_sys_write"
+# define AC_SYM_PTRACE           "__x64_sys_ptrace"
+# define AC_SYM_PTRACE32         "__ia32_compat_sys_ptrace"
+# define AC_SYM_PVM_READV        "__x64_sys_process_vm_readv"
+# define AC_SYM_PVM_READV32      "__ia32_sys_process_vm_readv"
+# define AC_SYM_PVM_WRITEV       "__x64_sys_process_vm_writev"
+# define AC_SYM_PVM_WRITEV32     "__ia32_sys_process_vm_writev"
+# define AC_SYM_EXECVE           "__x64_sys_execve"
+# define AC_SYM_EXECVEAT         "__x64_sys_execveat"
+# define AC_SYM_EXECVE32         "__ia32_compat_sys_execve"
+# define AC_SYM_EXECVEAT32       "__ia32_compat_sys_execveat"
+#endif
+
+/*
+ * Unpack syscall arguments inside the ptrace/process_vm kprobe
+ * pre-handlers. The probed wrappers all take
+ * `const struct pt_regs *regs`, but where that pointer lives at kprobe
+ * entry -- and where the syscall arguments live inside the frame it
+ * points to -- is per-architecture:
+ *
+ *  x86-64: the wrapper's pt_regs pointer arrives in %rdi
+ *    (regs->di); the native wrapper unpacks args from args->di/si
+ *    while the ia32 compat wrapper uses args->bx/cx (32-bit entry
+ *    passes args in ebx, ecx, ...).
+ *  ARM64: the wrapper's pt_regs pointer arrives in x0
+ *    (regs->regs[0]); both native and compat wrappers unpack args
+ *    from args->regs[0]/regs[1] (arg0/arg1) -- the compat entry uses
+ *    the same pt_regs layout, only with compat-sized types.
+ */
+#if defined(CONFIG_ARM64)
+static inline struct pt_regs *ac_frame_regs(struct pt_regs *regs)
+{
+    return (struct pt_regs *)regs->regs[0];
+}
+static inline unsigned long ac_frame_arg(struct pt_regs *args, int n)
+{
+    return args->regs[n];
+}
+static inline void ac_frame_set_arg(struct pt_regs *args, int n,
+                                    unsigned long val)
+{
+    args->regs[n] = (u64)val;
+}
+#else
+static inline struct pt_regs *ac_frame_regs(struct pt_regs *regs)
+{
+    return (struct pt_regs *)regs->di;
+}
+#endif
+
 /* forward declarations */
 static void ac_emit(unsigned int type, int pid, const char *comm,
                     const char *fmt, ...);
@@ -141,7 +221,7 @@ static unsigned long ac_lookup(const char *name)
 }
 
 /* Normalize a kprobe-reported address to the start of the function.
- * On x86-64 with IBT + fentry the kprobe lands on the ftrace call site,
+ * x86-64 only: with IBT + fentry the kprobe lands on the ftrace call site,
  * i.e. 4 bytes after the endbr64, whereas the syscall table stores the
  * symbol start (the endbr64 itself).  Detect endbr64 (0xf3 0x0f 0x1e 0xfa)
  * right before the address and step back.  On non-IBT kernels with
@@ -149,9 +229,14 @@ static unsigned long ac_lookup(const char *name)
  * a leading fentry pad -- either a CALL rel32 (0xe8 ..) or the common
  * 5-byte NOP (0f 1f 44 00 00) -- so detect that pad the same way and step
  * back 5; on kernels without either layout the address is already the
- * function start. See #91. */
+ * function start. On ARM64 the kprobe reports the function start directly
+ * (no endbr/fentry-pad offset to compensate), so this is a passthrough.
+ * See #91. */
 static unsigned long ac_normalize_func(unsigned long addr)
 {
+#if defined(CONFIG_ARM64)
+    return addr;
+#else
     unsigned int insn;
     unsigned char pad[5];
 
@@ -168,6 +253,7 @@ static unsigned long ac_normalize_func(unsigned long addr)
           pad[3] == 0x00 && pad[4] == 0x00)))
         return addr - 5;
     return addr;
+#endif
 }
 
 /* Scan window for ac_find_syscall_table(), in bytes, applied both forward
@@ -261,15 +347,36 @@ static unsigned long ac_syscall_table;
 
 /*
  * Locate sys_call_table without kallsyms_lookup_name:
- *  - resolve __x64_sys_read/__x64_sys_write handler addresses via kprobes,
+ *  - resolve the read/write handler addresses via kprobes
+ *    (__x64_sys_read/__x64_sys_write on x86-64,
+ *    __arm64_sys_read/__arm64_sys_write on ARM64 -- see AC_SYM_SYS_*
+ *    above),
  *  - scan the kernel image for an 8-byte slot equal to the read handler,
  *  - verify the write handler sits at table[__NR_write] and that most
  *    entries are real core-text handlers (distinguishes the main table
- *    from e.g. the x32 table, which reuses the same handlers sparsely).
+ *    from e.g. the x32 table on x86-64, which reuses the same handlers
+ *    sparsely). __NR_read/__NR_write come from <asm/unistd.h> and are
+ *    already correct per architecture (0/1 on x86-64, 63/64 on ARM64),
+ *    so the base arithmetic below needs no arch special-casing.
  */
+/* Minimum plausible-handler count for ac_table_plausible(): scaled to
+ * the architecture's table size (three quarters of __NR_syscalls,
+ * capped at the historical 400) rather than hardcoded, so a
+ * legitimately smaller table (ARM64's __NR_syscalls) isn't rejected
+ * for simply being smaller. */
+static unsigned int ac_plausible_threshold(void)
+{
+    unsigned int t = (unsigned int)__NR_syscalls * 3U / 4U;
+
+    if (t > 400)
+        t = 400;
+    return t;
+}
+
 static bool ac_table_plausible(unsigned long base, unsigned long anchor)
 {
     unsigned int i, valid = 0;
+    unsigned int threshold = ac_plausible_threshold();
 
     for (i = 0; i < __NR_syscalls; i++) {
         unsigned long e = 0;
@@ -278,12 +385,13 @@ static bool ac_table_plausible(unsigned long base, unsigned long anchor)
             continue;
         if (!e)
             continue;
-        if (ac_plausible_handler(e, anchor) && ++valid >= 400)
+        if (ac_plausible_handler(e, anchor) && ++valid >= threshold)
             return true;
     }
     if (ac_verbose)
-        pr_info("plausibility for base=0x%lx: valid=%u\n", base, valid);
-    return valid >= 400;
+        pr_info("plausibility for base=0x%lx: valid=%u (need %u)\n",
+                base, valid, threshold);
+    return valid >= threshold;
 }
 
 /* Once the table is found, derive core-text bounds from its (plausible)
@@ -323,13 +431,13 @@ static unsigned long ac_find_syscall_table(void)
     unsigned int partial = 0;
     unsigned long first_partial = 0;
 
-    raw_rh = ac_lookup("__x64_sys_read");
-    raw_wh = ac_lookup("__x64_sys_write");
+    raw_rh = ac_lookup(AC_SYM_SYS_READ);
+    raw_wh = ac_lookup(AC_SYM_SYS_WRITE);
     rh = ac_normalize_func(raw_rh);
     wh = ac_normalize_func(raw_wh);
     if (ac_verbose)
-        pr_info("lookup __x64_sys_read=0x%lx->0x%lx __x64_sys_write=0x%lx->0x%lx\n",
-                raw_rh, rh, raw_wh, wh);
+        pr_info("lookup %s=0x%lx->0x%lx %s=0x%lx->0x%lx\n",
+                AC_SYM_SYS_READ, raw_rh, rh, AC_SYM_SYS_WRITE, raw_wh, wh);
     if (!rh || !wh)
         return 0;
 
@@ -342,8 +450,9 @@ static unsigned long ac_find_syscall_table(void)
         win = 0x2000000UL;
     }
 
-    /* Primary window: from the end of .text forward.  On x86-64 the table
-     * lives in .rodata right after .text. */
+    /* Primary window: from the end of .text forward.  The table
+     * lives in .rodata right after .text on both supported
+     * architectures. */
     lo = ac_etext ? ac_etext : (ac_stext ? ac_stext : rh);
     hi = lo + win;
     if (ac_verbose)
@@ -1436,24 +1545,33 @@ static struct kprobe ac_kp_ptrace32;
 static int ac_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
 {
     /*
-     * Modern x86-64 syscall wrappers (__x64_sys_*, __ia32_sys_*) are
-     * `long f(const struct pt_regs *regs)`: %rdi at entry points to the
-     * syscall's pt_regs frame, and the wrapper unpacks the arguments
-     * from it.  regs->di is the frame pointer, not the request.
+     * The probed syscall wrappers are
+     * `long f(const struct pt_regs *regs)` on both architectures; the
+     * kprobe's own `regs` holds the wrapper's entry state, not the
+     * syscall arguments themselves. ac_frame_regs()/ac_frame_arg() (see
+     * the architecture-abstraction block above) resolve the frame
+     * pointer and argument slots per architecture:
      *
-     * The native (__x64_sys_ptrace) wrapper unpacks its first two
-     * arguments from args->di/args->si (the x86-64 argument registers).
-     * The compat (__ia32_compat_sys_ptrace) wrapper instead unpacks them
-     * from args->bx/args->cx, since ia32 syscall entry passes arguments in
-     * ebx, ecx, edx, esi, edi, ebp rather than the native ABI's rdi,
-     * rsi, rdx, r10, r8, r9. Reading di/si for the compat probe would
-     * pick up the wrong register (ia32 arg5/arg4), silently mismatching
-     * every compat ptrace() call.
+     *  x86-64: frame pointer in regs->di; native args in args->di/si,
+     *    ia32-compat args in args->bx/cx (32-bit entry passes args in
+     *    ebx, ecx, ... rather than rdi, rsi, ... -- reading di/si for
+     *    the compat probe would pick up the wrong register, silently
+     *    mismatching every compat ptrace() call).
+     *  ARM64: frame pointer in regs->regs[0] (x0); both native and
+     *    compat args in args->regs[0]/regs[1] (same pt_regs layout,
+     *    only the types differ).
      */
-    struct pt_regs *args = (struct pt_regs *)regs->di;
+    struct pt_regs *args = ac_frame_regs(regs);
+#if defined(CONFIG_ARM64)
+    long request = (long)ac_frame_arg(args, 0);
+    long target = (long)ac_frame_arg(args, 1);
+
+    (void)p;   /* native and compat share one register layout; no per-probe switch */
+#else
     bool is_compat = (p == &ac_kp_ptrace32);
     long request = is_compat ? args->bx : args->di;
     long target = is_compat ? args->cx : args->si;
+#endif
     char tcomm[AC_MAX_COMM] = "?";
     bool deny = false, kill = false;
 
@@ -1485,10 +1603,14 @@ static int ac_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
     /* Neutralise the syscall: rewrite the request slot in the frame to an
      * invalid value.  ptrace() rejects unknown requests with -EIO and
      * performs no side effects, so the tracer sees a clean failure. */
+#if defined(CONFIG_ARM64)
+    ac_frame_set_arg(args, 0, (unsigned long)-1);
+#else
     if (is_compat)
         args->bx = -1;
     else
         args->di = -1;
+#endif
     return 0;
 }
 
@@ -1496,23 +1618,30 @@ static int ac_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
  * write another process's memory without ever calling ptrace(2), so the
  * ptrace kprobe above doesn't see it at all. Both syscalls take the target
  * pid as their first argument (SYSCALL_DEFINE6(process_vm_read{v,writev},
- * pid_t, pid, ...)); neither has a distinct COMPAT_SYSCALL_DEFINE (unlike
- * ptrace, whose compat_long_t args need special handling), so the i386
- * syscall table maps straight to the same sys_process_vm_{read,write}v --
+ * pid_t, pid, ...)). On x86-64 neither has a distinct COMPAT_SYSCALL_DEFINE
+ * (unlike ptrace, whose compat_long_t args need special handling), so the
+ * i386 syscall table maps straight to the same sys_process_vm_{read,write}v --
  * the standard wrapper-generation machinery still emits both a native
  * (__x64_sys_*) and a compat (__ia32_sys_*) entry point from that one
  * definition, unpacking the pid from the same register slot the ptrace
- * probe above already established: di for native, bx for compat. */
+ * probe above already established: di for native, bx for compat. On ARM64
+ * the native (__arm64_sys_*) and compat (__arm64_compat_sys_*) entry
+ * points both unpack the pid from args->regs[0] (see ac_frame_arg()
+ * above). */
 static struct kprobe ac_kp_process_vm_readv;
 static struct kprobe ac_kp_process_vm_readv32;
 static struct kprobe ac_kp_process_vm_writev32;
 
 static int ac_process_vm_pre(struct kprobe *p, struct pt_regs *regs)
 {
-    struct pt_regs *args = (struct pt_regs *)regs->di;
+    struct pt_regs *args = ac_frame_regs(regs);
+#if defined(CONFIG_ARM64)
+    pid_t target = (pid_t)ac_frame_arg(args, 0);
+#else
     bool is_compat = (p == &ac_kp_process_vm_readv32 ||
                        p == &ac_kp_process_vm_writev32);
     pid_t target = (pid_t)(is_compat ? args->bx : args->di);
+#endif
     struct task_struct *t;
     char tcomm[AC_MAX_COMM] = "?";
     bool protected_target;
@@ -1561,10 +1690,14 @@ static int ac_process_vm_pre(struct kprobe *p, struct pt_regs *regs)
      * are parsed but before any target memory is touched, so this fails
      * cleanly with -ESRCH and never copies a single byte to/from the
      * protected process. */
+#if defined(CONFIG_ARM64)
+    ac_frame_set_arg(args, 0, (unsigned long)-1);
+#else
     if (is_compat)
         args->bx = (unsigned long)-1;
     else
         args->di = (unsigned long)-1;
+#endif
     return 0;
 }
 
@@ -1756,32 +1889,34 @@ static int ac_exec_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 }
 
 static struct kretprobe ac_kp_execve = {
-    .kp = { .symbol_name = "__x64_sys_execve" },
+    .kp = { .symbol_name = AC_SYM_EXECVE },
     .entry_handler = ac_exec_entry,
     .handler = ac_exec_ret,
     .data_size = sizeof(struct ac_exec_entry_data),
     .maxactive = 64,
 };
 static struct kretprobe ac_kp_execveat = {
-    .kp = { .symbol_name = "__x64_sys_execveat" },
+    .kp = { .symbol_name = AC_SYM_EXECVEAT },
     .entry_handler = ac_exec_entry,
     .handler = ac_exec_ret,
     .data_size = sizeof(struct ac_exec_entry_data),
     .maxactive = 64,
 };
 static struct kretprobe ac_kp_execve32 = {
-    /* Same reasoning as ac_kp_ptrace32 below: execve/execveat have distinct
-     * COMPAT_SYSCALL_DEFINEs, so the ia32 syscall table entries resolve to
-     * __ia32_compat_sys_execve[at], not the unused generic __ia32_sys_*
-     * stub. */
-    .kp = { .symbol_name = "__ia32_compat_sys_execve" },
+    /* The compat entry resolves to the compat wrapper, not the unused
+     * generic stub the plain SYSCALL_DEFINE also emits but that no
+     * syscall table ever references (x86-64: __ia32_compat_sys_execve[at]
+     * via distinct COMPAT_SYSCALL_DEFINEs; ARM64: __arm64_compat_sys_execve
+     * [at]) -- a kprobe on the generic stub would silently never fire
+     * for a real 32-bit execve() call. */
+    .kp = { .symbol_name = AC_SYM_EXECVE32 },
     .entry_handler = ac_exec_entry,
     .handler = ac_exec_ret,
     .data_size = sizeof(struct ac_exec_entry_data),
     .maxactive = 64,
 };
 static struct kretprobe ac_kp_execveat32 = {
-    .kp = { .symbol_name = "__ia32_compat_sys_execveat" },
+    .kp = { .symbol_name = AC_SYM_EXECVEAT32 },
     .entry_handler = ac_exec_entry,
     .handler = ac_exec_ret,
     .data_size = sizeof(struct ac_exec_entry_data),
@@ -1796,33 +1931,32 @@ static bool ac_kretp_ok[ARRAY_SIZE(ac_kretprobes)];
 static unsigned int ac_kretprobes_registered;
 
 static struct kprobe ac_kp_ptrace = {
-    .symbol_name = "__x64_sys_ptrace",
+    .symbol_name = AC_SYM_PTRACE,
     .pre_handler = ac_ptrace_pre,
 };
 static struct kprobe ac_kp_ptrace32 = {
-    /* ptrace has a distinct COMPAT_SYSCALL_DEFINE (unlike process_vm_readv/
-     * writev below), so arch/x86/entry/syscalls/syscall_32.tbl wires the
-     * ia32 ptrace slot to the compat entry point, not the generic
-     * __ia32_sys_ptrace stub the plain SYSCALL_DEFINE also emits but that
-     * no syscall table ever references -- a kprobe there would silently
-     * never fire for a real 32-bit ptrace() call. */
-    .symbol_name = "__ia32_compat_sys_ptrace",
+    /* ptrace has a distinct compat wrapper (unlike process_vm_readv/
+     * writev below on x86-64), so the 32-bit ptrace slot wires to the
+     * compat entry point, not the generic stub the plain SYSCALL_DEFINE
+     * also emits but that no syscall table ever references -- a kprobe
+     * there would silently never fire for a real 32-bit ptrace() call. */
+    .symbol_name = AC_SYM_PTRACE32,
     .pre_handler = ac_ptrace_pre,
 };
 static struct kprobe ac_kp_process_vm_readv = {
-    .symbol_name = "__x64_sys_process_vm_readv",
+    .symbol_name = AC_SYM_PVM_READV,
     .pre_handler = ac_process_vm_pre,
 };
 static struct kprobe ac_kp_process_vm_readv32 = {
-    .symbol_name = "__ia32_sys_process_vm_readv",
+    .symbol_name = AC_SYM_PVM_READV32,
     .pre_handler = ac_process_vm_pre,
 };
 static struct kprobe ac_kp_process_vm_writev = {
-    .symbol_name = "__x64_sys_process_vm_writev",
+    .symbol_name = AC_SYM_PVM_WRITEV,
     .pre_handler = ac_process_vm_pre,
 };
 static struct kprobe ac_kp_process_vm_writev32 = {
-    .symbol_name = "__ia32_sys_process_vm_writev",
+    .symbol_name = AC_SYM_PVM_WRITEV32,
     .pre_handler = ac_process_vm_pre,
 };
 

@@ -59,7 +59,12 @@
 #include <time.h>
 #include <dirent.h>
 #include <ctype.h>
+/* <cpuid.h> (and the __cpuid() intrinsic) only exist on x86; the
+ * hypervisor-bit check below is compiled out on other architectures
+ * (see detect_hypervisor_cpuid()), where the DMI check still applies. */
+#if defined(__x86_64__) || defined(__i386__)
 #include <cpuid.h>
+#endif
 #include <elf.h>
 #include <netdb.h>
 #include <poll.h>
@@ -903,8 +908,8 @@ static int baseline_save_record(const char *blpath, unsigned long long inode,
  * doesn't carry one), -1 on any parse/read/bounds failure. Every
  * failure is inconclusive, never a positive detection -- a malformed or
  * unexpected-shape ELF file is a skip, same as an unreadable one.
- * x86-64 only (ELFCLASS64 / little-endian), matching the rest of this
- * project's scope. */
+ * x86-64 and AArch64 Linux are both ELFCLASS64 / little-endian, so this
+ * parses either architecture's libraries unchanged. */
 static int elf_find_symbol_offset(int fd, const char *symbol, uint64_t *offset_out,
                                    uint64_t *size_out)
 {
@@ -1726,9 +1731,16 @@ static int cmd_modules(void)
  * as the max standard leaf. Returns 1 if the bit is set (and fills
  * vendor_out with the 12-char vendor ID string from leaf 0x40000000,
  * only architecturally defined once the presence bit is set), 0
- * otherwise. x86-64 only, matching this project's stated scope. */
+ * otherwise. x86 only: AArch64 has no architectural hypervisor-present
+ * bit, so this check is compiled to a stub there and `vmcheck` rests on
+ * the DMI/SMBIOS check below (which is architecture-independent). */
 static int detect_hypervisor_cpuid(char *vendor_out, size_t outsz)
 {
+#if !defined(__x86_64__) && !defined(__i386__)
+    if (vendor_out && outsz)
+        vendor_out[0] = '\0';
+    return 0;
+#else
     unsigned int eax, ebx, ecx, edx;
 
     if (vendor_out && outsz)
@@ -1750,6 +1762,7 @@ static int detect_hypervisor_cpuid(char *vendor_out, size_t outsz)
         vendor_out[12] = '\0';
     }
     return 1;
+#endif
 }
 
 static int read_dmi_field(const char *name, char *out, size_t outsz)
@@ -1850,10 +1863,15 @@ static int cmd_vmcheck(void)
     dmi_hit = detect_hypervisor_dmi(dmi_desc, sizeof(dmi_desc));
 
     printf("VM/hypervisor check:\n");
+#if !defined(__x86_64__) && !defined(__i386__)
+    printf("  CPUID hypervisor bit : not applicable on this architecture "
+           "(x86 only)\n");
+#else
     if (cpuid_hit)
         printf("  CPUID hypervisor bit : present (vendor id: %s)\n", cpuid_vendor);
     else
         printf("  CPUID hypervisor bit : not present\n");
+#endif
     if (dmi_hit)
         printf("  DMI/SMBIOS strings   : %s\n", dmi_desc);
     else

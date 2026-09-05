@@ -32,9 +32,13 @@ before the backtrace.
 **A kprobe path specifically implicated** (all `pr_fmt`-prefixed, all in
 `src/anticheat_module.c`):
 
-- `ac_ptrace_pre` — the `__x64_sys_ptrace`/`__ia32_sys_ptrace` kprobe
+- `ac_ptrace_pre` — the native/compat `ptrace` kprobe (`__x64_sys_ptrace`/
+  `__ia32_sys_ptrace`-family on x86-64, `__arm64_sys_ptrace`/
+  `__arm64_compat_sys_ptrace` on ARM64)
 - `ac_exit_pre` — the `do_exit` kprobe
-- `ac_exec_pre` — the `__x64_sys_execve`/`__x64_sys_execveat` kprobes
+- `ac_exec_pre` — the native/compat `execve`/`execveat` kprobes
+  (`__x64_sys_execve`/`__x64_sys_execveat`-family on x86-64,
+  `__arm64_sys_execve`/`__arm64_sys_execveat`-family on ARM64)
 - `ac_clone_ret` — the `kernel_clone` kretprobe (fork/exec inheritance)
 - `ac_kill_worker` — the deferred `SIGKILL` of a ptrace offender, running
   in the `anticheat` workqueue rather than kprobe context (the only thing
@@ -152,8 +156,8 @@ kernel's symbols anyway, not patched in place).
 The one combination that's genuinely untested is a kernel live-patching
 mechanism (`kpatch`, `livepatch`, `ksplice`, or similar) that redirects
 one of the exact functions this module already hooks (`do_exit`,
-`kernel_clone`, `__x64_sys_ptrace`/`__ia32_sys_ptrace`,
-`__x64_sys_execve`/`__x64_sys_execveat`) out from under an already-loaded
+`kernel_clone`, the native/compat `ptrace` and `execve`/`execveat`
+entries listed above) out from under an already-loaded
 kprobe. Nothing in this project has been verified against that
 interaction either way. If you use kernel live-patching, treat combining
 it with this module as unverified: reload `anticheat.ko` after applying
