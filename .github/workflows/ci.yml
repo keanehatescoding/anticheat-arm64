@@ -256,7 +256,7 @@ jobs:
 
       - name: Check whether src/anticheat_module.c changed
         id: filter
-        uses: dorny/paths-filter@v3
+        uses: dorny/paths-filter@v4
         with:
           filters: |
             module:
