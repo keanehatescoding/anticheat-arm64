@@ -144,19 +144,41 @@ static unsigned long ac_lookup(const char *name)
  * On x86-64 with IBT + fentry the kprobe lands on the ftrace call site,
  * i.e. 4 bytes after the endbr64, whereas the syscall table stores the
  * symbol start (the endbr64 itself).  Detect endbr64 (0xf3 0x0f 0x1e 0xfa)
- * right before the address and step back; on kernels without that layout
- * the address is already the function start. */
+ * right before the address and step back.  On non-IBT kernels with
+ * ftrace/CALL-thunk mitigations the kprobe can instead land 5 bytes past
+ * a leading fentry pad -- either a CALL rel32 (0xe8 ..) or the common
+ * 5-byte NOP (0f 1f 44 00 00) -- so detect that pad the same way and step
+ * back 5; on kernels without either layout the address is already the
+ * function start. See #91. */
 static unsigned long ac_normalize_func(unsigned long addr)
 {
     unsigned int insn;
+    unsigned char pad[5];
 
     if (!addr)
         return 0;
-    if (ac_kread(&insn, (void *)(addr - 4), sizeof(insn)) == 0 &&
+    if (addr >= 4 &&
+        ac_kread(&insn, (void *)(addr - 4), sizeof(insn)) == 0 &&
         insn == 0xfa1e0ff3)   /* endbr64, little-endian */
         return addr - 4;
+    if (addr >= 5 &&
+        ac_kread(pad, (void *)(addr - 5), sizeof(pad)) == 0 &&
+        (pad[0] == 0xe8 ||
+         (pad[0] == 0x0f && pad[1] == 0x1f && pad[2] == 0x44 &&
+          pad[3] == 0x00 && pad[4] == 0x00)))
+        return addr - 5;
     return addr;
 }
+
+/* Scan window for ac_find_syscall_table(), in bytes, applied both forward
+ * from _etext and backward from the read handler.  Tunable without a
+ * rebuild for unusual kernel layouts (large debug/KASAN images can push
+ * the table further from _etext than the default covers).  Clamped in
+ * ac_find_syscall_table() so a stray value can't turn a boot-time scan
+ * into a hang.  See #93. */
+static unsigned long ac_scan_window = 0x2000000UL;   /* 32 MB */
+module_param(ac_scan_window, ulong, 0600);
+MODULE_PARM_DESC(ac_scan_window, "syscall table scan window in bytes (forward and backward; default 32MB)");
 
 static unsigned long ac_stext;
 static unsigned long ac_etext;
@@ -297,27 +319,45 @@ static void ac_derive_bounds(unsigned long base, unsigned long anchor)
 static unsigned long ac_find_syscall_table(void)
 {
     unsigned long rh, wh, lo, hi, addr, base, v1, v2;
+    unsigned long raw_rh, raw_wh, win;
+    unsigned int partial = 0;
+    unsigned long first_partial = 0;
 
-    rh = ac_normalize_func(ac_lookup("__x64_sys_read"));
-    wh = ac_normalize_func(ac_lookup("__x64_sys_write"));
+    raw_rh = ac_lookup("__x64_sys_read");
+    raw_wh = ac_lookup("__x64_sys_write");
+    rh = ac_normalize_func(raw_rh);
+    wh = ac_normalize_func(raw_wh);
     if (ac_verbose)
-        pr_info("lookup __x64_sys_read=0x%lx __x64_sys_write=0x%lx\n",
-                rh, wh);
+        pr_info("lookup __x64_sys_read=0x%lx->0x%lx __x64_sys_write=0x%lx->0x%lx\n",
+                raw_rh, rh, raw_wh, wh);
     if (!rh || !wh)
         return 0;
+
+    /* Tunable window (#93); clamp so a stray value can't turn this
+     * boot-time scan into a hang (1 MB min, 256 MB max). */
+    win = ac_scan_window;
+    if (!win || win < 0x100000UL || win > 0x10000000UL) {
+        pr_warn("ac_scan_window=0x%lx out of range, using 32MB default\n",
+                ac_scan_window);
+        win = 0x2000000UL;
+    }
 
     /* Primary window: from the end of .text forward.  On x86-64 the table
      * lives in .rodata right after .text. */
     lo = ac_etext ? ac_etext : (ac_stext ? ac_stext : rh);
-    hi = lo + 0x2000000UL;      /* 32 MB window */
+    hi = lo + win;
     if (ac_verbose)
-        pr_info("table scan window [0x%lx, 0x%lx)\n", lo, hi);
+        pr_info("table scan window [0x%lx, 0x%lx) (win=0x%lx)\n",
+                lo, hi, win);
 
     for (addr = lo; addr < hi; addr += sizeof(unsigned long)) {
         if (ac_kread(&v1, (void *)addr, sizeof(v1)))
             continue;
         if (v1 != rh)
             continue;
+        if (!first_partial)
+            first_partial = addr;
+        partial++;
         base = addr - __NR_read * sizeof(unsigned long);
         if (ac_kread(&v2, (void *)(base + __NR_write * sizeof(unsigned long)),
                      sizeof(v2)))
@@ -336,24 +376,47 @@ static unsigned long ac_find_syscall_table(void)
      * table is normally right after .text), so mirror the forward window
      * rather than skimping on it: some layouts place the table below the
      * first handler. */
-    for (addr = rh; addr > rh - 0x2000000UL; addr -= sizeof(unsigned long)) {
-        if (ac_kread(&v1, (void *)addr, sizeof(v1)))
-            continue;
-        if (v1 != rh)
-            continue;
-        base = addr - __NR_read * sizeof(unsigned long);
-        if (ac_kread(&v2, (void *)(base + __NR_write * sizeof(unsigned long)),
-                     sizeof(v2)))
-            continue;
-        if (ac_verbose)
-            pr_info("fallback candidate addr=0x%lx base=0x%lx v2=0x%lx\n",
-                    addr, base, v2);
-        if (v2 == wh && ac_table_plausible(base, rh)) {
-            ac_anchor = rh;
-            ac_derive_bounds(base, rh);
-            return base;
+    {
+        unsigned long lo_b = rh > win ? rh - win : sizeof(unsigned long);
+
+        for (addr = rh; ; addr -= sizeof(unsigned long)) {
+            if (ac_kread(&v1, (void *)addr, sizeof(v1)) == 0 &&
+                v1 == rh) {
+                if (!first_partial)
+                    first_partial = addr;
+                partial++;
+                base = addr - __NR_read * sizeof(unsigned long);
+                if (ac_kread(&v2,
+                             (void *)(base + __NR_write *
+                                      sizeof(unsigned long)),
+                             sizeof(v2)) == 0) {
+                    if (ac_verbose)
+                        pr_info("fallback candidate addr=0x%lx base=0x%lx v2=0x%lx\n",
+                                addr, base, v2);
+                    if (v2 == wh && ac_table_plausible(base, rh)) {
+                        ac_anchor = rh;
+                        ac_derive_bounds(base, rh);
+                        return base;
+                    }
+                }
+            }
+            if (addr < lo_b + sizeof(unsigned long))
+                break;
         }
     }
+    /* Both scans failed: say why, not just "not located" (#91/#93).
+     * Zero partial matches means the normalized handler value never
+     * appeared at all -- suspect ac_normalize_func() on this kernel
+     * layout.  Non-zero partials with no plausible table means the
+     * value was seen but the write-slot/plausibility check rejected
+     * every candidate -- suspect an unusual table position outside the
+     * window (try ac_scan_window=...) rather than normalization. */
+    pr_warn("syscall table not found: rh=0x%lx (raw 0x%lx) wh=0x%lx (raw 0x%lx) fwd=[0x%lx,0x%lx) bwd=0x%lx bytes partial=%u%s; try ac_scan_window=<bytes> if the table lies further out\n",
+            rh, raw_rh, wh, raw_wh, lo, hi, win, partial,
+            partial ? ", first partial match" : ", no read-handler value seen");
+    if (partial)
+        pr_warn("first partial read-handler match at 0x%lx\n",
+                first_partial);
     return 0;
 }
 
