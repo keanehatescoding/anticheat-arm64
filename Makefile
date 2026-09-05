@@ -35,9 +35,62 @@ DECK_PREFIX ?= $(HOME)/.local/share/anticheat
 
 # If the running kernel was built with clang/LLVM, build the module with
 # the same toolchain (Kbuild flags are not compatible with gcc).
-ifeq ($(shell grep -q '^CONFIG_CC_IS_CLANG=y' $(KDIR)/.config 2>/dev/null && echo 1 || echo 0),1)
+# Prefer $(KDIR)/.config (authoritative); some minimal/embedded
+# headers packages omit it or ship it unreadable, in which case grep
+# quietly fails and the old single-check logic silently defaulted to gcc
+# -- surfacing later as an opaque `Invalid module format` at insmod time.
+# /proc/version is only a fallback for the running kernel itself: for a
+# different target (KDIR override) the host's version string says nothing
+# about the target, so warn and require an explicit LLVM=1/CC=... instead.
+# CONFIG_CC_IS_CLANG covers only the C compiler -- a kernel can pair clang
+# with GNU as/ld, where full LLVM=1 (llvm-as/ld) would pick the wrong
+# binutils -- so select LLVM=1 only for a fully-LLVM target (CC+AS+LD all
+# LLVM) and pass CC=clang alone for a mixed toolchain. The /proc/version
+# fallback is compiler-only too (it names the CC, never AS/LD), so it also
+# selects CC=clang only; pass LLVM=1 explicitly for a known full-LLVM
+# target. Explicit LLVM=/CC= on the command line or environment always
+# wins over auto-detection.
+AC_KCONFIG_READABLE := $(shell test -r $(KDIR)/.config && echo 1 || echo 0)
+AC_CC_CLANG := $(shell grep -q '^CONFIG_CC_IS_CLANG=y' $(KDIR)/.config 2>/dev/null && echo 1 || echo 0)
+AC_AS_LLVM := $(shell grep -q '^CONFIG_AS_IS_LLVM=y' $(KDIR)/.config 2>/dev/null && echo 1 || echo 0)
+AC_LD_LLD := $(shell grep -q '^CONFIG_LD_IS_LLD=y' $(KDIR)/.config 2>/dev/null && echo 1 || echo 0)
+AC_PROC_CLANG := $(shell grep -q 'clang version' /proc/version 2>/dev/null && echo 1 || echo 0)
+AC_RUNNING_KDIR := /lib/modules/$(shell uname -r)/build
+AC_IS_RUNNING := $(shell test "$(KDIR)" = "$(AC_RUNNING_KDIR)" && echo 1 || echo 0)
+# An explicit CC=... (command line or environment) is authoritative: skip
+# LLVM auto-detection entirely so CC=gcc can never end up paired with
+# LLVM binutils, and forward it as a Kbuild command-line variable (an
+# environment-only CC would be inheritable but overridable inside Kbuild).
+AC_CC_EXPLICIT := $(if $(filter command\ line environment,$(origin CC)),1,0)
+ifeq ($(origin LLVM),undefined)
+ifeq ($(AC_CC_EXPLICIT),0)
+ifeq ($(AC_CC_CLANG),1)
+ifeq ($(AC_AS_LLVM),1)
+ifeq ($(AC_LD_LLD),1)
 LLVM := 1
+else
+AC_KBUILD_CC := clang
 endif
+else
+AC_KBUILD_CC := clang
+endif
+else ifeq ($(AC_KCONFIG_READABLE),0)
+ifeq ($(AC_IS_RUNNING),1)
+ifeq ($(AC_PROC_CLANG),1)
+AC_KBUILD_CC := clang
+else
+$(warning $(KDIR)/.config not readable and /proc/version does not mention clang -- defaulting to gcc; if the running kernel was built with clang, the module may fail to load with 'Invalid module format')
+endif
+else
+$(warning $(KDIR)/.config not readable and KDIR does not target the running kernel ($(AC_RUNNING_KDIR)) -- cannot infer the target toolchain from host /proc/version; pass LLVM=1 (full LLVM) or CC=clang (mixed clang/GNU) explicitly if the target kernel was built with clang)
+endif
+endif
+endif
+endif
+# Effective CC for the recursive Kbuild call: explicit user CC wins,
+# otherwise the mixed-toolchain fallback (if any). Passed as a command-line
+# variable so Kbuild cannot override it.
+AC_MODULE_CC := $(if $(filter 1,$(AC_CC_EXPLICIT)),$(CC),$(AC_KBUILD_CC))
 
 obj-m += anticheat.o
 anticheat-objs := src/anticheat_module.o src/sha256.o
@@ -45,7 +98,7 @@ anticheat-objs := src/anticheat_module.o src/sha256.o
 all: module daemon
 
 module:
-	$(MAKE) -C $(KDIR) M=$(PWD) LLVM=$(LLVM) modules
+	$(MAKE) -C $(KDIR) M=$(PWD) LLVM=$(LLVM) $(if $(AC_MODULE_CC),CC="$(AC_MODULE_CC)") modules
 
 daemon: src/anticheat_daemon.c src/sha256.c src/sha256.h src/anticheat.h
 	$(CC) $(CFLAGS) -o anticheat src/anticheat_daemon.c src/sha256.c $(LDFLAGS)
