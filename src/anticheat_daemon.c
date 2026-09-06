@@ -224,6 +224,55 @@ static int read_comm(int pid, char *buf, size_t bufsz)
         buf[--r] = '\0';
     return (int)r;
 }
+/* Reads /proc/<pid>/stat field 22 (starttime, in clock ticks since boot)
+ * into *out; 0 on success, -1 if the pid is gone/unreadable or the line
+ * doesn't parse. The comm field (field 2) is parenthesized and may itself
+ * contain spaces and parens, so the fields after it are located from the
+ * LAST ')' on the line, not the first. */
+static int proc_starttime(int pid, unsigned long long *out)
+{
+    char path[64], buf[1024];
+    int fd;
+    ssize_t r;
+    char *p;
+    int i;
+
+    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+    fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return -1;
+    r = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (r <= 0)
+        return -1;
+    buf[r] = '\0';
+    p = strrchr(buf, ')');
+    if (!p || p[1] != ' ')
+        return -1;
+    p += 2;   /* skip ") ": p now points at field 3 */
+    /* starttime is field 22 -- skip fields 3..21, then read field 22. */
+    for (i = 0; i < 19; i++) {
+        while (*p == ' ')
+            p++;
+        if (*p == '\0' || *p == '\n')
+            return -1;
+        while (*p && *p != ' ' && *p != '\n')
+            p++;
+    }
+    while (*p == ' ')
+        p++;
+    {
+        char *end;
+        unsigned long long v;
+
+        errno = 0;
+        v = strtoull(p, &end, 10);
+        if (end == p || errno != 0)
+            return -1;
+        *out = v;
+        return 0;
+    }
+}
 
 /* Defined further down (the scan command's helpers); forward-declared here
  * so pid_of_comm() can reuse it instead of duplicating the readlink. */
@@ -389,6 +438,21 @@ static int cmd_protect(int argc, char **argv)
     if (ref_pid >= 0 && pid < 0)
         die("usage: --ns-of requires --pid");
 
+    /* --pid without --comm carries no name to re-validate, so pin the
+     * target by its /proc starttime instead: snapshot it here (before the
+     * ac_open() below, the widest part of the parse-to-ioctl window) and
+     * re-read immediately before the ADD_PROC ioctl. A mismatch means the
+     * pid exited and was reused in between -- refuse rather than protect
+     * the wrong process. Best-effort: if the snapshot itself fails the
+     * pid is already gone/unreadable and the ioctl below reports that
+     * authoritatively, same as before. Skipped with --ns-of, where pid
+     * names a process inside another pid namespace and the host's
+     * /proc/<pid>/stat would describe a different process (or nothing).
+     * Residual window: same-tick pid recycling (starttime granularity is
+     * jiffies), negligible against the previously unbounded window. */
+    unsigned long long protect_st0 = 0;
+    int have_protect_st0 = (!comm && pid >= 0 && ref_pid < 0 &&
+                            proc_starttime(pid, &protect_st0) == 0);
     ac_open();
     if (comm) {
         int pids[256];
@@ -428,6 +492,20 @@ static int cmd_protect(int argc, char **argv)
         }
         printf("%d process(es) protected\n", protected_count);
     } else {
+        /* Last-chance reuse check for the snapshot above: the pid → process
+         * binding may have turned over anywhere between arg parsing (via
+         * ac_open() just now) and this ioctl, and automation racing
+         * protect --pid $(pgrep foo) against exit+respawn churn would
+         * otherwise silently protect the unrelated new owner. */
+        if (have_protect_st0) {
+            unsigned long long st1;
+
+            if (proc_starttime(pid, &st1) != 0 || st1 != protect_st0) {
+                fprintf(stderr, "protect: pid %d exited or was reused "
+                        "-- refusing to protect the wrong process\n", pid);
+                return 1;
+            }
+        }
         memset(&id, 0, sizeof(id));
         id.pid = pid;
         id.ref_pid = ref_pid;
