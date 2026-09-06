@@ -578,6 +578,13 @@ static char *proc_exe_path(int pid)
     n = readlink(p, link, sizeof(link) - 1);
     if (n < 0)
         return NULL;
+    /* readlink() never NUL-terminates: n == sizeof(link)-1 means the
+     * target didn't fit, and link[] would be a silently truncated path
+     * used for identity/baseline decisions downstream. Reject it. */
+    if (n == (ssize_t)(sizeof(link) - 1)) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
     link[n] = '\0';
     return link;
 }
@@ -685,14 +692,39 @@ static int ac_scan_check_interval(void)
 static void ac_mkdir_baselines(void)
 {
     const char *d = ac_baseline_dir();
-    const char *slash = strrchr(d, '/');
-    char parent[PATH_MAX];
+    char tmp[PATH_MAX];
+    size_t len, i;
+    struct stat st;
 
-    if (slash && slash != d) {
-        snprintf(parent, sizeof(parent), "%.*s", (int)(slash - d), d);
-        mkdir(parent, 0755);
+    if (strlen(d) >= sizeof(tmp)) {
+        fprintf(stderr, "cannot create baseline directory %s: path too long\n", d);
+        return;
     }
-    mkdir(d, 0755);
+    snprintf(tmp, sizeof(tmp), "%s", d);
+    len = strlen(tmp);
+    while (len > 1 && tmp[len - 1] == '/')
+        tmp[--len] = '\0';
+    /* mkdir -p: create every missing level, ignoring EEXIST. A deeper
+     * failure (permissions, ENOTDIR from a file in the way) aborts loudly
+     * here instead of surfacing later as a confusing baseline open(). */
+    for (i = 1; i <= len; i++) {
+        if (tmp[i] != '/' && tmp[i] != '\0')
+            continue;
+        {
+            char saved = tmp[i];
+            tmp[i] = '\0';
+            if (mkdir(tmp, 0755) < 0 && errno != EEXIST) {
+                fprintf(stderr, "cannot create baseline directory %s: %s\n",
+                        tmp, strerror(errno));
+                tmp[i] = saved;
+                return;
+            }
+            tmp[i] = saved;
+        }
+    }
+    if (stat(d, &st) != 0 || !S_ISDIR(st.st_mode))
+        fprintf(stderr, "cannot create baseline directory %s: %s\n",
+                d, strerror(errno));
 }
 
 static void baseline_path_for(const char *path, char out[PATH_MAX])
@@ -1214,6 +1246,7 @@ static int find_libs_by_basenames(int pid, const char *const *prefixes,
 {
     struct ac_scan_begin b;
     unsigned int v, k;
+    int scan_failed = 0;
 
     for (k = 0; k < n; k++) {
         results[k].found = 0;
@@ -1234,8 +1267,14 @@ static int find_libs_by_basenames(int pid, const char *const *prefixes,
         memset(&g, 0, sizeof(g));
         g.pid = pid;
         g.index = v;
-        if (ioctl(dev_fd, AC_IOCTL_SCAN_GET, &g) < 0)
+        if (ioctl(dev_fd, AC_IOCTL_SCAN_GET, &g) < 0) {
+            /* A transient failure mid-scan would otherwise fall through
+             * to the success return below, letting libraries later in
+             * the VMA list go silently unchecked. Flag it so the
+             * caller reports inconclusive instead of clean. */
+            scan_failed = 1;
             break;
+        }
         vi = &g.vma;
         if (!vi->is_file || !vi->path[0])
             continue;
@@ -1253,7 +1292,7 @@ static int find_libs_by_basenames(int pid, const char *const *prefixes,
         }
     }
     ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL);
-    return 0;
+    return scan_failed ? -1 : 0;
 }
 
 /* render_hook_statuses_for(): the single source of truth both the
@@ -2151,7 +2190,9 @@ static int ac_read_environ_vars(int pid, struct ac_environ_query *vars,
      * the whole file -- a real Steam/Proton/Flatpak launch environment
      * can comfortably exceed one read's worth. */
     while (total < AC_ENVIRON_BUF - 1) {
-        n = read(fd, buf + total, AC_ENVIRON_BUF - 1 - total);
+        do {
+            n = read(fd, buf + total, AC_ENVIRON_BUF - 1 - total);
+        } while (n < 0 && errno == EINTR);
         if (n < 0) {
             close(fd);
             free(buf);
@@ -3866,7 +3907,15 @@ static int cmd_start(int argc, char **argv)
                                ev_type_str(e->type), e->pid, e->comm, e->data);
                 }
             }
-            now = time(NULL);
+            /* Monotonic scheduling: wall-clock jumps (NTP step, manual
+             * settimeofday) must not suppress checks or fire a burst.
+             * time(NULL) stays only where wall time is needed (report
+             * payloads in ac_report()). */
+            {
+                struct timespec ts;
+                clock_gettime(CLOCK_MONOTONIC, &ts);
+                now = ts.tv_sec;
+            }
             if (now >= next_sys) {
                 check_syscalls_periodic();
                 next_sys = now + 5;
