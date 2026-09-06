@@ -3503,9 +3503,13 @@ static void ac_report(const char *event_type, const char *detail)
          * socket has set) -- checking only for a negative return and
          * assuming anything else means the whole request went out would
          * let a partial, malformed HTTP request reach the server
-         * silently. */
+         * silently. MSG_NOSIGNAL keeps a peer/server-side reset between
+         * connect() and here from raising SIGPIPE (default: kill the
+         * whole daemon, see below) -- the write then fails with EPIPE
+         * instead, which the w < 0 branch already treats as a normal
+         * reconnect-triggering error. */
         while (sent < reqlen) {
-            ssize_t w = write(fd, req + sent, reqlen - sent);
+            ssize_t w = send(fd, req + sent, reqlen - sent, MSG_NOSIGNAL);
 
             if (w < 0) {
                 fprintf(stderr, "ac_report: send failed: %s\n", strerror(errno));
@@ -3849,6 +3853,16 @@ static void usage(const char *prog)
 
 int main(int argc, char **argv)
 {
+    /* ac_report() writes to TCP/unix report sockets from the monitor loop
+     * and, via logmsg() at LOG_CRIT, from any other command path. If the
+     * server/proxy resets the connection between connect() and send(),
+     * the default SIGPIPE disposition would kill the whole daemon silently,
+     * mid-detection. Ignore it process-wide so the send fails with EPIPE
+     * instead, which ac_report() already handles as a normal delivery
+     * failure. The send() there also passes MSG_NOSIGNAL as a second,
+     * per-call layer for the same reason. */
+    signal(SIGPIPE, SIG_IGN);
+
     const char *cmd = argc > 1 ? argv[1] : "help";
 
     if (geteuid() != 0 && strcmp(cmd, "help") != 0) {
