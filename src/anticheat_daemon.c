@@ -947,8 +947,15 @@ static int elf_find_symbol_offset(int fd, const char *symbol, uint64_t *offset_o
 
         for (i = 0; i < eh.e_shnum; i++) {
             const char *name;
+            size_t remaining;
 
             if (shdrs[i].sh_name >= shstr->sh_size)
+                continue;
+            /* shstrtab comes from an untrusted ELF: strcmp() below would
+             * read past the heap buffer if the name has no NUL within
+             * bounds. Skip unterminated entries. */
+            remaining = (size_t)(shstr->sh_size - shdrs[i].sh_name);
+            if (strnlen(shstrtab + shdrs[i].sh_name, remaining) == remaining)
                 continue;
             name = shstrtab + shdrs[i].sh_name;
             if (shdrs[i].sh_type == SHT_DYNSYM && strcmp(name, ".dynsym") == 0)
@@ -977,8 +984,15 @@ static int elf_find_symbol_offset(int fd, const char *symbol, uint64_t *offset_o
         goto out;
 
     for (i = 0; i < nsyms; i++) {
+        size_t remaining;
+
         if (syms[i].st_name == 0 || syms[i].st_name >= dynstr->sh_size ||
             syms[i].st_value == 0)
+            continue;
+        /* Same unterminated-string hazard as shstrtab above, against
+         * dynstrtab. Skip entries with no NUL in bounds. */
+        remaining = (size_t)(dynstr->sh_size - syms[i].st_name);
+        if (strnlen(dynstrtab + syms[i].st_name, remaining) == remaining)
             continue;
         if (strcmp(dynstrtab + syms[i].st_name, symbol) == 0) {
             *offset_out = syms[i].st_value;
