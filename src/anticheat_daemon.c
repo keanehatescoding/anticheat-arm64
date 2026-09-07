@@ -773,17 +773,18 @@ struct ac_baseline_rec {
  * identically. NULL when the caller is about to overwrite the file
  * anyway (baseline_save_record()'s own reload below) since a legacy line
  * there just needs dropping, not reporting. */
-static int baseline_load_records(const char *blpath, struct ac_baseline_rec *out,
+/* Parse core shared by the by-name reader below and the descriptor-stable
+ * reload inside baseline_save_record() -- parsing never resolves a path,
+ * so every caller gets identical record semantics from whatever FILE* it
+ * hands in. */
+static int baseline_parse_records(FILE *f, struct ac_baseline_rec *out,
                                   int *out_legacy)
 {
-    FILE *f = fopen(blpath, "r");
     char line[512];
     int n = 0;
 
     if (out_legacy)
         *out_legacy = 0;
-    if (!f)
-        return 0;
     while (n < AC_BASELINE_MAX_RECORDS && fgets(line, sizeof(line), f)) {
         struct ac_baseline_rec *r = &out[n];
 
@@ -800,7 +801,50 @@ static int baseline_load_records(const char *blpath, struct ac_baseline_rec *out
                 *out_legacy = 1;
         }
     }
+    return n;
+}
+
+static int baseline_load_records(const char *blpath, struct ac_baseline_rec *out,
+                                  int *out_legacy)
+{
+    FILE *f = fopen(blpath, "r");
+    int n;
+
+    if (!f) {
+        if (out_legacy)
+            *out_legacy = 0;
+        return 0;
+    }
+    n = baseline_parse_records(f, out, out_legacy);
     fclose(f);
+    return n;
+}
+
+/* Reloads the baseline file already held LOCK_EX via lock_fd, reading
+ * through the descriptor itself (dup'ed so fclose() closes only the copy
+ * and the flock survives until baseline_save_record()'s final unlock).
+ * Nothing here re-resolves blpath by name, so a symlink or replacement
+ * file swapped in after the caller's open-lock-verify cannot redirect
+ * the merge source -- the records read are always the locked inode's
+ * own. Returns the record count, or -1 with errno set. */
+static int baseline_load_locked(int lock_fd, struct ac_baseline_rec *out)
+{
+    FILE *rf;
+    int rdfd, n;
+
+    rdfd = dup(lock_fd);
+    if (rdfd < 0)
+        return -1;
+    rf = fdopen(rdfd, "r");
+    if (!rf) {
+        int e = errno;
+
+        close(rdfd);
+        errno = e;
+        return -1;
+    }
+    n = baseline_parse_records(rf, out, NULL);
+    fclose(rf);
     return n;
 }
 
@@ -869,7 +913,12 @@ static int baseline_find_record(const struct ac_baseline_rec *recs, int n,
  * or a process killed mid-fprintf() loop leaves blpath truncated with
  * only some of the previously-valid records rewritten -- exactly the
  * kind of silent baseline-coverage loss this file exists to prevent
- * (#51). rename() within the same directory is atomic, so a reader
+ * (#51). Writers serialize on a stable .lock sibling (never renamed, so
+ * the flock inode cannot go stale the way a lock on blpath itself can
+ * across a peer's rename), and the reload-then-merge reads through the
+ * identity-checked data descriptor, so a path swap mid-save cannot
+ * smuggle foreign records into the merge. rename()
+ * within the same directory is atomic, so a reader
  * (baseline_load_records()) never observes a half-written file. */
 static int baseline_save_record(const char *blpath, unsigned long long inode,
                                  unsigned long long offset, unsigned long long size,
@@ -877,10 +926,29 @@ static int baseline_save_record(const char *blpath, unsigned long long inode,
 {
     struct ac_baseline_rec recs[AC_BASELINE_MAX_RECORDS];
     char tmp_path[PATH_MAX];
-    int i, kept = 0, n, lock_fd, tmp_fd, saved_errno;
+    char lock_path[PATH_MAX];
+    int i, kept = 0, n, lock_fd, data_fd, tmp_fd, saved_errno;
     FILE *f;
 
-    lock_fd = open(blpath, O_RDWR | O_CREAT, 0644);
+    /* Stable lock inode (review on #6): flock() guards an inode, not a
+     * name, so locking blpath itself races peer renames -- a waiter can
+     * lock a stale inode while blpath already names a newer file, and no
+     * bounded open-lock-verify retry converges under real contention
+     * (proven by a threaded smoke test: 3 of 8 concurrent savers starved
+     * on 3 retries). Instead serialize on a lockfile sibling whose inode
+     * never changes (only blpath is ever renamed, never the .lock path),
+     * then open + identity-check the data file while peer renames are
+     * excluded. O_NOFOLLOW on both opens: a symlink at either path fails
+     * loud with ELOOP. 0600 (#6): baselines are integrity references, no
+     * reason for every local user to read them. The .lock files persist
+     * next to their baselines -- unlinking a lockfile would reintroduce
+     * the very inode-vs-name race this exists to prevent. */
+    if (snprintf(lock_path, sizeof(lock_path), "%s.lock", blpath) >=
+        (int)sizeof(lock_path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    lock_fd = open(lock_path, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
     if (lock_fd < 0)
         return -1;
     if (flock(lock_fd, LOCK_EX) < 0) {
@@ -890,7 +958,46 @@ static int baseline_save_record(const char *blpath, unsigned long long inode,
         return -1;
     }
 
-    n = baseline_load_records(blpath, recs, NULL);
+    /* No peer rename can interleave between here and the rename() below,
+     * so a single identity check suffices -- a mismatch now means a third
+     * party (not a fellow saver) swapped blpath after open, and failing
+     * loud beats merging records the lock never covered. */
+    data_fd = open(blpath, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
+    if (data_fd < 0) {
+        saved_errno = errno;
+        flock(lock_fd, LOCK_UN);
+        close(lock_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    {
+        struct stat fst, lst;
+
+        if (fstat(data_fd, &fst) < 0 || !S_ISREG(fst.st_mode) ||
+            lstat(blpath, &lst) < 0 || !S_ISREG(lst.st_mode) ||
+            fst.st_dev != lst.st_dev || fst.st_ino != lst.st_ino) {
+            saved_errno = errno;
+            close(data_fd);
+            flock(lock_fd, LOCK_UN);
+            close(lock_fd);
+            errno = (saved_errno != 0) ? saved_errno : ELOOP;
+            return -1;
+        }
+    }
+
+    /* Reload through the data descriptor, never by name: nothing between
+     * the check above and this read re-resolves blpath (dup shares
+     * data_fd's inode), so a swap in between cannot redirect the merge
+     * source. data_fd's job is done once the records are in memory. */
+    n = baseline_load_locked(data_fd, recs);
+    saved_errno = errno;
+    close(data_fd);
+    if (n < 0) {
+        flock(lock_fd, LOCK_UN);
+        close(lock_fd);
+        errno = saved_errno;
+        return -1;
+    }
     for (i = 0; i < n; i++)
         if (recs[i].inode != inode || recs[i].offset != offset ||
             recs[i].size != size)
@@ -922,7 +1029,10 @@ static int baseline_save_record(const char *blpath, unsigned long long inode,
         errno = saved_errno;
         return -1;
     }
-    fchmod(tmp_fd, 0644);
+    /* mkstemp already creates 0600; keep it that way explicitly (#6) so a
+     * future edit can't silently loosen baselines back to world-readable
+     * the way the old fchmod(0644) did. */
+    fchmod(tmp_fd, 0600);
     f = fdopen(tmp_fd, "w");
     if (!f) {
         saved_errno = errno;
@@ -1132,8 +1242,9 @@ out:
 
 /* Reads `symbol` from libpath (resolved via the target's own
  * /proc/<pid>/root/ -- see below) and compares against the same offset
- * in the target pid's live memory (lib_base = that mapping's lowest VMA
- * start, i.e. its file-offset-0 load address). Compares the symbol's
+ * in the target pid's live memory (lib_base = that library's file-offset-0
+ * mapping's start, falling back to its lowest VMA start -- see
+ * find_libs_by_basenames()). Compares the symbol's
  * *entire* declared length (its ELF st_size, clamped to
  * [AC_HOOK_CHECK_MIN_BYTES, AC_HOOK_CHECK_MAX_BYTES], or
  * AC_HOOK_CHECK_DEFAULT_BYTES if the symbol table has no usable size for
@@ -1238,6 +1349,10 @@ static const struct {
 struct ac_lib_result {
     int found;                    /* 1 = located, 0 = not loaded */
     unsigned long long lib_base;
+    /* 1 once lib_base comes from a file-offset-0 VMA (#7) -- an
+     * offset-0 mapping is the library's true load base, so it always
+     * outranks a lower-addressed non-zero-offset VMA. */
+    int base_is_file_start;
     char libpath[AC_VMA_PATH];
 };
 
@@ -1261,6 +1376,7 @@ static int find_libs_by_basenames(int pid, const char *const *prefixes,
     for (k = 0; k < n; k++) {
         results[k].found = 0;
         results[k].lib_base = 0;
+        results[k].base_is_file_start = 0;
         results[k].libpath[0] = '\0';
     }
 
@@ -1293,13 +1409,43 @@ static int find_libs_by_basenames(int pid, const char *const *prefixes,
         for (k = 0; k < n; k++) {
             if (strncmp(base, prefixes[k], prefix_lens[k]) != 0)
                 continue;
-            if (!results[k].found || vi->start < results[k].lib_base) {
+            /* Prefer the file-offset-0 mapping as the load base (#7):
+             * min-VMA-start is usually the same mapping, but an unusual
+             * segment layout could put a non-zero-offset VMA lower, and
+             * lib_base + st_value would then point at the wrong bytes.
+             * A zero-offset VMA always outranks a fallback one; among
+             * same-kind candidates keep the lowest start. */
+            if (vi->offset == 0) {
+                if (!results[k].found || !results[k].base_is_file_start ||
+                    vi->start < results[k].lib_base) {
+                    results[k].lib_base = vi->start;
+                    snprintf(results[k].libpath, sizeof(results[k].libpath),
+                             "%s", vi->path);
+                    results[k].found = 1;
+                    results[k].base_is_file_start = 1;
+                }
+            } else if (!results[k].found) {
                 results[k].lib_base = vi->start;
                 snprintf(results[k].libpath, sizeof(results[k].libpath),
                          "%s", vi->path);
                 results[k].found = 1;
+            } else if (!results[k].base_is_file_start &&
+                       vi->start < results[k].lib_base) {
+                results[k].lib_base = vi->start;
+                snprintf(results[k].libpath, sizeof(results[k].libpath),
+                         "%s", vi->path);
             }
         }
+    }
+    /* Fallback notice (#7): LOG_INFO is verbose-only per logmsg(), so the
+     * periodic silent-unless-hooked sweep stays quiet while a CLI run with
+     * -v (or syslog at info level) still shows which library had no
+     * offset-0 mapping to anchor on. */
+    for (k = 0; k < n; k++) {
+        if (results[k].found && !results[k].base_is_file_start)
+            logmsg(LOG_INFO, "pid %d: %s has no file-offset-0 VMA, using "
+                   "lowest-address mapping 0x%llx as fallback base",
+                   pid, results[k].libpath, results[k].lib_base);
     }
     ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL);
     return scan_failed ? -1 : 0;
