@@ -773,17 +773,18 @@ struct ac_baseline_rec {
  * identically. NULL when the caller is about to overwrite the file
  * anyway (baseline_save_record()'s own reload below) since a legacy line
  * there just needs dropping, not reporting. */
-static int baseline_load_records(const char *blpath, struct ac_baseline_rec *out,
+/* Parse core shared by the by-name reader below and the descriptor-stable
+ * reload inside baseline_save_record() -- parsing never resolves a path,
+ * so every caller gets identical record semantics from whatever FILE* it
+ * hands in. */
+static int baseline_parse_records(FILE *f, struct ac_baseline_rec *out,
                                   int *out_legacy)
 {
-    FILE *f = fopen(blpath, "r");
     char line[512];
     int n = 0;
 
     if (out_legacy)
         *out_legacy = 0;
-    if (!f)
-        return 0;
     while (n < AC_BASELINE_MAX_RECORDS && fgets(line, sizeof(line), f)) {
         struct ac_baseline_rec *r = &out[n];
 
@@ -800,7 +801,50 @@ static int baseline_load_records(const char *blpath, struct ac_baseline_rec *out
                 *out_legacy = 1;
         }
     }
+    return n;
+}
+
+static int baseline_load_records(const char *blpath, struct ac_baseline_rec *out,
+                                  int *out_legacy)
+{
+    FILE *f = fopen(blpath, "r");
+    int n;
+
+    if (!f) {
+        if (out_legacy)
+            *out_legacy = 0;
+        return 0;
+    }
+    n = baseline_parse_records(f, out, out_legacy);
     fclose(f);
+    return n;
+}
+
+/* Reloads the baseline file already held LOCK_EX via lock_fd, reading
+ * through the descriptor itself (dup'ed so fclose() closes only the copy
+ * and the flock survives until baseline_save_record()'s final unlock).
+ * Nothing here re-resolves blpath by name, so a symlink or replacement
+ * file swapped in after the caller's open-lock-verify cannot redirect
+ * the merge source -- the records read are always the locked inode's
+ * own. Returns the record count, or -1 with errno set. */
+static int baseline_load_locked(int lock_fd, struct ac_baseline_rec *out)
+{
+    FILE *rf;
+    int rdfd, n;
+
+    rdfd = dup(lock_fd);
+    if (rdfd < 0)
+        return -1;
+    rf = fdopen(rdfd, "r");
+    if (!rf) {
+        int e = errno;
+
+        close(rdfd);
+        errno = e;
+        return -1;
+    }
+    n = baseline_parse_records(rf, out, NULL);
+    fclose(rf);
     return n;
 }
 
@@ -869,7 +913,12 @@ static int baseline_find_record(const struct ac_baseline_rec *recs, int n,
  * or a process killed mid-fprintf() loop leaves blpath truncated with
  * only some of the previously-valid records rewritten -- exactly the
  * kind of silent baseline-coverage loss this file exists to prevent
- * (#51). rename() within the same directory is atomic, so a reader
+ * (#51). Writers serialize on a stable .lock sibling (never renamed, so
+ * the flock inode cannot go stale the way a lock on blpath itself can
+ * across a peer's rename), and the reload-then-merge reads through the
+ * identity-checked data descriptor, so a path swap mid-save cannot
+ * smuggle foreign records into the merge. rename()
+ * within the same directory is atomic, so a reader
  * (baseline_load_records()) never observes a half-written file. */
 static int baseline_save_record(const char *blpath, unsigned long long inode,
                                  unsigned long long offset, unsigned long long size,
@@ -877,16 +926,29 @@ static int baseline_save_record(const char *blpath, unsigned long long inode,
 {
     struct ac_baseline_rec recs[AC_BASELINE_MAX_RECORDS];
     char tmp_path[PATH_MAX];
-    int i, kept = 0, n, lock_fd, tmp_fd, saved_errno;
+    char lock_path[PATH_MAX];
+    int i, kept = 0, n, lock_fd, data_fd, tmp_fd, saved_errno;
     FILE *f;
 
-    /* O_NOFOLLOW: refuse to follow a symlink swapped in at blpath (#6) --
-     * without it, a symlink here would redirect the lock+read below (and
-     * the final rename) through an attacker-chosen path whenever
-     * AC_BASELINE_DIR is writable by someone other than root. 0600 (not
-     * the old 0644): baselines are integrity references, no reason for
-     * every local user to read them. */
-    lock_fd = open(blpath, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
+    /* Stable lock inode (review on #6): flock() guards an inode, not a
+     * name, so locking blpath itself races peer renames -- a waiter can
+     * lock a stale inode while blpath already names a newer file, and no
+     * bounded open-lock-verify retry converges under real contention
+     * (proven by a threaded smoke test: 3 of 8 concurrent savers starved
+     * on 3 retries). Instead serialize on a lockfile sibling whose inode
+     * never changes (only blpath is ever renamed, never the .lock path),
+     * then open + identity-check the data file while peer renames are
+     * excluded. O_NOFOLLOW on both opens: a symlink at either path fails
+     * loud with ELOOP. 0600 (#6): baselines are integrity references, no
+     * reason for every local user to read them. The .lock files persist
+     * next to their baselines -- unlinking a lockfile would reintroduce
+     * the very inode-vs-name race this exists to prevent. */
+    if (snprintf(lock_path, sizeof(lock_path), "%s.lock", blpath) >=
+        (int)sizeof(lock_path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    lock_fd = open(lock_path, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
     if (lock_fd < 0)
         return -1;
     if (flock(lock_fd, LOCK_EX) < 0) {
@@ -896,7 +958,46 @@ static int baseline_save_record(const char *blpath, unsigned long long inode,
         return -1;
     }
 
-    n = baseline_load_records(blpath, recs, NULL);
+    /* No peer rename can interleave between here and the rename() below,
+     * so a single identity check suffices -- a mismatch now means a third
+     * party (not a fellow saver) swapped blpath after open, and failing
+     * loud beats merging records the lock never covered. */
+    data_fd = open(blpath, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
+    if (data_fd < 0) {
+        saved_errno = errno;
+        flock(lock_fd, LOCK_UN);
+        close(lock_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    {
+        struct stat fst, lst;
+
+        if (fstat(data_fd, &fst) < 0 || !S_ISREG(fst.st_mode) ||
+            lstat(blpath, &lst) < 0 || !S_ISREG(lst.st_mode) ||
+            fst.st_dev != lst.st_dev || fst.st_ino != lst.st_ino) {
+            saved_errno = errno;
+            close(data_fd);
+            flock(lock_fd, LOCK_UN);
+            close(lock_fd);
+            errno = (saved_errno != 0) ? saved_errno : ELOOP;
+            return -1;
+        }
+    }
+
+    /* Reload through the data descriptor, never by name: nothing between
+     * the check above and this read re-resolves blpath (dup shares
+     * data_fd's inode), so a swap in between cannot redirect the merge
+     * source. data_fd's job is done once the records are in memory. */
+    n = baseline_load_locked(data_fd, recs);
+    saved_errno = errno;
+    close(data_fd);
+    if (n < 0) {
+        flock(lock_fd, LOCK_UN);
+        close(lock_fd);
+        errno = saved_errno;
+        return -1;
+    }
     for (i = 0; i < n; i++)
         if (recs[i].inode != inode || recs[i].offset != offset ||
             recs[i].size != size)
