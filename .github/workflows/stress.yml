@@ -22,10 +22,14 @@ jobs:
   stress:
     name: server/stress_test.sh (sustained concurrent load)
     runs-on: ubuntu-latest
-    # Default worker duration is 300s (see inputs above) plus setup overhead;
-    # a hung worker must fail fast, not sit on a runner until the 360-minute
-    # platform default.
-    timeout-minutes: 15
+    # Must cover the longest documented soak (STRESS_DURATION=1800, see
+    # server/stress_test.sh) plus setup overhead -- not just the 300s
+    # dispatch default. A hung worker still fails fast instead of sitting
+    # on a runner until the 360-minute platform default; dispatches longer
+    # than ~3300s need a timeout bump alongside. A derived expression was
+    # considered, but timeout-minutes must be a positive integer and
+    # duration/60 is fractional for non-multiple-of-60 inputs.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
 
