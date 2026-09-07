@@ -22,6 +22,10 @@ jobs:
   stress:
     name: server/stress_test.sh (sustained concurrent load)
     runs-on: ubuntu-latest
+    # Default worker duration is 300s (see inputs above) plus setup overhead;
+    # a hung worker must fail fast, not sit on a runner until the 360-minute
+    # platform default.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 

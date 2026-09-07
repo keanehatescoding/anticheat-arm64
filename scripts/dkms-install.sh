@@ -51,7 +51,7 @@ if [[ ! -e "$DEST" ]]; then
     cp -a "${SRC_DIR}/src" "$DEST/"
 fi
 
-dkms add    -m "$NAME" -v "$VERSION"
+dkms add    -m "$NAME" -v "$VERSION" 2>/dev/null || true
 dkms build  -m "$NAME" -v "$VERSION"
 dkms install -m "$NAME" -v "$VERSION"
 

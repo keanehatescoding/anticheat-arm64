@@ -254,13 +254,15 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Check whether src/anticheat_module.c changed
+      - name: Check whether module or fuzz sources changed
         id: filter
         uses: dorny/paths-filter@v4
         with:
           filters: |
             module:
               - 'src/anticheat_module.c'
+              - 'src/anticheat.h'
+              - 'test/ioctl_fuzz.c'
 
   # --- real-module fuzz seed: short KASAN run against the actual module ---
   # THREAT_MODEL.md's "What 'production-ready' claims today" section

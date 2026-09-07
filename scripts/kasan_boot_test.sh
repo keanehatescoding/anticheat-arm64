@@ -50,7 +50,9 @@ KDIR="$WORKDIR/linux-$KVER"
 # timeout-minutes, or a local Ctrl-C) -- a log that only reached its
 # final home via a post-vng `cp` would be lost in exactly the cases
 # where the partial output matters most for diagnosis.
-CONSOLE_LOG="$REPO_ROOT/kasan-console.log"
+# PID suffix so concurrent invocations (local run + CI, future parallel
+# matrix) don't overwrite each other's console log mid-write.
+CONSOLE_LOG="$REPO_ROOT/kasan-console-$$.log"
 
 cleanup() {
     rm -rf "$WORKDIR"
