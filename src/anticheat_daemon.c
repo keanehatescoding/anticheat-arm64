@@ -696,8 +696,12 @@ static void ac_mkdir_baselines(void)
     size_t len, i;
     struct stat st;
 
-    if (strlen(d) >= sizeof(tmp)) {
-        fprintf(stderr, "cannot create baseline directory %s: path too long\n", d);
+    /* baseline_path_for() appends "/<64-hex>.txt" (69 chars + NUL = 70);
+     * a dir that fits PATH_MAX alone can still truncate the file path
+     * via snprintf(), failing or hitting the wrong file. Budget it here. */
+    if (strlen(d) + 70 > sizeof(tmp)) {
+        fprintf(stderr, "cannot create baseline directory %s: path too long "
+                "(no room for /<hash>.txt)\n", d);
         return;
     }
     snprintf(tmp, sizeof(tmp), "%s", d);
@@ -722,17 +726,23 @@ static void ac_mkdir_baselines(void)
             tmp[i] = saved;
         }
     }
-    if (stat(d, &st) != 0 || !S_ISDIR(st.st_mode))
+    if (stat(d, &st) != 0)
         fprintf(stderr, "cannot create baseline directory %s: %s\n",
                 d, strerror(errno));
+    else if (!S_ISDIR(st.st_mode))
+        fprintf(stderr, "cannot create baseline directory %s: not a directory\n",
+                d);
 }
 
 static void baseline_path_for(const char *path, char out[PATH_MAX])
 {
     char hex[65];
+    int n;
 
     ac_sha256_hex(path, strlen(path), hex);
-    snprintf(out, PATH_MAX, "%s/%s.txt", ac_baseline_dir(), hex);
+    n = snprintf(out, PATH_MAX, "%s/%s.txt", ac_baseline_dir(), hex);
+    if (n < 0 || n >= PATH_MAX)
+        out[0] = '\0';
 }
 
 /* One baseline file per path (see baseline_path_for()) can hold multiple
