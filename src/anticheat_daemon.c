@@ -880,7 +880,13 @@ static int baseline_save_record(const char *blpath, unsigned long long inode,
     int i, kept = 0, n, lock_fd, tmp_fd, saved_errno;
     FILE *f;
 
-    lock_fd = open(blpath, O_RDWR | O_CREAT, 0644);
+    /* O_NOFOLLOW: refuse to follow a symlink swapped in at blpath (#6) --
+     * without it, a symlink here would redirect the lock+read below (and
+     * the final rename) through an attacker-chosen path whenever
+     * AC_BASELINE_DIR is writable by someone other than root. 0600 (not
+     * the old 0644): baselines are integrity references, no reason for
+     * every local user to read them. */
+    lock_fd = open(blpath, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
     if (lock_fd < 0)
         return -1;
     if (flock(lock_fd, LOCK_EX) < 0) {
@@ -922,7 +928,10 @@ static int baseline_save_record(const char *blpath, unsigned long long inode,
         errno = saved_errno;
         return -1;
     }
-    fchmod(tmp_fd, 0644);
+    /* mkstemp already creates 0600; keep it that way explicitly (#6) so a
+     * future edit can't silently loosen baselines back to world-readable
+     * the way the old fchmod(0644) did. */
+    fchmod(tmp_fd, 0600);
     f = fdopen(tmp_fd, "w");
     if (!f) {
         saved_errno = errno;
@@ -1132,8 +1141,9 @@ out:
 
 /* Reads `symbol` from libpath (resolved via the target's own
  * /proc/<pid>/root/ -- see below) and compares against the same offset
- * in the target pid's live memory (lib_base = that mapping's lowest VMA
- * start, i.e. its file-offset-0 load address). Compares the symbol's
+ * in the target pid's live memory (lib_base = that library's file-offset-0
+ * mapping's start, falling back to its lowest VMA start -- see
+ * find_libs_by_basenames()). Compares the symbol's
  * *entire* declared length (its ELF st_size, clamped to
  * [AC_HOOK_CHECK_MIN_BYTES, AC_HOOK_CHECK_MAX_BYTES], or
  * AC_HOOK_CHECK_DEFAULT_BYTES if the symbol table has no usable size for
@@ -1238,6 +1248,10 @@ static const struct {
 struct ac_lib_result {
     int found;                    /* 1 = located, 0 = not loaded */
     unsigned long long lib_base;
+    /* 1 once lib_base comes from a file-offset-0 VMA (#7) -- an
+     * offset-0 mapping is the library's true load base, so it always
+     * outranks a lower-addressed non-zero-offset VMA. */
+    int base_is_file_start;
     char libpath[AC_VMA_PATH];
 };
 
@@ -1261,6 +1275,7 @@ static int find_libs_by_basenames(int pid, const char *const *prefixes,
     for (k = 0; k < n; k++) {
         results[k].found = 0;
         results[k].lib_base = 0;
+        results[k].base_is_file_start = 0;
         results[k].libpath[0] = '\0';
     }
 
@@ -1293,13 +1308,43 @@ static int find_libs_by_basenames(int pid, const char *const *prefixes,
         for (k = 0; k < n; k++) {
             if (strncmp(base, prefixes[k], prefix_lens[k]) != 0)
                 continue;
-            if (!results[k].found || vi->start < results[k].lib_base) {
+            /* Prefer the file-offset-0 mapping as the load base (#7):
+             * min-VMA-start is usually the same mapping, but an unusual
+             * segment layout could put a non-zero-offset VMA lower, and
+             * lib_base + st_value would then point at the wrong bytes.
+             * A zero-offset VMA always outranks a fallback one; among
+             * same-kind candidates keep the lowest start. */
+            if (vi->offset == 0) {
+                if (!results[k].found || !results[k].base_is_file_start ||
+                    vi->start < results[k].lib_base) {
+                    results[k].lib_base = vi->start;
+                    snprintf(results[k].libpath, sizeof(results[k].libpath),
+                             "%s", vi->path);
+                    results[k].found = 1;
+                    results[k].base_is_file_start = 1;
+                }
+            } else if (!results[k].found) {
                 results[k].lib_base = vi->start;
                 snprintf(results[k].libpath, sizeof(results[k].libpath),
                          "%s", vi->path);
                 results[k].found = 1;
+            } else if (!results[k].base_is_file_start &&
+                       vi->start < results[k].lib_base) {
+                results[k].lib_base = vi->start;
+                snprintf(results[k].libpath, sizeof(results[k].libpath),
+                         "%s", vi->path);
             }
         }
+    }
+    /* Fallback notice (#7): LOG_INFO is verbose-only per logmsg(), so the
+     * periodic silent-unless-hooked sweep stays quiet while a CLI run with
+     * -v (or syslog at info level) still shows which library had no
+     * offset-0 mapping to anchor on. */
+    for (k = 0; k < n; k++) {
+        if (results[k].found && !results[k].base_is_file_start)
+            logmsg(LOG_INFO, "pid %d: %s has no file-offset-0 VMA, using "
+                   "lowest-address mapping 0x%llx as fallback base",
+                   pid, results[k].libpath, results[k].lib_base);
     }
     ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL);
     return scan_failed ? -1 : 0;
