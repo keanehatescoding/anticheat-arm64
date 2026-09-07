@@ -22,7 +22,30 @@ jobs:
   stress:
     name: server/stress_test.sh (sustained concurrent load)
     runs-on: ubuntu-latest
+    # Must cover the longest documented soak (STRESS_DURATION=1800, see
+    # server/stress_test.sh) plus setup overhead -- not just the 300s
+    # dispatch default. A hung worker still fails fast instead of sitting
+    # on a runner until the 360-minute platform default. The validation
+    # step below rejects durations beyond ~3300s; longer runs need a
+    # timeout bump alongside (a derived expression was considered, but
+    # timeout-minutes must be a positive integer and duration/60 is
+    # fractional for non-multiple-of-60 inputs).
+    timeout-minutes: 60
     steps:
+      - name: Validate duration fits the job timeout
+        env:
+          STRESS_DURATION: ${{ inputs.duration || '300' }}
+        run: |
+          if ! [[ "$STRESS_DURATION" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::duration must be a positive integer (got '$STRESS_DURATION')" >&2
+            exit 1
+          fi
+          # 60-minute job timeout minus setup/upload overhead.
+          if [ "$STRESS_DURATION" -gt 3300 ]; then
+            echo "::error::duration $STRESS_DURATION exceeds the 60-minute job timeout budget (max ~3300s) -- bump timeout-minutes alongside" >&2
+            exit 1
+          fi
+
       - uses: actions/checkout@v7
 
       - name: Run the stress test

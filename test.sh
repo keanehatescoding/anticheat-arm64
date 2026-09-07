@@ -151,8 +151,8 @@ SPAWNTEST_PID=""
 
 say "registry survives leader-only exit: mm-keyed entry needs no migration (#62)"
 coproc MIGTEST { ./test/thread_exit_migration_test; }
-read -r _ MAIN_TID <&"${MIGTEST[0]}"
-read -r _ WORKER_TID <&"${MIGTEST[0]}"
+read -r -t 5 _ MAIN_TID <&"${MIGTEST[0]}" || MAIN_TID=""
+read -r -t 5 _ WORKER_TID <&"${MIGTEST[0]}" || WORKER_TID=""
 if [ -n "$MAIN_TID" ] && [ -n "$WORKER_TID" ]; then
     # Baseline: confirm an attach to the worker actually succeeds before
     # protection is in place. Without this, an unrelated strace failure

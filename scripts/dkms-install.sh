@@ -51,7 +51,15 @@ if [[ ! -e "$DEST" ]]; then
     cp -a "${SRC_DIR}/src" "$DEST/"
 fi
 
-dkms add    -m "$NAME" -v "$VERSION"
+# Skip add when already registered (verified: `dkms status -m/-v` prints
+# nothing, exit 0, for an unregistered module). A genuine add failure
+# still aborts loudly under `set -e` with diagnostics intact -- unlike
+# `|| true`, which would swallow real errors too.
+if dkms status -m "$NAME" -v "$VERSION" 2>/dev/null | grep -q .; then
+    echo "DKMS module ${NAME}/${VERSION} already registered, skipping add"
+else
+    dkms add -m "$NAME" -v "$VERSION"
+fi
 dkms build  -m "$NAME" -v "$VERSION"
 dkms install -m "$NAME" -v "$VERSION"
 
