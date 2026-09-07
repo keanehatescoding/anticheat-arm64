@@ -357,6 +357,6 @@ jobs:
         with:
           name: kasan-fuzz-seed-failure
           path: |
-            kasan-console.log
+            kasan-console-*.log
             anticheat.ko
           if-no-files-found: ignore
