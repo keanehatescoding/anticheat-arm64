@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Build with warnings-as-errors, run the full mock suite
         run: make ci
@@ -113,7 +113,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install toolchain
         run: |
@@ -250,7 +250,7 @@ jobs:
       # checkout has neither, which would force it into the GitHub REST API
       # fallback path (needing broader permissions this workflow doesn't
       # otherwise grant) or fail outright on a push event.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -297,7 +297,7 @@ jobs:
     steps:
       # persist-credentials: false -- same reasoning as kasan-boot.yml:
       # no later step needs authenticated git access.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
