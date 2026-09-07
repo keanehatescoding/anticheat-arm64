@@ -735,9 +735,9 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
             event_type = body.get("event_type")
             detail = body.get("detail")
             client_ts = body.get("ts")
-            if not isinstance(event_type, str) or len(event_type) > 64:
+            if not isinstance(event_type, str) or not (0 < len(event_type) <= 64):
                 return self._send_json(400, {"error": "invalid event_type"})
-            if not isinstance(detail, str) or len(detail) > 2000:
+            if not isinstance(detail, str) or not (0 < len(detail) <= 2000):
                 return self._send_json(400, {"error": "invalid detail"})
             if not isinstance(client_ts, (int, float)):
                 client_ts = None

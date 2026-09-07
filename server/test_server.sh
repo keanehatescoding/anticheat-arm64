@@ -318,6 +318,24 @@ if [ "$CODE" = "400" ]; then
 else
     fail "missing required field should be 400 (got $CODE)"
 fi
+# 8b. empty event_type / empty detail -> 400 (upper bound alone let "" through)
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/report" \
+    -H "Authorization: Bearer $REPORT_KEY" -H 'Content-Type: application/json' \
+    -d "{\"client_id\":\"$CID\",\"event_type\":\"\",\"detail\":\"x\",\"ts\":1}")
+if [ "$CODE" = "400" ]; then
+    pass "empty event_type rejected -> 400"
+else
+    fail "empty event_type should be 400 (got $CODE)"
+fi
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/report" \
+    -H "Authorization: Bearer $REPORT_KEY" -H 'Content-Type: application/json' \
+    -d "{\"client_id\":\"$CID\",\"event_type\":\"X\",\"detail\":\"\",\"ts\":1}")
+if [ "$CODE" = "400" ]; then
+    pass "empty detail rejected -> 400"
+else
+    fail "empty detail should be 400 (got $CODE)"
+fi
+
 
 # 9. non-UTF-8 bytes in detail -> still accepted (errors="replace", not a
 # rejection -- a process could otherwise suppress its own report just by
