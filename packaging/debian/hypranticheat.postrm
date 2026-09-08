@@ -1,0 +1,23 @@
+#!/bin/sh
+# Removes daemon runtime baselines on purge only -- "remove" keeps
+# them (standard dpkg semantics: remove keeps state, purge deletes
+# it), and "upgrade"/"failed-upgrade" must not touch them.
+#
+# /var/lib/anticheat/baselines/*.txt are created at runtime by the
+# daemon, not shipped in the package and therefore not dpkg-tracked,
+# so without this they persist indefinitely after a full purge.
+set -e
+
+case "$1" in
+    purge)
+        rm -rf /var/lib/anticheat/baselines
+        # Drop the parent only when the dkms package's state is gone
+        # too (its postrm removes mok/ the same way) -- rmdir fails
+        # silently when it is still needed.
+        rmdir /var/lib/anticheat 2>/dev/null || true
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

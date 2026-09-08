@@ -1,0 +1,25 @@
+#!/bin/sh
+# Removes the DKMS Secure Boot signing key on purge only -- "remove"
+# keeps it (standard dpkg semantics: remove keeps state, purge deletes
+# it), and "upgrade"/"failed-upgrade" must not touch it (the new
+# version's postinst needs the same key to keep loading without a
+# re-enrollment).
+#
+# /var/lib/anticheat/mok/mok.priv is a private signing key generated
+# after install by DKMS's own signing step (not a dpkg-tracked file),
+# so without this it persists indefinitely after a full purge.
+set -e
+
+case "$1" in
+    purge)
+        rm -rf /var/lib/anticheat/mok
+        # Drop the parent only when the other package's state is gone
+        # too (its own postrm removes baselines the same way) -- rmdir
+        # fails silently when it is still needed.
+        rmdir /var/lib/anticheat 2>/dev/null || true
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0
