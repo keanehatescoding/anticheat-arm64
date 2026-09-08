@@ -2220,15 +2220,21 @@ static int check_modules_periodic(void)
  * kernel mappings from code that gets mapped in after we started watching
  * -- without needing to identify vdso/vvar by name in the kernel (which
  * would need arch-specific, harder-to-verify code; see the discussion in
- * anticheat.h). This does mean a pid that gets reused for an unrelated
- * process between two scans could show a spurious baseline reset; that's
- * a known, accepted limitation for this pass, not a security hole -- the
- * new process's own baseline just gets (re-)established on its first
- * scan, same as any newly-protected pid. */
+ * anticheat.h). Slots are keyed by (pid, starttime) -- the /proc starttime
+ * (stat field 22, via proc_starttime()) identifies the process generation,
+ * so a recycled pid number never inherits the previous occupant's
+ * baseline: the new process's own baseline is (re-)established on its
+ * first scan, same as any newly-protected pid (issue #10). When the
+ * starttime is unreadable (racy exit) the slot falls back to pid-only
+ * matching, which is harmless: forget_stale() clears dead slots on the
+ * next pass anyway.
+ */
 struct ac_anon_baseline {
-    int          pid;
-    unsigned int count;
-    int          in_use;
+    int                pid;
+    unsigned long long starttime;       /* /proc stat field 22 at insert */
+    int                have_starttime;  /* 0 if unreadable at insert */
+    unsigned int       count;
+    int                in_use;
 };
 static struct ac_anon_baseline g_anon_baseline[AC_MAX_PROTS];
 
@@ -2251,9 +2257,25 @@ static void anon_baseline_check(int pid, const char *comm, unsigned int count,
                                  int jit_allowed)
 {
     unsigned int i, free_slot = AC_MAX_PROTS;
+    unsigned long long cur_st = 0;
+    int have_cur = (proc_starttime(pid, &cur_st) == 0);
 
     for (i = 0; i < AC_MAX_PROTS; i++) {
         if (g_anon_baseline[i].in_use && g_anon_baseline[i].pid == pid) {
+            if (have_cur && g_anon_baseline[i].have_starttime &&
+                cur_st != g_anon_baseline[i].starttime) {
+                /* Pid number recycled since this baseline was taken: the
+                 * stored count belongs to a dead process. Adopt the new
+                 * occupant silently -- its own baseline starts here, with
+                 * no delta alert against another process's history. */
+                g_anon_baseline[i].starttime = cur_st;
+                g_anon_baseline[i].count = count;
+                return;
+            }
+            if (have_cur && !g_anon_baseline[i].have_starttime) {
+                g_anon_baseline[i].starttime = cur_st;
+                g_anon_baseline[i].have_starttime = 1;
+            }
             if (count > g_anon_baseline[i].count) {
                 if (jit_allowed)
                     logmsg(LOG_WARNING, "pid %d (%s): %u new anonymous "
@@ -2277,6 +2299,8 @@ static void anon_baseline_check(int pid, const char *comm, unsigned int count,
     }
     if (free_slot != AC_MAX_PROTS) {
         g_anon_baseline[free_slot].pid = pid;
+        g_anon_baseline[free_slot].starttime = cur_st;
+        g_anon_baseline[free_slot].have_starttime = have_cur;
         g_anon_baseline[free_slot].count = count;
         g_anon_baseline[free_slot].in_use = 1;
     }
@@ -2432,8 +2456,10 @@ static int ac_read_ld_preload(int pid, char *out, size_t outsz)
  * in the log every cycle forever. Same in_use/pid slot-tracking pattern
  * as g_anon_baseline above. */
 struct ac_preload_warned {
-    int pid;
-    int in_use;
+    int                pid;
+    unsigned long long starttime;
+    int                have_starttime;
+    int                in_use;
 };
 static struct ac_preload_warned g_preload_warned[AC_MAX_PROTS];
 
@@ -2455,25 +2481,46 @@ static void preload_warned_forget_stale(const struct ac_prot_list *pl)
 static int preload_already_warned(int pid)
 {
     unsigned int i;
+    unsigned long long cur_st = 0;
+    int have_cur = (proc_starttime(pid, &cur_st) == 0);
 
-    for (i = 0; i < AC_MAX_PROTS; i++)
-        if (g_preload_warned[i].in_use && g_preload_warned[i].pid == pid)
-            return 1;
+    for (i = 0; i < AC_MAX_PROTS; i++) {
+        if (!g_preload_warned[i].in_use || g_preload_warned[i].pid != pid)
+            continue;
+        if (have_cur && g_preload_warned[i].have_starttime &&
+            cur_st != g_preload_warned[i].starttime) {
+            /* Pid recycled: the old occupant's warn-once state must not
+             * silence the new process's warning. Drop the stale slot; the
+             * caller re-checks and re-warns below. */
+            g_preload_warned[i].in_use = 0;
+            return 0;
+        }
+        return 1;
+    }
     return 0;
 }
 
 static void preload_mark_warned(int pid)
 {
     unsigned int i, free_slot = AC_MAX_PROTS;
+    unsigned long long cur_st = 0;
+    int have_cur = (proc_starttime(pid, &cur_st) == 0);
 
     for (i = 0; i < AC_MAX_PROTS; i++) {
-        if (g_preload_warned[i].in_use && g_preload_warned[i].pid == pid)
+        if (g_preload_warned[i].in_use && g_preload_warned[i].pid == pid) {
+            if (have_cur && !g_preload_warned[i].have_starttime) {
+                g_preload_warned[i].starttime = cur_st;
+                g_preload_warned[i].have_starttime = 1;
+            }
             return;
+        }
         if (free_slot == AC_MAX_PROTS && !g_preload_warned[i].in_use)
             free_slot = i;
     }
     if (free_slot != AC_MAX_PROTS) {
         g_preload_warned[free_slot].pid = pid;
+        g_preload_warned[free_slot].starttime = cur_st;
+        g_preload_warned[free_slot].have_starttime = have_cur;
         g_preload_warned[free_slot].in_use = 1;
     }
 }
@@ -2512,8 +2559,10 @@ static int ac_ld_preload_check_interval(void)
  * g_preload_warned above, kept as a separate array since a pid warned
  * for one doesn't imply anything about the other. */
 struct ac_vklayer_warned {
-    int pid;
-    int in_use;
+    int                pid;
+    unsigned long long starttime;
+    int                have_starttime;
+    int                in_use;
 };
 static struct ac_vklayer_warned g_vklayer_warned[AC_MAX_PROTS];
 
@@ -2535,25 +2584,45 @@ static void vklayer_warned_forget_stale(const struct ac_prot_list *pl)
 static int vklayer_already_warned(int pid)
 {
     unsigned int i;
+    unsigned long long cur_st = 0;
+    int have_cur = (proc_starttime(pid, &cur_st) == 0);
 
-    for (i = 0; i < AC_MAX_PROTS; i++)
-        if (g_vklayer_warned[i].in_use && g_vklayer_warned[i].pid == pid)
-            return 1;
+    for (i = 0; i < AC_MAX_PROTS; i++) {
+        if (!g_vklayer_warned[i].in_use || g_vklayer_warned[i].pid != pid)
+            continue;
+        if (have_cur && g_vklayer_warned[i].have_starttime &&
+            cur_st != g_vklayer_warned[i].starttime) {
+            /* Pid recycled -- same re-warn reasoning as
+             * preload_already_warned() above. */
+            g_vklayer_warned[i].in_use = 0;
+            return 0;
+        }
+        return 1;
+    }
     return 0;
 }
 
 static void vklayer_mark_warned(int pid)
 {
     unsigned int i, free_slot = AC_MAX_PROTS;
+    unsigned long long cur_st = 0;
+    int have_cur = (proc_starttime(pid, &cur_st) == 0);
 
     for (i = 0; i < AC_MAX_PROTS; i++) {
-        if (g_vklayer_warned[i].in_use && g_vklayer_warned[i].pid == pid)
+        if (g_vklayer_warned[i].in_use && g_vklayer_warned[i].pid == pid) {
+            if (have_cur && !g_vklayer_warned[i].have_starttime) {
+                g_vklayer_warned[i].starttime = cur_st;
+                g_vklayer_warned[i].have_starttime = 1;
+            }
             return;
+        }
         if (free_slot == AC_MAX_PROTS && !g_vklayer_warned[i].in_use)
             free_slot = i;
     }
     if (free_slot != AC_MAX_PROTS) {
         g_vklayer_warned[free_slot].pid = pid;
+        g_vklayer_warned[free_slot].starttime = cur_st;
+        g_vklayer_warned[free_slot].have_starttime = have_cur;
         g_vklayer_warned[free_slot].in_use = 1;
     }
 }
@@ -2983,9 +3052,11 @@ static int check_implicit_layers(int pid)
  * later increase (a new unrecognized layer appearing mid-session) is
  * the signal. */
 struct ac_implicit_layer_baseline {
-    int pid;
-    unsigned int count;
-    int in_use;
+    int                pid;
+    unsigned long long starttime;
+    int                have_starttime;
+    unsigned int       count;
+    int                in_use;
 };
 static struct ac_implicit_layer_baseline g_implicit_layer_baseline[AC_MAX_PROTS];
 
@@ -3043,9 +3114,25 @@ static void check_implicit_layers_periodic(void)
             unknown++;
         }
 
+        unsigned long long cur_st = 0;
+        int have_cur = (proc_starttime(pl.items[i].pid, &cur_st) == 0);
         for (j = 0; j < AC_MAX_PROTS; j++) {
             if (g_implicit_layer_baseline[j].in_use &&
                 g_implicit_layer_baseline[j].pid == pl.items[i].pid) {
+                if (have_cur &&
+                    g_implicit_layer_baseline[j].have_starttime &&
+                    cur_st != g_implicit_layer_baseline[j].starttime) {
+                    /* Pid recycled: re-baseline the new occupant silently
+                     * instead of diffing against the dead process's count.
+                     * Count is set to the current value up front so the
+                     * growth check below cannot fire on another process's history. */
+                    g_implicit_layer_baseline[j].starttime = cur_st;
+                    g_implicit_layer_baseline[j].count = unknown;
+                } else if (have_cur &&
+                           !g_implicit_layer_baseline[j].have_starttime) {
+                    g_implicit_layer_baseline[j].starttime = cur_st;
+                    g_implicit_layer_baseline[j].have_starttime = 1;
+                }
                 slot = j;
                 break;
             }
