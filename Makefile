@@ -6,7 +6,8 @@
 #   make clean
 #   sudo make install         (binary -> /usr/local/sbin, module -> /lib/modules/.../extra)
 #   sudo make uninstall
-#   make install-deck         (SteamOS / immutable distros — see below)
+#   make DESTDIR=/tmp/stage install   (staged/packaging install -- skips depmod, no root needed)
+#   make install-deck         (SteamOS / immutable distros — see below, run WITHOUT sudo)
 #   make uninstall-deck
 #
 # Kernel module build requires linux headers for the running kernel:
@@ -50,10 +51,10 @@ DECK_PREFIX ?= $(HOME)/.local/share/anticheat
 # selects CC=clang only; pass LLVM=1 explicitly for a known full-LLVM
 # target. Explicit LLVM=/CC= on the command line or environment always
 # wins over auto-detection.
-AC_KCONFIG_READABLE := $(shell test -r $(KDIR)/.config && echo 1 || echo 0)
-AC_CC_CLANG := $(shell grep -q '^CONFIG_CC_IS_CLANG=y' $(KDIR)/.config 2>/dev/null && echo 1 || echo 0)
-AC_AS_LLVM := $(shell grep -q '^CONFIG_AS_IS_LLVM=y' $(KDIR)/.config 2>/dev/null && echo 1 || echo 0)
-AC_LD_LLD := $(shell grep -q '^CONFIG_LD_IS_LLD=y' $(KDIR)/.config 2>/dev/null && echo 1 || echo 0)
+AC_KCONFIG_READABLE := $(shell test -r "$(KDIR)/.config" && echo 1 || echo 0)
+AC_CC_CLANG := $(shell grep -q '^CONFIG_CC_IS_CLANG=y' "$(KDIR)/.config" 2>/dev/null && echo 1 || echo 0)
+AC_AS_LLVM := $(shell grep -q '^CONFIG_AS_IS_LLVM=y' "$(KDIR)/.config" 2>/dev/null && echo 1 || echo 0)
+AC_LD_LLD := $(shell grep -q '^CONFIG_LD_IS_LLD=y' "$(KDIR)/.config" 2>/dev/null && echo 1 || echo 0)
 AC_PROC_CLANG := $(shell grep -q 'clang version' /proc/version 2>/dev/null && echo 1 || echo 0)
 AC_RUNNING_KDIR := /lib/modules/$(shell uname -r)/build
 AC_IS_RUNNING := $(shell test "$(KDIR)" = "$(AC_RUNNING_KDIR)" && echo 1 || echo 0)
@@ -98,7 +99,7 @@ anticheat-objs := src/anticheat_module.o src/sha256.o
 all: module daemon
 
 module:
-	$(MAKE) -C $(KDIR) M=$(PWD) LLVM=$(LLVM) $(if $(AC_MODULE_CC),CC="$(AC_MODULE_CC)") modules
+	$(MAKE) -C "$(KDIR)" M="$(PWD)" LLVM=$(LLVM) $(if $(AC_MODULE_CC),CC="$(AC_MODULE_CC)") modules
 
 daemon: src/anticheat_daemon.c src/sha256.c src/sha256.h src/anticheat.h
 	$(CC) $(CFLAGS) -o anticheat src/anticheat_daemon.c src/sha256.c $(LDFLAGS)
@@ -225,34 +226,39 @@ ci:
 	./test/mock_test.sh
 
 clean:
-	@if [ -d $(KDIR) ]; then $(MAKE) -C $(KDIR) M=$(PWD) clean; fi
+	@if [ -d "$(KDIR)" ]; then $(MAKE) -C "$(KDIR)" M="$(PWD)" clean; fi
 	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test test/mount_ns_probe test/anon_exec_test test/thread_exit_migration_test test/thread_spawn_after_protect_test test/ioctl_fuzz test/baseline_test test/ac_report_status_test test/ac_report_url_test
 
 install: all
-	install -D -m 0755 anticheat /usr/local/sbin/anticheat
-	install -D -m 0644 anticheat.ko /lib/modules/$(KVER)/extra/anticheat.ko
-	install -d -m 0755 /var/lib/anticheat/baselines
-	depmod -a
+	@if [ -z "$(DESTDIR)" ] && [ "$$(id -u)" -ne 0 ]; then echo "error: 'make install' writes to /usr/local and /lib/modules -- run as root, or set DESTDIR= for a staged/packaging install"; exit 1; fi
+	install -D -m 0755 anticheat $(DESTDIR)/usr/local/sbin/anticheat
+	install -D -m 0644 anticheat.ko $(DESTDIR)/lib/modules/$(KVER)/extra/anticheat.ko
+	install -d -m 0755 $(DESTDIR)/var/lib/anticheat/baselines
+	@if [ -z "$(DESTDIR)" ]; then depmod -a; else echo "DESTDIR staged install -- skipping depmod -a (packaging must run depmod in postinst)"; fi
 	@echo "installed. load with: sudo modprobe anticheat  (or insmod ./anticheat.ko)"
 
 uninstall:
-	rm -f /usr/local/sbin/anticheat
-	rm -f /lib/modules/$(KVER)/extra/anticheat.ko
-	depmod -a
+	@if [ -z "$(DESTDIR)" ] && [ "$$(id -u)" -ne 0 ]; then echo "error: 'make uninstall' removes from /usr/local and /lib/modules -- run as root, or set DESTDIR= to match the staged install"; exit 1; fi
+	rm -f $(DESTDIR)/usr/local/sbin/anticheat
+	rm -f $(DESTDIR)/lib/modules/$(KVER)/extra/anticheat.ko
+	@if [ -z "$(DESTDIR)" ]; then depmod -a; fi
 
 # SteamOS / immutable-distro install: everything lives under $(DECK_PREFIX)
 # (default: ~/.local/share/anticheat), which survives OTA image updates
 # because it's in the user's home, not the read-only system image. No
 # /lib/modules write, no depmod — the module is loaded directly by path.
+# Run install-deck as your own user, NOT under sudo: DECK_PREFIX defaults
+# from $(HOME), so sudo would resolve it to /root/.local/share/anticheat
+# instead of your home. Only the later `insmod` step needs root.
 install-deck: all
-	install -D -m 0755 anticheat $(DECK_PREFIX)/bin/anticheat
-	install -D -m 0644 anticheat.ko $(DECK_PREFIX)/anticheat.ko
-	install -d -m 0755 $(DECK_PREFIX)/baselines
+	install -D -m 0755 anticheat "$(DECK_PREFIX)/bin/anticheat"
+	install -D -m 0644 anticheat.ko "$(DECK_PREFIX)/anticheat.ko"
+	install -d -m 0755 "$(DECK_PREFIX)/baselines"
 	@echo "installed under $(DECK_PREFIX)"
 	@echo "load with: sudo insmod $(DECK_PREFIX)/anticheat.ko"
 	@echo "run the daemon with: sudo AC_BASELINE_DIR=$(DECK_PREFIX)/baselines $(DECK_PREFIX)/bin/anticheat start"
 
 uninstall-deck:
-	rm -rf $(DECK_PREFIX)
+	rm -rf "$(DECK_PREFIX)"
 
 .PHONY: all module daemon mock test-mock priv-drop-test render-hook-test mount-ns-test thread-exit-migration-test thread-spawn-after-protect-test ioctl-fuzz baseline-test ac-report-status-test ac-report-url-test ci clean install uninstall install-deck uninstall-deck
