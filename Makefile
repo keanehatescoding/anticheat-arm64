@@ -231,16 +231,16 @@ clean:
 
 install: all
 	@if [ -z "$(DESTDIR)" ] && [ "$$(id -u)" -ne 0 ]; then echo "error: 'make install' writes to /usr/local and /lib/modules -- run as root, or set DESTDIR= for a staged/packaging install"; exit 1; fi
-	install -D -m 0755 anticheat $(DESTDIR)/usr/local/sbin/anticheat
-	install -D -m 0644 anticheat.ko $(DESTDIR)/lib/modules/$(KVER)/extra/anticheat.ko
-	install -d -m 0755 $(DESTDIR)/var/lib/anticheat/baselines
+	install -D -m 0755 anticheat "$(DESTDIR)/usr/local/sbin/anticheat"
+	install -D -m 0644 anticheat.ko "$(DESTDIR)/lib/modules/$(KVER)/extra/anticheat.ko"
+	install -d -m 0755 "$(DESTDIR)/var/lib/anticheat/baselines"
 	@if [ -z "$(DESTDIR)" ]; then depmod -a; else echo "DESTDIR staged install -- skipping depmod -a (packaging must run depmod in postinst)"; fi
 	@echo "installed. load with: sudo modprobe anticheat  (or insmod ./anticheat.ko)"
 
 uninstall:
 	@if [ -z "$(DESTDIR)" ] && [ "$$(id -u)" -ne 0 ]; then echo "error: 'make uninstall' removes from /usr/local and /lib/modules -- run as root, or set DESTDIR= to match the staged install"; exit 1; fi
-	rm -f $(DESTDIR)/usr/local/sbin/anticheat
-	rm -f $(DESTDIR)/lib/modules/$(KVER)/extra/anticheat.ko
+	rm -f "$(DESTDIR)/usr/local/sbin/anticheat"
+	rm -f "$(DESTDIR)/lib/modules/$(KVER)/extra/anticheat.ko"
 	@if [ -z "$(DESTDIR)" ]; then depmod -a; fi
 
 # SteamOS / immutable-distro install: everything lives under $(DECK_PREFIX)
@@ -251,6 +251,7 @@ uninstall:
 # from $(HOME), so sudo would resolve it to /root/.local/share/anticheat
 # instead of your home. Only the later `insmod` step needs root.
 install-deck: all
+	@if [ "$$(id -u)" -eq 0 ]; then echo "warning: running install-deck as root installs under $(DECK_PREFIX) -- under sudo this is root's HOME, not yours; run as your own user instead unless that is what you want"; fi
 	install -D -m 0755 anticheat "$(DECK_PREFIX)/bin/anticheat"
 	install -D -m 0644 anticheat.ko "$(DECK_PREFIX)/anticheat.ko"
 	install -d -m 0755 "$(DECK_PREFIX)/baselines"
