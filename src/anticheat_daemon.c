@@ -2262,19 +2262,19 @@ static void anon_baseline_check(int pid, const char *comm, unsigned int count,
 
     for (i = 0; i < AC_MAX_PROTS; i++) {
         if (g_anon_baseline[i].in_use && g_anon_baseline[i].pid == pid) {
-            if (have_cur && g_anon_baseline[i].have_starttime &&
-                cur_st != g_anon_baseline[i].starttime) {
-                /* Pid number recycled since this baseline was taken: the
-                 * stored count belongs to a dead process. Adopt the new
-                 * occupant silently -- its own baseline starts here, with
-                 * no delta alert against another process's history. */
-                g_anon_baseline[i].starttime = cur_st;
-                g_anon_baseline[i].count = count;
-                return;
-            }
-            if (have_cur && !g_anon_baseline[i].have_starttime) {
+            if (have_cur && (!g_anon_baseline[i].have_starttime ||
+                             cur_st != g_anon_baseline[i].starttime)) {
+                /* New process generation for this pid number: provably
+                 * different starttime (recycled pid), or no recorded
+                 * starttime at all (insert raced the old occupant's exit,
+                 * so the stored count cannot belong to whoever holds the
+                 * pid now). Adopt the new occupant silently -- its own
+                 * baseline starts here, with no delta alert against
+                 * another process's history. */
                 g_anon_baseline[i].starttime = cur_st;
                 g_anon_baseline[i].have_starttime = 1;
+                g_anon_baseline[i].count = count;
+                return;
             }
             if (count > g_anon_baseline[i].count) {
                 if (jit_allowed)
@@ -2487,11 +2487,13 @@ static int preload_already_warned(int pid)
     for (i = 0; i < AC_MAX_PROTS; i++) {
         if (!g_preload_warned[i].in_use || g_preload_warned[i].pid != pid)
             continue;
-        if (have_cur && g_preload_warned[i].have_starttime &&
-            cur_st != g_preload_warned[i].starttime) {
-            /* Pid recycled: the old occupant's warn-once state must not
-             * silence the new process's warning. Drop the stale slot; the
-             * caller re-checks and re-warns below. */
+        if (have_cur && (!g_preload_warned[i].have_starttime ||
+                         cur_st != g_preload_warned[i].starttime)) {
+            /* New generation: recycled pid, or a mark that raced the old
+             * occupant's exit and recorded no starttime. Either way the
+             * old occupant's warn-once state must not silence the new
+             * process's warning. Drop the stale slot; the caller
+             * re-checks and re-warns below. */
             g_preload_warned[i].in_use = 0;
             return 0;
         }
@@ -2507,13 +2509,8 @@ static void preload_mark_warned(int pid)
     int have_cur = (proc_starttime(pid, &cur_st) == 0);
 
     for (i = 0; i < AC_MAX_PROTS; i++) {
-        if (g_preload_warned[i].in_use && g_preload_warned[i].pid == pid) {
-            if (have_cur && !g_preload_warned[i].have_starttime) {
-                g_preload_warned[i].starttime = cur_st;
-                g_preload_warned[i].have_starttime = 1;
-            }
+        if (g_preload_warned[i].in_use && g_preload_warned[i].pid == pid)
             return;
-        }
         if (free_slot == AC_MAX_PROTS && !g_preload_warned[i].in_use)
             free_slot = i;
     }
@@ -2590,9 +2587,9 @@ static int vklayer_already_warned(int pid)
     for (i = 0; i < AC_MAX_PROTS; i++) {
         if (!g_vklayer_warned[i].in_use || g_vklayer_warned[i].pid != pid)
             continue;
-        if (have_cur && g_vklayer_warned[i].have_starttime &&
-            cur_st != g_vklayer_warned[i].starttime) {
-            /* Pid recycled -- same re-warn reasoning as
+        if (have_cur && (!g_vklayer_warned[i].have_starttime ||
+                         cur_st != g_vklayer_warned[i].starttime)) {
+            /* New generation -- same re-warn reasoning as
              * preload_already_warned() above. */
             g_vklayer_warned[i].in_use = 0;
             return 0;
@@ -2609,13 +2606,8 @@ static void vklayer_mark_warned(int pid)
     int have_cur = (proc_starttime(pid, &cur_st) == 0);
 
     for (i = 0; i < AC_MAX_PROTS; i++) {
-        if (g_vklayer_warned[i].in_use && g_vklayer_warned[i].pid == pid) {
-            if (have_cur && !g_vklayer_warned[i].have_starttime) {
-                g_vklayer_warned[i].starttime = cur_st;
-                g_vklayer_warned[i].have_starttime = 1;
-            }
+        if (g_vklayer_warned[i].in_use && g_vklayer_warned[i].pid == pid)
             return;
-        }
         if (free_slot == AC_MAX_PROTS && !g_vklayer_warned[i].in_use)
             free_slot = i;
     }
@@ -3120,18 +3112,20 @@ static void check_implicit_layers_periodic(void)
             if (g_implicit_layer_baseline[j].in_use &&
                 g_implicit_layer_baseline[j].pid == pl.items[i].pid) {
                 if (have_cur &&
-                    g_implicit_layer_baseline[j].have_starttime &&
-                    cur_st != g_implicit_layer_baseline[j].starttime) {
-                    /* Pid recycled: re-baseline the new occupant silently
-                     * instead of diffing against the dead process's count.
-                     * Count is set to the current value up front so the
-                     * growth check below cannot fire on another process's history. */
-                    g_implicit_layer_baseline[j].starttime = cur_st;
-                    g_implicit_layer_baseline[j].count = unknown;
-                } else if (have_cur &&
-                           !g_implicit_layer_baseline[j].have_starttime) {
+                    (!g_implicit_layer_baseline[j].have_starttime ||
+                     cur_st != g_implicit_layer_baseline[j].starttime)) {
+                    /* New process generation for this pid number: either
+                     * a provably different starttime (recycled pid), or
+                     * no recorded starttime at all (insert raced the old
+                     * occupant's exit, so the stored count cannot belong
+                     * to whoever holds the pid now). Re-baseline the new
+                     * occupant silently instead of diffing against a dead
+                     * process's count: count is set to the current value
+                     * up front so the growth check below cannot fire on
+                     * another process's history. */
                     g_implicit_layer_baseline[j].starttime = cur_st;
                     g_implicit_layer_baseline[j].have_starttime = 1;
+                    g_implicit_layer_baseline[j].count = unknown;
                 }
                 slot = j;
                 break;
@@ -3142,6 +3136,8 @@ static void check_implicit_layers_periodic(void)
         if (slot == AC_MAX_PROTS) {
             if (free_slot != AC_MAX_PROTS) {
                 g_implicit_layer_baseline[free_slot].pid = pl.items[i].pid;
+                g_implicit_layer_baseline[free_slot].starttime = cur_st;
+                g_implicit_layer_baseline[free_slot].have_starttime = have_cur;
                 g_implicit_layer_baseline[free_slot].count = unknown;
                 g_implicit_layer_baseline[free_slot].in_use = 1;
             }
