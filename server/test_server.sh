@@ -439,6 +439,49 @@ else
     fail "oversized ban reason should be 400 (got $CODE)"
 fi
 
+# 17b. default-deny auth: every tiered endpoint rejects a missing
+# credential and the wrong tier's key -- the dispatch table checks the
+# key tier centrally before any handler runs, so a route can never be
+# left unauthenticated by forgetting a per-handler decorator.
+for _probe in "ban:POST:$BASE/ban" "unban:POST:$BASE/unban"; do
+    _name="${_probe%%:*}"; _rest="${_probe#*:}"; _method="${_rest%%:*}"; _url="${_rest#*:}"
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' -X "$_method" "$_url" \
+        -H 'Content-Type: application/json' \
+        -d "{\"client_id\":\"$CID\",\"reason\":\"x\"}")
+    if [ "$CODE" = "401" ]; then
+        pass "POST /$_name without credential -> 401"
+    else
+        fail "POST /$_name without credential should be 401 (got $CODE)"
+    fi
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' -X "$_method" "$_url" \
+        -H "Authorization: Bearer $REPORT_KEY" -H 'Content-Type: application/json' \
+        -d "{\"client_id\":\"$CID\",\"reason\":\"x\"}")
+    if [ "$CODE" = "401" ]; then
+        pass "POST /$_name with report key (wrong tier) -> 401"
+    else
+        fail "POST /$_name with report key should be 401 (got $CODE)"
+    fi
+done
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/banned/$CID")
+if [ "$CODE" = "401" ]; then
+    pass "GET /banned without credential -> 401"
+else
+    fail "GET /banned without credential should be 401 (got $CODE)"
+fi
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/reports/$CID" \
+    -H "Authorization: Bearer $REPORT_KEY")
+if [ "$CODE" = "401" ]; then
+    pass "GET /reports with report key (wrong tier) -> 401"
+else
+    fail "GET /reports with report key should be 401 (got $CODE)"
+fi
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/reports/$CID")
+if [ "$CODE" = "401" ]; then
+    pass "GET /reports without credential -> 401"
+else
+    fail "GET /reports without credential should be 401 (got $CODE)"
+fi
+
 # 18. concurrent report writes -- exercises Store's per-call-fresh-
 # connection design under real ThreadingHTTPServer concurrency, not
 # simulated.

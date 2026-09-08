@@ -569,10 +569,12 @@ human-in-the-loop pipeline. This mirrors the same design instinct as
 source IP — `--rate-limit`/`--rate-window`, default 60 requests per 60s —
 so a compromised or misbehaving client can't flood the ingestion pipeline
 or the SQLite DB, and an attacker can't freely hammer `/banned/<id>` to
-enumerate client IDs or brute-force the admin key. It's a simple
-fixed-window counter (allows a brief double-rate burst right at a window
-boundary), not built for distributed scale — enough to bound abuse
-against a single small process, which is the deployment this targets.
+enumerate client IDs or brute-force the admin key. It's a sliding-window
+counter over the trailing `--rate-window`, so requests bunched on both
+sides of a window boundary can't combine into a burst the way a
+fixed-window counter allows -- not built for distributed scale, but
+enough to bound abuse against a single small process, which is the
+deployment this targets.
 
 **No TLS.** This is plain HTTP, meant for localhost/LAN or behind a
 reverse proxy that terminates TLS for anything reachable over an

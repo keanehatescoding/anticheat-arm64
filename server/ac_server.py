@@ -45,6 +45,8 @@ that for a different-user daemon: any group/ACL change made after the
 fact is undone the next time this process (re)starts and rebinds.
 """
 import argparse
+import collections
+import errno
 import hmac
 import http.server
 import ipaddress
@@ -66,11 +68,14 @@ MAX_BODY_BYTES = 4096
 
 
 class RateLimiter:
-    """Fixed-window limiter: at most `limit` requests per `window` seconds,
-    per key (source IP here). Not built for distributed scale or precise
-    edge behavior (a fixed window allows a brief double-rate burst right
-    at the boundary) -- enough to bound abuse against a single small
-    process, which is the actual deployment this is for. Applied to every
+    """Sliding-window limiter: at most `limit` requests per `window` seconds,
+    per key (source IP here). Each key keeps the timestamps of its recent
+    hits; a new request is allowed only if fewer than `limit` of them fall
+    inside the trailing `window` -- so unlike the previous fixed-window
+    counter, requests bunched on both sides of a window boundary can't
+    combine into a ~2x burst. Not built for distributed scale (each
+    process keeps its own counters), but the per-process bound it
+    provides is now exact up to clock resolution. Applied to every
     endpoint, not just /report: unauthenticated attempts against /banned
     or /ban are exactly the kind of thing worth throttling too (ID
     enumeration, admin-key brute-forcing), not just report flooding."""
@@ -79,30 +84,41 @@ class RateLimiter:
         self.limit = limit
         self.window = window
         self._lock = threading.Lock()
-        self._buckets = {}  # key -> (window_start, count)
+        self._buckets = {}  # key -> collections.deque of hit timestamps
         self._last_prune = time.time()
 
     def allow(self, key):
         now = time.time()
         with self._lock:
-            window_start, count = self._buckets.get(key, (now, 0))
-            if now - window_start >= self.window:
-                window_start, count = now, 0
-            count += 1
-            self._buckets[key] = (window_start, count)
+            hits = self._buckets.get(key)
+            if hits is None:
+                hits = self._buckets[key] = collections.deque()
+            else:
+                while hits and now - hits[0] >= self.window:
+                    hits.popleft()
+            if len(hits) >= self.limit:
+                if now - self._last_prune >= self.window:
+                    self._prune(now)
+                return False
+            hits.append(now)
             if now - self._last_prune >= self.window:
                 self._prune(now)
-            return count <= self.limit
+            return True
 
     def _prune(self, now):
-        """Drop buckets whose window has already elapsed. _buckets grows
-        one entry per distinct source IP ever seen with nothing to evict
-        them otherwise -- an unbounded leak in a long-running process.
-        Called opportunistically from allow() roughly once per window
-        rather than on every request, so this stays cheap."""
-        stale = [k for k, (ws, _) in self._buckets.items() if now - ws >= self.window]
-        for k in stale:
-            del self._buckets[k]
+        """Drop hits that fell out of the window, then evict keys left
+        with nothing in it. _buckets grows one entry per distinct source
+        IP ever seen (each holding at most `limit` timestamps) with
+        nothing to evict them otherwise -- an unbounded leak in a
+        long-running process. Called opportunistically from allow()
+        roughly once per window rather than on every request, so this
+        stays cheap."""
+        for key in list(self._buckets):
+            hits = self._buckets[key]
+            while hits and now - hits[0] >= self.window:
+                hits.popleft()
+            if not hits:
+                del self._buckets[key]
         self._last_prune = now
 
 
@@ -221,41 +237,68 @@ class ThreadingUnixHTTPServer(BoundedThreadingMixIn, http.server.HTTPServer):
         # already exists at that path -- unlike a TCP port, which is free
         # again as soon as the previous listener closes it (modulo
         # TIME_WAIT, which allow_reuse_address already handles). Without
-        # this, every restart after the very first one would fail with
-        # "address already in use" against the stale socket file the
+        # reclaiming it, every restart after the very first one would fail
+        # with "address already in use" against the stale socket file the
         # previous run left behind. But blindly unlinking whatever is
         # there would (a) delete a regular file someone accidentally
         # pointed --unix-socket at, and (b) steal the path out from under
         # a still-running previous instance (e.g. a second `ac_server.py
         # --unix-socket` invocation against the same path), silently
         # diverting new connections to this process while the old one
-        # keeps running unaware its socket file is gone. Guard both: only
-        # ever remove a path that's actually a socket, and only after
-        # confirming nothing is listening on it.
+        # keeps running unaware its socket file is gone.
+        #
+        # So: try the bind itself first. bind() is atomic, meaning the
+        # common case (a free path) succeeds with no
+        # check-before-unlink window at all -- the lstat/connect/unlink
+        # probe sequence in _reclaim_stale_socket() below only runs when
+        # the first bind reports the path as taken, i.e. solely on the
+        # stale-reclaim path where a check-then-act is unavoidable. A
+        # loser of that residual race just fails its second bind loudly
+        # instead of hijacking anything: bind() refuses to replace an
+        # existing path.
+        try:
+            self._bind_and_secure()
+        except OSError as exc:
+            if exc.errno != errno.EADDRINUSE:
+                raise
+            self._reclaim_stale_socket()
+            self._bind_and_secure()
+
+    def _reclaim_stale_socket(self):
+        # Only ever remove a path that's actually a socket, and only
+        # after confirming nothing is listening on it (see server_bind
+        # for why both guards exist).
         try:
             st = os.lstat(self.server_address)
         except FileNotFoundError:
-            pass
+            # Lost the residual race: someone else unlinked the path
+            # between our failed bind and this lstat -- retrying the
+            # bind is the correct move, not treating this as an error.
+            return
+        if not stat.S_ISSOCK(st.st_mode):
+            raise RuntimeError(
+                "ac_server: --unix-socket path %r exists and is not a "
+                "socket -- refusing to remove it" % (self.server_address,)
+            )
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.connect(self.server_address)
+        except OSError:
+            pass  # nothing listening -- a stale socket file, safe to reclaim
         else:
-            if not stat.S_ISSOCK(st.st_mode):
-                raise RuntimeError(
-                    "ac_server: --unix-socket path %r exists and is not a "
-                    "socket -- refusing to remove it" % (self.server_address,)
-                )
-            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            try:
-                probe.connect(self.server_address)
-            except OSError:
-                pass  # nothing listening -- a stale socket file, safe to reclaim
-            else:
-                raise RuntimeError(
-                    "ac_server: --unix-socket path %r already has an "
-                    "active listener -- refusing to steal it"
-                    % (self.server_address,)
-                )
-            finally:
-                probe.close()
+            raise RuntimeError(
+                "ac_server: --unix-socket path %r already has an "
+                "active listener -- refusing to steal it"
+                % (self.server_address,)
+            )
+        finally:
+            probe.close()
+        try:
             os.unlink(self.server_address)
+        except FileNotFoundError:
+            pass  # same lost-race as above: already gone, bind away
+
+    def _bind_and_secure(self):
         # Deliberately socketserver.TCPServer.server_bind(), not
         # http.server.HTTPServer.server_bind(): the latter does
         # `host, port = self.server_address[:2]` afterward, assuming a TCP
@@ -293,25 +336,6 @@ class ThreadingUnixHTTPServer(BoundedThreadingMixIn, http.server.HTTPServer):
         # per-peer network address to report or rate-limit on separately.
         request, _client_address = super().get_request()
         return request, UNIX_CLIENT_ADDRESS
-
-
-def _requires_auth(keys):
-    """Method decorator for a Handler._handle_*() method: send 401 and
-    skip the wrapped handler if the request's bearer token isn't in
-    `keys`. Centralizes the `if not self._authed(...)` check that would
-    otherwise be copy-pasted at the top of each handler -- but it's still
-    opt-in per handler, not enforced by the dispatch table, so a new
-    endpoint still has to remember to apply this decorator."""
-
-    def deco(fn):
-        def wrapper(self, *args, **kwargs):
-            if not self._authed(keys):
-                return self._send_json(401, {"error": "unauthorized"})
-            return fn(self, *args, **kwargs)
-
-        return wrapper
-
-    return deco
 
 
 class Store:
@@ -703,15 +727,25 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
         def do_POST(self):
             self._dispatch(self._do_POST)
 
+        def _call_with_auth(self, keys, fn, *args, **kwargs):
+            # Default-deny: every known route below names its key tier
+            # here, checked before the handler runs. A route added
+            # without an entry falls through to 404 (unreachable),
+            # never to an unauthenticated handler -- there is no
+            # per-handler decorator left to forget.
+            if not self._authed(keys):
+                return self._send_json(401, {"error": "unauthorized"})
+            return fn(*args, **kwargs)
+
         def _do_POST(self):
             if self._rate_limited():
                 return
             if self.path == "/report":
-                return self._handle_report()
+                return self._call_with_auth(report_keys, self._handle_report)
             if self.path == "/ban":
-                return self._handle_ban()
+                return self._call_with_auth(admin_keys, self._handle_ban)
             if self.path == "/unban":
-                return self._handle_unban()
+                return self._call_with_auth(admin_keys, self._handle_unban)
             self._send_json(404, {"error": "not found"})
 
         def do_GET(self):
@@ -721,12 +755,15 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
             if self._rate_limited():
                 return
             if self.path.startswith("/banned/"):
-                return self._handle_banned(self.path[len("/banned/"):])
+                return self._call_with_auth(
+                    admin_keys, self._handle_banned, self.path[len("/banned/"):]
+                )
             if self.path.startswith("/reports/"):
-                return self._handle_reports(self.path[len("/reports/"):])
+                return self._call_with_auth(
+                    admin_keys, self._handle_reports, self.path[len("/reports/"):]
+                )
             self._send_json(404, {"error": "not found"})
 
-        @_requires_auth(report_keys)
         def _handle_report(self):
             body = self._require_body_client_id()
             if body is None:
@@ -746,7 +783,6 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
             )
             self._send_json(201, {"ok": True})
 
-        @_requires_auth(admin_keys)
         def _handle_ban(self):
             body = self._require_body_client_id()
             if body is None:
@@ -758,7 +794,6 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
             store.ban(client_id, reason)
             self._send_json(200, {"ok": True})
 
-        @_requires_auth(admin_keys)
         def _handle_unban(self):
             body = self._require_body_client_id()
             if body is None:
@@ -766,13 +801,11 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
             existed = store.unban(body["client_id"])
             self._send_json(200, {"ok": True, "was_banned": existed})
 
-        @_requires_auth(admin_keys)
         def _handle_banned(self, client_id):
             if not self._require_valid_client_id(client_id):
                 return
             self._send_json(200, store.ban_status(client_id))
 
-        @_requires_auth(admin_keys)
         def _handle_reports(self, client_id):
             if not self._require_valid_client_id(client_id):
                 return
