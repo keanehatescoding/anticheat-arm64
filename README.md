@@ -871,6 +871,26 @@ the firmware's blue "MOK Management" screen — that's a UEFI requirement (no
 software can auto-approve a new trusted key, by design) and only happens
 once per machine, not per kernel update.
 
+DKMS builds use the same clang/LLVM toolchain autodetection as `make module`
+(via `scripts/dkms-build.sh`, called from `dkms.conf`): a target kernel built
+with clang gets `LLVM=1` (full LLVM) or `CC=clang` (mixed clang/GNU toolchain)
+automatically, based on the target's own `.config`. If that config is
+unreadable and the target kernel needs clang, export `LLVM=1` or `CC=clang`
+for the build by hand.
+
+The module's `ac_scan_window` tunable (syscall-table scan window, default 32 MB,
+clamped to 1–256 MB) needs no rebuild and no DKMS interaction — set it
+persistently on any installed system via modprobe.d:
+
+```sh
+echo "options anticheat ac_scan_window=67108864" | sudo tee /etc/modprobe.d/anticheat.conf
+sudo rmmod anticheat && sudo modprobe anticheat   # or reboot
+```
+
+Only raise it if `dmesg` reports the syscall table was not found and suggests a
+larger window (large debug/KASAN images can push the table further out than the
+default covers).
+
 **Arch Linux / AUR:** `packaging/aur/` has a `hypranticheat`/
 `hypranticheat-dkms` split-package `PKGBUILD` that does the same DKMS +
 MOK setup as `scripts/dkms-install.sh`, wired into `pacman`'s own

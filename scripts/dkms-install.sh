@@ -44,10 +44,12 @@ fi
 if [[ ! -e "$DEST" ]]; then
     echo "staging source into ${DEST}"
     mkdir -p "$DEST"
-    # Only what the kernel build needs — not the daemon, tests, or CI
-    # files, so kernel updates don't get charged for copying the whole
-    # repo every time.
+    # Only what the kernel build needs (dkms.conf's MAKE entry point lives
+    # in scripts/dkms-build.sh) -- not the daemon, tests, or CI files, so
+    # kernel updates don't get charged for copying the whole repo every time.
     cp -a "${SRC_DIR}/Makefile" "${SRC_DIR}/dkms.conf" "$DEST/"
+    mkdir -p "$DEST/scripts"
+    cp -a "${SRC_DIR}/scripts/dkms-build.sh" "$DEST/scripts/"
     cp -a "${SRC_DIR}/src" "$DEST/"
 fi
 

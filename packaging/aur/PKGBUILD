@@ -70,6 +70,7 @@ package_hypranticheat-dkms() {
     local _dkmsdir="$pkgdir/usr/src/anticheat-${pkgver}"
     install -Dm644 Makefile "$_dkmsdir/Makefile"
     install -Dm644 dkms.conf "$_dkmsdir/dkms.conf"
+    install -Dm755 scripts/dkms-build.sh "$_dkmsdir/scripts/dkms-build.sh"
     cp -a src "$_dkmsdir/"
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 
