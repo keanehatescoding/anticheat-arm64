@@ -79,6 +79,7 @@ install -dm755 %{buildroot}%{_localstatedir}/lib/anticheat/baselines
 _dkmsdir=%{buildroot}%{_usrsrc}/anticheat-%{version}
 install -Dm644 Makefile "${_dkmsdir}/Makefile"
 install -Dm644 dkms.conf "${_dkmsdir}/dkms.conf"
+install -Dm755 scripts/dkms-build.sh "${_dkmsdir}/scripts/dkms-build.sh"
 cp -a src "${_dkmsdir}/"
 
 install -Dm644 /dev/stdin \
@@ -103,6 +104,7 @@ install -dm700 %{buildroot}%{_localstatedir}/lib/anticheat/mok
 %dir %{_usrsrc}/anticheat-%{version}
 %{_usrsrc}/anticheat-%{version}/Makefile
 %{_usrsrc}/anticheat-%{version}/dkms.conf
+%{_usrsrc}/anticheat-%{version}/scripts/dkms-build.sh
 %{_usrsrc}/anticheat-%{version}/src
 %config(noreplace) %{_sysconfdir}/dkms/framework.conf.d/anticheat.conf
 %dir %attr(0700,root,root) %{_localstatedir}/lib/anticheat/mok

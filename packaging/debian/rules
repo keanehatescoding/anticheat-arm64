@@ -32,6 +32,8 @@ override_dh_auto_install:
 	        debian/hypranticheat-dkms/usr/src/anticheat-$(DEB_VERSION_UPSTREAM)/Makefile
 	install -Dm644 dkms.conf \
 	        debian/hypranticheat-dkms/usr/src/anticheat-$(DEB_VERSION_UPSTREAM)/dkms.conf
+	install -Dm755 scripts/dkms-build.sh \
+	        debian/hypranticheat-dkms/usr/src/anticheat-$(DEB_VERSION_UPSTREAM)/scripts/dkms-build.sh
 	cp -a src debian/hypranticheat-dkms/usr/src/anticheat-$(DEB_VERSION_UPSTREAM)/
 	install -Dm644 debian/anticheat-dkms.framework.conf \
 	        debian/hypranticheat-dkms/etc/dkms/framework.conf.d/anticheat.conf
