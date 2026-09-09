@@ -62,5 +62,14 @@ else
     fi
 fi
 
-# shellcheck disable=SC2086
-exec make -C "$KDIR" M="$BUILD" $LLVM_ARG $CC_ARG modules
+# Each assignment stays one argument so values with spaces
+# (e.g. CC="ccache clang") are not split into a bogus make target.
+if [ -n "$LLVM_ARG" ] && [ -n "$CC_ARG" ]; then
+    exec make -C "$KDIR" M="$BUILD" "$LLVM_ARG" "$CC_ARG" modules
+elif [ -n "$LLVM_ARG" ]; then
+    exec make -C "$KDIR" M="$BUILD" "$LLVM_ARG" modules
+elif [ -n "$CC_ARG" ]; then
+    exec make -C "$KDIR" M="$BUILD" "$CC_ARG" modules
+else
+    exec make -C "$KDIR" M="$BUILD" modules
+fi
