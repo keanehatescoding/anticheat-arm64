@@ -3779,16 +3779,16 @@ static int ac_report_parse_url(const char *url, struct ac_report_dest *out)
  * unreachable report endpoint stalls event polling for the whole
  * resolve+connect+send window on EVERY event for the duration of the
  * outage. Two bounds keep one outage from wedging the loop:
- *  1. the TCP connect phase below shares a single absolute deadline
- *     (AC_REPORT_CONNECT_BUDGET_MS) instead of a fresh timeout per
- *     address, and
+ *  1. resolve+connect share a single absolute deadline started before
+ *     resolution (AC_REPORT_TIMEOUT_SEC) instead of a fresh timeout per
+ *     phase and address, and
  *  2. this circuit breaker: after AC_REPORT_FAIL_THRESHOLD consecutive
  *     delivery failures the endpoint is treated as down and reports are
  *     skipped -- without touching the network at all -- until
  *     AC_REPORT_COOLDOWN_SEC passes. Local detection logging (syslog /
  *     stderr via logmsg()) is unaffected; only the HTTP delivery is
- *     suppressed, and only its own failure message on the trip (not one
- *     per skipped event) so the logs don't pile up either.
+ *     suppressed, with one arming message per cooldown window rather than
+ *     one per skipped event so the logs don't pile up either.
  * Wall-clock time is deliberately not used here: an NTP step or manual
  * clock change must neither suppress reporting nor fire a burst of it. */
 #define AC_REPORT_FAIL_THRESHOLD 3
@@ -3820,15 +3820,18 @@ static int ac_report_backoff_active(unsigned consec_fail,
     return ac_report_remaining_ms(until, now) > 0;
 }
 
-/* Record a failed delivery. The trip itself is logged once, here; later
- * ac_report() calls suppressed by the cooldown stay silent. */
+/* Record a failed delivery. Arming (and re-arming) the cooldown is logged
+ * here -- once per arming, not once per skipped event, so the logs don't
+ * pile up either. A failure after an expired cooldown re-arms a fresh one
+ * instead of leaving every later report to attempt a doomed synchronous
+ * delivery. */
 static void ac_report_note_failure(void)
 {
     struct timespec now;
 
     if (ac_report_consec_fail < UINT_MAX)
         ac_report_consec_fail++;
-    if (ac_report_consec_fail != AC_REPORT_FAIL_THRESHOLD)
+    if (ac_report_consec_fail < AC_REPORT_FAIL_THRESHOLD)
         return;
     clock_gettime(CLOCK_MONOTONIC, &now);
     ac_report_cooldown_until.tv_sec = now.tv_sec + AC_REPORT_COOLDOWN_SEC;
@@ -3921,6 +3924,18 @@ static void ac_report(const char *event_type, const char *detail)
             return;
         }
     } else {
+        /* Issue #9: one absolute deadline for resolve+connect together,
+         * started before resolution -- not a fresh budget for each. The
+         * resolve below opens the window (its own internal deadline is
+         * the same length, started a hair later); the connect loop gets
+         * whatever is left of it, so a slow-DNS-plus-many-addresses
+         * endpoint still can't stall past one timeout's worth of
+         * resolve+connect. SO_SNDTIMEO/SO_RCVTIMEO separately bound the
+         * later send/recv. */
+        struct timespec deadline;
+
+        clock_gettime(CLOCK_MONOTONIC, &deadline);
+        deadline.tv_sec += AC_REPORT_TIMEOUT_SEC;
         naddrs = ac_resolve_timeout(dest.host, dest.port, addrs,
                                      AC_RESOLVE_MAX, AC_REPORT_TIMEOUT_SEC);
         if (naddrs <= 0) {
@@ -3933,21 +3948,15 @@ static void ac_report(const char *event_type, const char *detail)
          * monitoring loop -- ac_connect_timeout() bounds connect() itself
          * (which SO_SNDTIMEO/SO_RCVTIMEO do not, on Linux), and those two
          * still bound the subsequent send/recv on whichever address works.
-         * Issue #9: that bound is one absolute budget for the whole phase,
-         * not a fresh timeout per address -- each attempt gets whatever is
-         * left of AC_REPORT_CONNECT_BUDGET_MS, so a many-address DNS
-         * response can't multiply the stall. */
+         * Each attempt gets whatever is left of the shared deadline above,
+         * so a many-address DNS response can't multiply the stall. */
         {
-            struct timespec cdeadline;
-
-            clock_gettime(CLOCK_MONOTONIC, &cdeadline);
-            cdeadline.tv_sec += AC_REPORT_TIMEOUT_SEC;
             for (ai = 0; ai < naddrs; ai++) {
                 struct timespec cnow;
                 long remain_ms;
 
                 clock_gettime(CLOCK_MONOTONIC, &cnow);
-                remain_ms = ac_report_remaining_ms(&cdeadline, &cnow);
+                remain_ms = ac_report_remaining_ms(&deadline, &cnow);
                 if (remain_ms <= 0)
                     break;   /* connect budget exhausted */
                 fd = socket(addrs[ai].family, addrs[ai].socktype,

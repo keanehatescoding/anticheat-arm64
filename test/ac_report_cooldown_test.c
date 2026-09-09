@@ -132,6 +132,26 @@ int main(void)
         ac_report_note_success();   /* leave no test pollution behind */
     }
 
+    /* counter wiring: a failure after an expired cooldown re-arms a fresh
+     * one instead of leaving later reports on the synchronous path */
+    {
+        struct timespec now;
+
+        ac_report_consec_fail = AC_REPORT_FAIL_THRESHOLD;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        ac_report_cooldown_until.tv_sec = now.tv_sec - 1;   /* expired */
+        ac_report_cooldown_until.tv_nsec = now.tv_nsec;
+        CHECK(!ac_report_backoff_active(ac_report_consec_fail, &now,
+                                        &ac_report_cooldown_until),
+              "an expired cooldown admits one more delivery attempt");
+        ac_report_note_failure();   /* that attempt fails too */
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        CHECK(ac_report_backoff_active(ac_report_consec_fail, &now,
+                                       &ac_report_cooldown_until),
+              "a post-expiry failure re-arms the backoff right away");
+        ac_report_note_success();   /* leave no test pollution behind */
+    }
+
     /* the constants must actually bound the stall they claim to bound:
      * one loneliest report can burn resolve + connect + send + read
      * timeouts back to back, so the cooldown has to outlast all four. */
