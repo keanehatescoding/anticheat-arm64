@@ -3156,6 +3156,7 @@ static void check_implicit_layers_periodic(void)
                 g_implicit_layer_baseline[free_slot].pid = pl.items[i].pid;
                 g_implicit_layer_baseline[free_slot].starttime = st0;
                 g_implicit_layer_baseline[free_slot].have_starttime = 1;
+                g_implicit_layer_baseline[free_slot].count = unknown;
                 g_implicit_layer_baseline[free_slot].in_use = 1;
             }
             continue;
