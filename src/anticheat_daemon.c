@@ -2224,15 +2224,31 @@ static int check_modules_periodic(void)
  * (stat field 22, via proc_starttime()) identifies the process generation,
  * so a recycled pid number never inherits the previous occupant's
  * baseline: the new process's own baseline is (re-)established on its
- * first scan, same as any newly-protected pid (issue #10). When the
- * starttime is unreadable (racy exit) the slot falls back to pid-only
- * matching, which is harmless: forget_stale() clears dead slots on the
- * next pass anyway.
- */
+ * first scan, same as any newly-protected pid (issue #10).
+ *
+ * Binding scan data to a slot needs the generation to hold across the
+ * scan itself: every periodic check below reads the starttime before
+ * scanning and confirms it with proc_same_generation() right after. If
+ * either read fails or the generation changed mid-scan the result is
+ * discarded and retried next period, so one generation's scan data is
+ * never stored under another's identity. Residual: same-tick pid
+ * recycling (starttime granularity is jiffies), negligible -- same
+ * accepted residual as the protect --pid pinning. A slot with unknown
+ * generation (have_starttime == 0, only possible if a future path
+ * inserts without one) is always treated as a new generation: the safe
+ * direction is re-baseline/re-warn, never compare. */
+/* Confirm pid still has starttime st0 (reread after a scan): 0 means it
+ * exited, was reused, or went unreadable mid-scan. */
+static int proc_same_generation(int pid, unsigned long long st0)
+{
+    unsigned long long st1;
+
+    return proc_starttime(pid, &st1) == 0 && st1 == st0;
+}
 struct ac_anon_baseline {
     int                pid;
-    unsigned long long starttime;       /* /proc stat field 22 at insert */
-    int                have_starttime;  /* 0 if unreadable at insert */
+    unsigned long long starttime;       /* /proc stat field 22, always known (see above) */
+    int                have_starttime;  /* 0 (unknown) always treated as a new generation */
     unsigned int       count;
     int                in_use;
 };
@@ -2254,24 +2270,21 @@ static void anon_baseline_forget_stale(const struct ac_prot_list *pl)
 }
 
 static void anon_baseline_check(int pid, const char *comm, unsigned int count,
-                                 int jit_allowed)
+                                int jit_allowed, unsigned long long st0)
 {
     unsigned int i, free_slot = AC_MAX_PROTS;
-    unsigned long long cur_st = 0;
-    int have_cur = (proc_starttime(pid, &cur_st) == 0);
 
+    /* st0 was read before the kernel scan and confirmed with
+     * proc_same_generation() right after by the caller -- count is this
+     * generation's data, so it binds directly. */
     for (i = 0; i < AC_MAX_PROTS; i++) {
         if (g_anon_baseline[i].in_use && g_anon_baseline[i].pid == pid) {
-            if (have_cur && (!g_anon_baseline[i].have_starttime ||
-                             cur_st != g_anon_baseline[i].starttime)) {
-                /* New process generation for this pid number: provably
-                 * different starttime (recycled pid), or no recorded
-                 * starttime at all (insert raced the old occupant's exit,
-                 * so the stored count cannot belong to whoever holds the
-                 * pid now). Adopt the new occupant silently -- its own
-                 * baseline starts here, with no delta alert against
-                 * another process's history. */
-                g_anon_baseline[i].starttime = cur_st;
+            if (!g_anon_baseline[i].have_starttime ||
+                st0 != g_anon_baseline[i].starttime) {
+                /* New occupant (recycled pid): its own baseline starts
+                 * here, silently -- no delta alert against the dead
+                 * process's history. */
+                g_anon_baseline[i].starttime = st0;
                 g_anon_baseline[i].have_starttime = 1;
                 g_anon_baseline[i].count = count;
                 return;
@@ -2299,8 +2312,8 @@ static void anon_baseline_check(int pid, const char *comm, unsigned int count,
     }
     if (free_slot != AC_MAX_PROTS) {
         g_anon_baseline[free_slot].pid = pid;
-        g_anon_baseline[free_slot].starttime = cur_st;
-        g_anon_baseline[free_slot].have_starttime = have_cur;
+        g_anon_baseline[free_slot].starttime = st0;
+        g_anon_baseline[free_slot].have_starttime = 1;
         g_anon_baseline[free_slot].count = count;
         g_anon_baseline[free_slot].in_use = 1;
     }
@@ -2457,8 +2470,8 @@ static int ac_read_ld_preload(int pid, char *out, size_t outsz)
  * as g_anon_baseline above. */
 struct ac_preload_warned {
     int                pid;
-    unsigned long long starttime;
-    int                have_starttime;
+    unsigned long long starttime;       /* always known: callers bracket, see above */
+    int                have_starttime;  /* 0 (unknown) always treated as a new generation */
     int                in_use;
 };
 static struct ac_preload_warned g_preload_warned[AC_MAX_PROTS];
@@ -2478,22 +2491,18 @@ static void preload_warned_forget_stale(const struct ac_prot_list *pl)
     }
 }
 
-static int preload_already_warned(int pid)
+static int preload_already_warned(int pid, unsigned long long st0)
 {
     unsigned int i;
-    unsigned long long cur_st = 0;
-    int have_cur = (proc_starttime(pid, &cur_st) == 0);
 
     for (i = 0; i < AC_MAX_PROTS; i++) {
         if (!g_preload_warned[i].in_use || g_preload_warned[i].pid != pid)
             continue;
-        if (have_cur && (!g_preload_warned[i].have_starttime ||
-                         cur_st != g_preload_warned[i].starttime)) {
-            /* New generation: recycled pid, or a mark that raced the old
-             * occupant's exit and recorded no starttime. Either way the
-             * old occupant's warn-once state must not silence the new
-             * process's warning. Drop the stale slot; the caller
-             * re-checks and re-warns below. */
+        if (!g_preload_warned[i].have_starttime ||
+            st0 != g_preload_warned[i].starttime) {
+            /* New generation: the old occupant's warn-once state must not
+             * silence the new process's warning. Drop the stale slot; the
+             * caller re-checks and re-warns below. */
             g_preload_warned[i].in_use = 0;
             return 0;
         }
@@ -2502,22 +2511,21 @@ static int preload_already_warned(int pid)
     return 0;
 }
 
-static void preload_mark_warned(int pid)
+static void preload_mark_warned(int pid, unsigned long long st0)
 {
     unsigned int i, free_slot = AC_MAX_PROTS;
-    unsigned long long cur_st = 0;
-    int have_cur = (proc_starttime(pid, &cur_st) == 0);
 
     for (i = 0; i < AC_MAX_PROTS; i++) {
         if (g_preload_warned[i].in_use && g_preload_warned[i].pid == pid)
-            return;
+            return;   /* already_warned() cleared stale generations above;
+                       * a match here is this generation, already recorded */
         if (free_slot == AC_MAX_PROTS && !g_preload_warned[i].in_use)
             free_slot = i;
     }
     if (free_slot != AC_MAX_PROTS) {
         g_preload_warned[free_slot].pid = pid;
-        g_preload_warned[free_slot].starttime = cur_st;
-        g_preload_warned[free_slot].have_starttime = have_cur;
+        g_preload_warned[free_slot].starttime = st0;
+        g_preload_warned[free_slot].have_starttime = 1;
         g_preload_warned[free_slot].in_use = 1;
     }
 }
@@ -2533,17 +2541,23 @@ static void check_ld_preload_periodic(void)
     preload_warned_forget_stale(&pl);
     for (i = 0; i < pl.count; i++) {
         char val[512];
+        unsigned long long st0 = 0;
 
-        if (preload_already_warned(pl.items[i].pid))
+        if (proc_starttime(pl.items[i].pid, &st0) != 0)
+            continue;   /* gone before the check; retry next period */
+        if (preload_already_warned(pl.items[i].pid, st0))
             continue;
         if (ac_read_ld_preload(pl.items[i].pid, val, sizeof(val)) != 1)
             continue;
+        if (!proc_same_generation(pl.items[i].pid, st0))
+            continue;   /* exited/reused mid-check: val may be another
+                         * generation's -- discard, retry next period */
         logmsg(LOG_WARNING, "pid %d (%s): LD_PRELOAD=%s set at exec -- "
                "common for legitimate overlay/compat tools (MangoHud, "
                "gamemode, gamescope) as well as library-injection hooking; "
                "informational only, not a verdict on its own",
                pl.items[i].pid, pl.items[i].comm, val);
-        preload_mark_warned(pl.items[i].pid);
+        preload_mark_warned(pl.items[i].pid, st0);
     }
 }
 
@@ -2557,8 +2571,8 @@ static int ac_ld_preload_check_interval(void)
  * for one doesn't imply anything about the other. */
 struct ac_vklayer_warned {
     int                pid;
-    unsigned long long starttime;
-    int                have_starttime;
+    unsigned long long starttime;       /* always known: callers bracket, see above */
+    int                have_starttime;  /* 0 (unknown) always treated as a new generation */
     int                in_use;
 };
 static struct ac_vklayer_warned g_vklayer_warned[AC_MAX_PROTS];
@@ -2578,17 +2592,15 @@ static void vklayer_warned_forget_stale(const struct ac_prot_list *pl)
     }
 }
 
-static int vklayer_already_warned(int pid)
+static int vklayer_already_warned(int pid, unsigned long long st0)
 {
     unsigned int i;
-    unsigned long long cur_st = 0;
-    int have_cur = (proc_starttime(pid, &cur_st) == 0);
 
     for (i = 0; i < AC_MAX_PROTS; i++) {
         if (!g_vklayer_warned[i].in_use || g_vklayer_warned[i].pid != pid)
             continue;
-        if (have_cur && (!g_vklayer_warned[i].have_starttime ||
-                         cur_st != g_vklayer_warned[i].starttime)) {
+        if (!g_vklayer_warned[i].have_starttime ||
+            st0 != g_vklayer_warned[i].starttime) {
             /* New generation -- same re-warn reasoning as
              * preload_already_warned() above. */
             g_vklayer_warned[i].in_use = 0;
@@ -2599,22 +2611,21 @@ static int vklayer_already_warned(int pid)
     return 0;
 }
 
-static void vklayer_mark_warned(int pid)
+static void vklayer_mark_warned(int pid, unsigned long long st0)
 {
     unsigned int i, free_slot = AC_MAX_PROTS;
-    unsigned long long cur_st = 0;
-    int have_cur = (proc_starttime(pid, &cur_st) == 0);
 
     for (i = 0; i < AC_MAX_PROTS; i++) {
         if (g_vklayer_warned[i].in_use && g_vklayer_warned[i].pid == pid)
-            return;
+            return;   /* same stale-generation reasoning as
+                       * preload_mark_warned() above */
         if (free_slot == AC_MAX_PROTS && !g_vklayer_warned[i].in_use)
             free_slot = i;
     }
     if (free_slot != AC_MAX_PROTS) {
         g_vklayer_warned[free_slot].pid = pid;
-        g_vklayer_warned[free_slot].starttime = cur_st;
-        g_vklayer_warned[free_slot].have_starttime = have_cur;
+        g_vklayer_warned[free_slot].starttime = st0;
+        g_vklayer_warned[free_slot].have_starttime = 1;
         g_vklayer_warned[free_slot].in_use = 1;
     }
 }
@@ -2630,8 +2641,11 @@ static void check_vk_layers_periodic(void)
     vklayer_warned_forget_stale(&pl);
     for (i = 0; i < pl.count; i++) {
         struct ac_environ_query vars[AC_VK_LAYER_ENV_VARS_COUNT];
+        unsigned long long st0 = 0;
 
-        if (vklayer_already_warned(pl.items[i].pid))
+        if (proc_starttime(pl.items[i].pid, &st0) != 0)
+            continue;   /* gone before the check; retry next period */
+        if (vklayer_already_warned(pl.items[i].pid, st0))
             continue;
         for (j = 0; j < AC_VK_LAYER_ENV_VARS_COUNT; j++) {
             memset(&vars[j], 0, sizeof(vars[j]));
@@ -2640,6 +2654,9 @@ static void check_vk_layers_periodic(void)
         if (ac_read_environ_vars(pl.items[i].pid, vars,
                                   AC_VK_LAYER_ENV_VARS_COUNT) < 0)
             continue;
+        if (!proc_same_generation(pl.items[i].pid, st0))
+            continue;   /* exited/reused mid-check: vars may be another
+                         * generation's -- discard, retry next period */
         for (j = 0; j < AC_VK_LAYER_ENV_VARS_COUNT; j++) {
             if (!vars[j].found)
                 continue;
@@ -2650,7 +2667,7 @@ static void check_vk_layers_periodic(void)
                    pl.items[i].pid, pl.items[i].comm,
                    vars[j].name, vars[j].value);
         }
-        vklayer_mark_warned(pl.items[i].pid);
+        vklayer_mark_warned(pl.items[i].pid, st0);
     }
 }
 
@@ -3045,8 +3062,8 @@ static int check_implicit_layers(int pid)
  * the signal. */
 struct ac_implicit_layer_baseline {
     int                pid;
-    unsigned long long starttime;
-    int                have_starttime;
+    unsigned long long starttime;       /* always known: callers bracket, see above */
+    int                have_starttime;  /* 0 (unknown) always treated as a new generation */
     unsigned int       count;
     int                in_use;
 };
@@ -3078,14 +3095,20 @@ static void check_implicit_layers_periodic(void)
     implicit_layer_baseline_forget_stale(&pl);
     for (i = 0; i < pl.count; i++) {
         struct ac_implicit_layer layers[AC_MAX_IMPLICIT_LAYERS];
-        int n = ac_scan_active_implicit_layers(pl.items[i].pid, layers,
-                                                AC_MAX_IMPLICIT_LAYERS);
+        unsigned long long st0 = 0;
+        int n;
         char names[512];
         size_t noff = 0;
         unsigned int unknown = 0, j, slot = AC_MAX_PROTS, free_slot = AC_MAX_PROTS;
 
+        if (proc_starttime(pl.items[i].pid, &st0) != 0)
+            continue;   /* gone before the scan; retry next period */
+        n = ac_scan_active_implicit_layers(pl.items[i].pid, layers,
+                                           AC_MAX_IMPLICIT_LAYERS);
         if (n < 0)
             continue;
+        if (!proc_same_generation(pl.items[i].pid, st0))
+            continue;   /* exited/reused mid-scan: discard, retry next period */
         for (j = 0; j < (unsigned int)n; j++) {
             const char *nm;
 
@@ -3106,23 +3129,18 @@ static void check_implicit_layers_periodic(void)
             unknown++;
         }
 
-        unsigned long long cur_st = 0;
-        int have_cur = (proc_starttime(pl.items[i].pid, &cur_st) == 0);
+        unsigned long long cur_st = st0;
         for (j = 0; j < AC_MAX_PROTS; j++) {
             if (g_implicit_layer_baseline[j].in_use &&
                 g_implicit_layer_baseline[j].pid == pl.items[i].pid) {
-                if (have_cur &&
-                    (!g_implicit_layer_baseline[j].have_starttime ||
-                     cur_st != g_implicit_layer_baseline[j].starttime)) {
-                    /* New process generation for this pid number: either
-                     * a provably different starttime (recycled pid), or
-                     * no recorded starttime at all (insert raced the old
-                     * occupant's exit, so the stored count cannot belong
-                     * to whoever holds the pid now). Re-baseline the new
-                     * occupant silently instead of diffing against a dead
-                     * process's count: count is set to the current value
-                     * up front so the growth check below cannot fire on
-                     * another process's history. */
+                if (!g_implicit_layer_baseline[j].have_starttime ||
+                    cur_st != g_implicit_layer_baseline[j].starttime) {
+                    /* New process generation for this pid number (recycled
+                     * pid, or a slot that never recorded one): re-baseline
+                     * the new occupant silently instead of diffing against
+                     * a dead process's count. Count is set to the current
+                     * value up front so the growth check below cannot fire
+                     * on another process's history. */
                     g_implicit_layer_baseline[j].starttime = cur_st;
                     g_implicit_layer_baseline[j].have_starttime = 1;
                     g_implicit_layer_baseline[j].count = unknown;
@@ -3136,9 +3154,8 @@ static void check_implicit_layers_periodic(void)
         if (slot == AC_MAX_PROTS) {
             if (free_slot != AC_MAX_PROTS) {
                 g_implicit_layer_baseline[free_slot].pid = pl.items[i].pid;
-                g_implicit_layer_baseline[free_slot].starttime = cur_st;
-                g_implicit_layer_baseline[free_slot].have_starttime = have_cur;
-                g_implicit_layer_baseline[free_slot].count = unknown;
+                g_implicit_layer_baseline[free_slot].starttime = st0;
+                g_implicit_layer_baseline[free_slot].have_starttime = 1;
                 g_implicit_layer_baseline[free_slot].in_use = 1;
             }
             continue;
@@ -3168,16 +3185,25 @@ static int scan_protected_periodic(void)
     anon_baseline_forget_stale(&pl);
     for (i = 0; i < pl.count; i++) {
         struct ac_scan_begin b;
+        unsigned long long st0 = 0;
 
         memset(&b, 0, sizeof(b));
         b.pid = pl.items[i].pid;
+        if (proc_starttime(pl.items[i].pid, &st0) != 0)
+            continue;   /* gone before the scan; retry next period */
         if (ioctl(dev_fd, AC_IOCTL_SCAN_BEGIN, &b) == 0) {
+            if (!proc_same_generation(pl.items[i].pid, st0)) {
+                /* Exited/reused mid-scan: b describes another generation.
+                 * End the kernel scan session, discard, retry next period. */
+                ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL);
+                continue;
+            }
             if (b.rwx_count > 0)
                 logmsg(LOG_WARNING, "pid %d (%s): %u RWX mapping(s) present",
                        pl.items[i].pid, pl.items[i].comm, b.rwx_count);
             anon_baseline_check(pl.items[i].pid, pl.items[i].comm,
                                  b.anon_exec_count,
-                                 pl.items[i].jit_allowed != 0);
+                                 pl.items[i].jit_allowed != 0, st0);
             ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL);
         }
     }
