@@ -3489,11 +3489,14 @@ static void ac_close_extra_fds(int keep_fd)
  * polling and let the kernel-side event ring fill and start dropping real
  * detections. Resolve in a short-lived child and bound how long we wait
  * for it with poll(), the same technique ac_connect_timeout() above uses
- * to bound connect(). Returns the number of addresses resolved (>=0), or
- * -1 on failure/timeout; the child is always reaped before returning. */
+ * to bound connect(). `deadline` is the caller's absolute (monotonic)
+ * resolve+connect deadline -- shared, not restarted here, so the resolver
+ * only ever spends what's left of the report's budget (issue #9). Returns
+ * the number of addresses resolved (>=0), or -1 on failure/timeout; the
+ * child is always reaped before returning. */
 static int ac_resolve_timeout(const char *host, const char *port,
                                struct ac_resolved_addr *out, int max,
-                               int timeout_sec)
+                               const struct timespec *deadline)
 {
     int pfd[2];
     pid_t pid;
@@ -3548,14 +3551,10 @@ static int ac_resolve_timeout(const char *host, const char *port,
     }
 
     close(pfd[1]);
-    /* An absolute deadline, not a per-call timeout_sec passed to every
-     * poll(): restarting the full timeout on each iteration would let a
-     * resolver trickling out one address per interval (or a slow child)
-     * keep the parent here for up to (max + 1) * timeout_sec -- exactly
-     * the unbounded stall this whole function exists to prevent. */
-    struct timespec deadline;
-    clock_gettime(CLOCK_MONOTONIC, &deadline);
-    deadline.tv_sec += timeout_sec;
+    /* An absolute deadline supplied by the caller, not a per-call timeout
+     * restarted here: restarting the full timeout on each iteration -- or
+     * restarting it after pipe()/fork() setup -- would let a slow resolver
+     * (or a slow child) keep the parent here past the report's budget. */
     /* read()/poll() on this fd can return early on a signal, and a pipe
      * gives no guarantee that a writer's single write() shows up as a
      * single reader-side read() -- so accumulate into a byte buffer
@@ -3573,8 +3572,8 @@ static int ac_resolve_timeout(const char *host, const char *port,
         ssize_t r;
 
         clock_gettime(CLOCK_MONOTONIC, &now);
-        remaining_ms = (deadline.tv_sec - now.tv_sec) * 1000L +
-                       (deadline.tv_nsec - now.tv_nsec) / 1000000L;
+        remaining_ms = (deadline->tv_sec - now.tv_sec) * 1000L +
+                       (deadline->tv_nsec - now.tv_nsec) / 1000000L;
         if (remaining_ms <= 0)
             break;   /* overall resolve deadline exceeded */
         if (poll(&p, 1, (int)remaining_ms) <= 0)
@@ -3925,9 +3924,9 @@ static void ac_report(const char *event_type, const char *detail)
         }
     } else {
         /* Issue #9: one absolute deadline for resolve+connect together,
-         * started before resolution -- not a fresh budget for each. The
-         * resolve below opens the window (its own internal deadline is
-         * the same length, started a hair later); the connect loop gets
+         * started before resolution and handed to both -- not a fresh
+         * budget per phase or address. The resolver derives each of its
+         * poll() waits from the same deadline, and the connect loop gets
          * whatever is left of it, so a slow-DNS-plus-many-addresses
          * endpoint still can't stall past one timeout's worth of
          * resolve+connect. SO_SNDTIMEO/SO_RCVTIMEO separately bound the
@@ -3937,7 +3936,7 @@ static void ac_report(const char *event_type, const char *detail)
         clock_gettime(CLOCK_MONOTONIC, &deadline);
         deadline.tv_sec += AC_REPORT_TIMEOUT_SEC;
         naddrs = ac_resolve_timeout(dest.host, dest.port, addrs,
-                                     AC_RESOLVE_MAX, AC_REPORT_TIMEOUT_SEC);
+                                     AC_RESOLVE_MAX, &deadline);
         if (naddrs <= 0) {
             fprintf(stderr, "ac_report: could not resolve %s:%s\n",
                     dest.host, dest.port);
