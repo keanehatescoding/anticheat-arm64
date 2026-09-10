@@ -213,6 +213,18 @@ ac-report-url-test: test/ac_report_url_test
 test/ac_report_url_test: test/ac_report_url_test.c src/anticheat_daemon.c src/sha256.c src/sha256.h src/anticheat.h
 	$(CC) $(CFLAGS) -o $@ test/ac_report_url_test.c src/sha256.c $(LDFLAGS)
 
+# ac_report() report-path stall bounds unit test (#9): pulls
+# anticheat_daemon.c in directly and proves the shared absolute connect
+# budget measures remaining time correctly, the consecutive-failure
+# circuit breaker trips only at the threshold and only while its monotonic
+# cooldown still has time left, and the failure/success counters arm and
+# clear it. See test/ac_report_cooldown_test.c.
+ac-report-cooldown-test: test/ac_report_cooldown_test
+	./test/ac_report_cooldown_test
+
+test/ac_report_cooldown_test: test/ac_report_cooldown_test.c src/anticheat_daemon.c src/sha256.c src/sha256.h src/anticheat.h
+	$(CC) $(CFLAGS) -o $@ test/ac_report_cooldown_test.c src/sha256.c $(LDFLAGS)
+
 # run the daemon CLI against the userspace mock (no kernel module, no root)
 test-mock: mock daemon
 	./test/mock_test.sh
@@ -222,12 +234,12 @@ test-mock: mock daemon
 # headers and is exercised separately in CI against a prepared kernel tree.)
 ci:
 	$(MAKE) clean
-	$(MAKE) CFLAGS="-O2 -Wall -Wextra -Werror" daemon mock baseline-test ac-report-status-test ac-report-url-test
+	$(MAKE) CFLAGS="-O2 -Wall -Wextra -Werror" daemon mock baseline-test ac-report-status-test ac-report-url-test ac-report-cooldown-test
 	./test/mock_test.sh
 
 clean:
 	@if [ -d "$(KDIR)" ]; then $(MAKE) -C "$(KDIR)" M="$(PWD)" clean; fi
-	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test test/mount_ns_probe test/anon_exec_test test/thread_exit_migration_test test/thread_spawn_after_protect_test test/ioctl_fuzz test/baseline_test test/ac_report_status_test test/ac_report_url_test
+	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test test/mount_ns_probe test/anon_exec_test test/thread_exit_migration_test test/thread_spawn_after_protect_test test/ioctl_fuzz test/baseline_test test/ac_report_status_test test/ac_report_url_test test/ac_report_cooldown_test
 
 install: all
 	@if [ -z "$(DESTDIR)" ] && [ "$$(id -u)" -ne 0 ]; then echo "error: 'make install' writes to /usr/local and /lib/modules -- run as root, or set DESTDIR= for a staged/packaging install"; exit 1; fi
@@ -262,4 +274,4 @@ install-deck: all
 uninstall-deck:
 	rm -rf "$(DECK_PREFIX)"
 
-.PHONY: all module daemon mock test-mock priv-drop-test render-hook-test mount-ns-test thread-exit-migration-test thread-spawn-after-protect-test ioctl-fuzz baseline-test ac-report-status-test ac-report-url-test ci clean install uninstall install-deck uninstall-deck
+.PHONY: all module daemon mock test-mock priv-drop-test render-hook-test mount-ns-test thread-exit-migration-test thread-spawn-after-protect-test ioctl-fuzz baseline-test ac-report-status-test ac-report-url-test ac-report-cooldown-test ci clean install uninstall install-deck uninstall-deck

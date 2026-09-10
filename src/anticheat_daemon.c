@@ -3342,6 +3342,11 @@ static int check_baselines_periodic(void)
 /* the deployment this project actually expects (see THREAT_MODEL.md).  */
 /* ------------------------------------------------------------------ */
 #define AC_REPORT_TIMEOUT_SEC 3
+/* Total budget shared by every connect() attempt of one report (issue #9):
+ * passed as the per-attempt ceiling on the first address and whatever is
+ * left of it on later ones, so a many-address response can't multiply the
+ * stall. ac_connect_timeout() takes it in milliseconds. */
+#define AC_REPORT_CONNECT_BUDGET_MS (AC_REPORT_TIMEOUT_SEC * 1000)
 
 /* connect() with an actual bound on how long it can block. On Linux,
  * SO_SNDTIMEO/SO_RCVTIMEO -- despite being set on this socket -- do NOT
@@ -3353,7 +3358,7 @@ static int check_baselines_periodic(void)
  * enforces the real bound. Returns 0 on success (fd left in its
  * original blocking mode), -1 on failure/timeout (errno set). */
 static int ac_connect_timeout(int fd, const struct sockaddr *addr,
-                               socklen_t addrlen, int timeout_sec)
+                               socklen_t addrlen, int timeout_ms)
 {
     int flags, err;
     socklen_t errlen = sizeof(err);
@@ -3378,7 +3383,7 @@ static int ac_connect_timeout(int fd, const struct sockaddr *addr,
 
     pfd.fd = fd;
     pfd.events = POLLOUT;
-    rc = poll(&pfd, 1, timeout_sec * 1000);
+    rc = poll(&pfd, 1, timeout_ms);
     if (rc <= 0) {
         fcntl(fd, F_SETFL, flags);
         errno = (rc == 0) ? ETIMEDOUT : errno;
@@ -3484,11 +3489,14 @@ static void ac_close_extra_fds(int keep_fd)
  * polling and let the kernel-side event ring fill and start dropping real
  * detections. Resolve in a short-lived child and bound how long we wait
  * for it with poll(), the same technique ac_connect_timeout() above uses
- * to bound connect(). Returns the number of addresses resolved (>=0), or
- * -1 on failure/timeout; the child is always reaped before returning. */
+ * to bound connect(). `deadline` is the caller's absolute (monotonic)
+ * resolve+connect deadline -- shared, not restarted here, so the resolver
+ * only ever spends what's left of the report's budget (issue #9). Returns
+ * the number of addresses resolved (>=0), or -1 on failure/timeout; the
+ * child is always reaped before returning. */
 static int ac_resolve_timeout(const char *host, const char *port,
                                struct ac_resolved_addr *out, int max,
-                               int timeout_sec)
+                               const struct timespec *deadline)
 {
     int pfd[2];
     pid_t pid;
@@ -3543,14 +3551,10 @@ static int ac_resolve_timeout(const char *host, const char *port,
     }
 
     close(pfd[1]);
-    /* An absolute deadline, not a per-call timeout_sec passed to every
-     * poll(): restarting the full timeout on each iteration would let a
-     * resolver trickling out one address per interval (or a slow child)
-     * keep the parent here for up to (max + 1) * timeout_sec -- exactly
-     * the unbounded stall this whole function exists to prevent. */
-    struct timespec deadline;
-    clock_gettime(CLOCK_MONOTONIC, &deadline);
-    deadline.tv_sec += timeout_sec;
+    /* An absolute deadline supplied by the caller, not a per-call timeout
+     * restarted here: restarting the full timeout on each iteration -- or
+     * restarting it after pipe()/fork() setup -- would let a slow resolver
+     * (or a slow child) keep the parent here past the report's budget. */
     /* read()/poll() on this fd can return early on a signal, and a pipe
      * gives no guarantee that a writer's single write() shows up as a
      * single reader-side read() -- so accumulate into a byte buffer
@@ -3568,8 +3572,8 @@ static int ac_resolve_timeout(const char *host, const char *port,
         ssize_t r;
 
         clock_gettime(CLOCK_MONOTONIC, &now);
-        remaining_ms = (deadline.tv_sec - now.tv_sec) * 1000L +
-                       (deadline.tv_nsec - now.tv_nsec) / 1000000L;
+        remaining_ms = (deadline->tv_sec - now.tv_sec) * 1000L +
+                       (deadline->tv_nsec - now.tv_nsec) / 1000000L;
         if (remaining_ms <= 0)
             break;   /* overall resolve deadline exceeded */
         if (poll(&p, 1, (int)remaining_ms) <= 0)
@@ -3770,6 +3774,82 @@ static int ac_report_parse_url(const char *url, struct ac_report_dest *out)
     }
 }
 
+/* Issue #9: ac_report() runs synchronously in the monitor loop, so an
+ * unreachable report endpoint stalls event polling for the whole
+ * resolve+connect+send window on EVERY event for the duration of the
+ * outage. Two bounds keep one outage from wedging the loop:
+ *  1. resolve+connect share a single absolute deadline started before
+ *     resolution (AC_REPORT_TIMEOUT_SEC) instead of a fresh timeout per
+ *     phase and address, and
+ *  2. this circuit breaker: after AC_REPORT_FAIL_THRESHOLD consecutive
+ *     delivery failures the endpoint is treated as down and reports are
+ *     skipped -- without touching the network at all -- until
+ *     AC_REPORT_COOLDOWN_SEC passes. Local detection logging (syslog /
+ *     stderr via logmsg()) is unaffected; only the HTTP delivery is
+ *     suppressed, with one arming message per cooldown window rather than
+ *     one per skipped event so the logs don't pile up either.
+ * Wall-clock time is deliberately not used here: an NTP step or manual
+ * clock change must neither suppress reporting nor fire a burst of it. */
+#define AC_REPORT_FAIL_THRESHOLD 3
+#define AC_REPORT_COOLDOWN_SEC 60
+static unsigned ac_report_consec_fail = 0;
+static struct timespec ac_report_cooldown_until = { 0, 0 };
+
+/* Remaining milliseconds from now until deadline; <= 0 means expired.
+ * Kept separate (instead of inline arithmetic at each call site) so the
+ * clamping is unit-testable -- see test/ac_report_cooldown_test.c. */
+static long ac_report_remaining_ms(const struct timespec *deadline,
+                                   const struct timespec *now)
+{
+    return (deadline->tv_sec - now->tv_sec) * 1000L +
+           (deadline->tv_nsec - now->tv_nsec) / 1000000L;
+}
+
+/* Pure predicate behind the skip check in ac_report(): trip after
+ * AC_REPORT_FAIL_THRESHOLD consecutive failures, stay tripped until the
+ * monotonic cooldown elapses. Takes both clocks as arguments (instead of
+ * reading them) so the boundary behavior is unit-testable without
+ * sleeping through a real cooldown. */
+static int ac_report_backoff_active(unsigned consec_fail,
+                                    const struct timespec *now,
+                                    const struct timespec *until)
+{
+    if (consec_fail < AC_REPORT_FAIL_THRESHOLD)
+        return 0;
+    return ac_report_remaining_ms(until, now) > 0;
+}
+
+/* Record a failed delivery. Arming (and re-arming) the cooldown is logged
+ * here -- once per arming, not once per skipped event, so the logs don't
+ * pile up either. A failure after an expired cooldown re-arms a fresh one
+ * instead of leaving every later report to attempt a doomed synchronous
+ * delivery. */
+static void ac_report_note_failure(void)
+{
+    struct timespec now;
+
+    if (ac_report_consec_fail < UINT_MAX)
+        ac_report_consec_fail++;
+    if (ac_report_consec_fail < AC_REPORT_FAIL_THRESHOLD)
+        return;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    ac_report_cooldown_until.tv_sec = now.tv_sec + AC_REPORT_COOLDOWN_SEC;
+    ac_report_cooldown_until.tv_nsec = now.tv_nsec;
+    fprintf(stderr,
+            "ac_report: %u consecutive failures, suppressing reports for "
+            "%d seconds\n",
+            ac_report_consec_fail, AC_REPORT_COOLDOWN_SEC);
+}
+
+/* Record a delivery the server actually answered (any HTTP status -- a
+ * response at all proves the endpoint is reachable again). */
+static void ac_report_note_success(void)
+{
+    ac_report_consec_fail = 0;
+    ac_report_cooldown_until.tv_sec = 0;
+    ac_report_cooldown_until.tv_nsec = 0;
+}
+
 static void ac_report(const char *event_type, const char *detail)
 {
     const char *url = getenv("AC_REPORT_URL");
@@ -3780,6 +3860,7 @@ static void ac_report(const char *event_type, const char *detail)
     struct ac_resolved_addr addrs[AC_RESOLVE_MAX];
     int fd = -1, naddrs, ai;
     struct timeval tv;
+    struct timespec now;
     ssize_t n;
 
     if (!url || !*url || !key || !*key)
@@ -3787,6 +3868,15 @@ static void ac_report(const char *event_type, const char *detail)
 
     if (ac_report_parse_url(url, &dest) != 0)
         return;   /* ac_report_parse_url() already logged what's wrong */
+
+    /* Issue #9: endpoint is in a known-down cooldown -- skip the network
+     * entirely instead of stalling the monitor loop on another doomed
+     * resolve+connect cycle. Detection logging already happened in
+     * logmsg(); only the HTTP delivery is suppressed. */
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (ac_report_backoff_active(ac_report_consec_fail, &now,
+                                 &ac_report_cooldown_until))
+        return;
 
     ac_report_client_id(client_id, sizeof(client_id));
     /* Defense in depth for #96: even though ac_report_client_id()
@@ -3816,6 +3906,7 @@ static void ac_report(const char *event_type, const char *detail)
         if (fd < 0) {
             fprintf(stderr, "ac_report: socket() failed: %s\n",
                     strerror(errno));
+            ac_report_note_failure();
             return;
         }
         tv.tv_sec = AC_REPORT_TIMEOUT_SEC;
@@ -3823,44 +3914,73 @@ static void ac_report(const char *event_type, const char *detail)
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         if (ac_connect_timeout(fd, (struct sockaddr *)&sun, sizeof(sun),
-                                AC_REPORT_TIMEOUT_SEC) != 0) {
+                                AC_REPORT_CONNECT_BUDGET_MS) != 0) {
             fprintf(stderr,
                     "ac_report: could not connect to unix socket %s: %s\n",
                     dest.sock_path, strerror(errno));
             close(fd);
+            ac_report_note_failure();
             return;
         }
     } else {
+        /* Issue #9: one absolute deadline for resolve+connect together,
+         * started before resolution and handed to both -- not a fresh
+         * budget per phase or address. The resolver derives each of its
+         * poll() waits from the same deadline, and the connect loop gets
+         * whatever is left of it, so a slow-DNS-plus-many-addresses
+         * endpoint still can't stall past one timeout's worth of
+         * resolve+connect. SO_SNDTIMEO/SO_RCVTIMEO separately bound the
+         * later send/recv. */
+        struct timespec deadline;
+
+        clock_gettime(CLOCK_MONOTONIC, &deadline);
+        deadline.tv_sec += AC_REPORT_TIMEOUT_SEC;
         naddrs = ac_resolve_timeout(dest.host, dest.port, addrs,
-                                     AC_RESOLVE_MAX, AC_REPORT_TIMEOUT_SEC);
+                                     AC_RESOLVE_MAX, &deadline);
         if (naddrs <= 0) {
             fprintf(stderr, "ac_report: could not resolve %s:%s\n",
                     dest.host, dest.port);
+            ac_report_note_failure();
             return;
         }
         /* A hung/unreachable report server must never stall the security
          * monitoring loop -- ac_connect_timeout() bounds connect() itself
          * (which SO_SNDTIMEO/SO_RCVTIMEO do not, on Linux), and those two
-         * still bound the subsequent send/recv on whichever address works. */
-        for (ai = 0; ai < naddrs; ai++) {
-            fd = socket(addrs[ai].family, addrs[ai].socktype,
-                        addrs[ai].protocol);
-            if (fd < 0)
-                continue;
-            tv.tv_sec = AC_REPORT_TIMEOUT_SEC;
-            tv.tv_usec = 0;
-            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-            if (ac_connect_timeout(fd, (struct sockaddr *)&addrs[ai].addr,
-                                    addrs[ai].addrlen,
-                                    AC_REPORT_TIMEOUT_SEC) == 0)
-                break;
-            close(fd);
-            fd = -1;
+         * still bound the subsequent send/recv on whichever address works.
+         * Each attempt gets whatever is left of the shared deadline above,
+         * so a many-address DNS response can't multiply the stall. */
+        {
+            for (ai = 0; ai < naddrs; ai++) {
+                struct timespec cnow;
+                long remain_ms;
+
+                clock_gettime(CLOCK_MONOTONIC, &cnow);
+                remain_ms = ac_report_remaining_ms(&deadline, &cnow);
+                if (remain_ms <= 0)
+                    break;   /* connect budget exhausted */
+                fd = socket(addrs[ai].family, addrs[ai].socktype,
+                            addrs[ai].protocol);
+                if (fd < 0)
+                    continue;
+                tv.tv_sec = AC_REPORT_TIMEOUT_SEC;
+                tv.tv_usec = 0;
+                setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+                setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+                if (ac_connect_timeout(fd,
+                                        (struct sockaddr *)&addrs[ai].addr,
+                                        addrs[ai].addrlen,
+                                        remain_ms < AC_REPORT_CONNECT_BUDGET_MS ?
+                                            (int)remain_ms :
+                                            AC_REPORT_CONNECT_BUDGET_MS) == 0)
+                    break;
+                close(fd);
+                fd = -1;
+            }
         }
         if (fd < 0) {
             fprintf(stderr, "ac_report: could not connect to %s:%s\n",
                     dest.host, dest.port);
+            ac_report_note_failure();
             return;
         }
     }
@@ -3913,6 +4033,7 @@ static void ac_report(const char *event_type, const char *detail)
             if (w < 0) {
                 fprintf(stderr, "ac_report: send failed: %s\n", strerror(errno));
                 close(fd);
+                ac_report_note_failure();
                 return;
             }
             if (w == 0)
@@ -3923,6 +4044,7 @@ static void ac_report(const char *event_type, const char *detail)
             fprintf(stderr, "ac_report: short write (%zu of %zu bytes)\n",
                     sent, reqlen);
             close(fd);
+            ac_report_note_failure();
             return;
         }
     }
@@ -3953,6 +4075,12 @@ static void ac_report(const char *event_type, const char *detail)
             snprintf(body, sizeof(body), "(read failed: %s)",
                      strerror(errno));
         }
+        /* A response -- any status -- proves the endpoint is reachable
+         * again; silence (close/timeout) counts as another failure. */
+        if (n > 0)
+            ac_report_note_success();
+        else
+            ac_report_note_failure();
         if (code < 200 || code >= 300)
             fprintf(stderr, "ac_report: server response status %d: %s\n",
                     code, body);
