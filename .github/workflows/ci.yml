@@ -97,6 +97,44 @@ jobs:
             { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
           git ls-files '*.sh' | xargs shellcheck
 
+      # AUR publish correctness (see issue #46): packaging/aur/.SRCINFO is
+      # a checked-in, hand-regenerated copy of PKGBUILD metadata
+      # (makepkg --printsrcinfo), so it drifts silently -- arch = x86_64
+      # survived the ARM64-only port long after PKGBUILD moved to
+      # aarch64. A stale .SRCINFO publishes the wrong architecture to AUR,
+      # and a pkgver cross-check against dkms.conf catches the RELEASING.md
+      # "must move together" bump landing in only one place. Textual
+      # comparison only: no makepkg/namcap on the ubuntu runner, and no
+      # network (the sha256sums SKIP placeholder itself stays legitimate
+      # until v<pkgver> is actually tagged -- filling it needs the real
+      # release tarball, not CI).
+      - name: Verify AUR packaging metadata is in sync
+        run: |
+          fail=0
+          pkgver="$(sed -n 's/^pkgver=//p' packaging/aur/PKGBUILD)"
+          pkgrel="$(sed -n 's/^pkgrel=//p' packaging/aur/PKGBUILD)"
+          pkgarch="$(sed -n "s/^arch=('\(.*\)')/\1/p" packaging/aur/PKGBUILD)"
+          for field in "pkgver = $pkgver" "pkgrel = $pkgrel" "arch = $pkgarch"; do
+            if ! grep -qF "$field" packaging/aur/.SRCINFO; then
+              echo "::error file=packaging/aur/.SRCINFO::missing '$field' -- regenerate with 'makepkg --printsrcinfo > .SRCINFO'"
+              fail=1
+            fi
+          done
+          if ! grep -qF "hypranticheat-$pkgver.tar.gz" packaging/aur/.SRCINFO; then
+            echo "::error file=packaging/aur/.SRCINFO::source tarball out of sync with pkgver=$pkgver"
+            fail=1
+          fi
+          dkmsver="$(sed -n 's/^PACKAGE_VERSION="\(.*\)"/\1/p' dkms.conf)"
+          if [ "$pkgver" != "$dkmsver" ]; then
+            echo "::error file=packaging/aur/PKGBUILD::pkgver=$pkgver disagrees with dkms.conf PACKAGE_VERSION=$dkmsver (RELEASING.md: bump together)"
+            fail=1
+          fi
+          if grep -q "sha256sums=('SKIP')" packaging/aur/PKGBUILD && git tag --list "v$pkgver" | grep -q .; then
+            echo "::error file=packaging/aur/PKGBUILD::v$pkgver is tagged but sha256sums is still SKIP -- run updpkgsums (issue #46)"
+            fail=1
+          fi
+          exit "$fail"
+
   # --- kernel module: compile smoke test against a pinned modern tree ---
   # The module targets kernels >= 6.12 (uses sized_strscpy, the _noprof
   # allocators, for_class_mod_mem_type, maple-tree VMA iteration).  CI
