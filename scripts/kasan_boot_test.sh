@@ -141,6 +141,12 @@ echo "== building userspace (daemon + ioctl_fuzz) =="
 # native ARM64 host (plain gcc). Command-line only, deliberately not
 # exported: the environment would leak into the module build above, where
 # an explicit CC overrides the Makefile's own Kbuild toolchain detection.
+# Remove first: switching CC (host cc vs ${CROSS_COMPILE}gcc across runs)
+# doesn't invalidate make's timestamps, so a stale binary for the wrong
+# arch would otherwise survive and die in the guest with "cannot execute
+# binary file" -- seen in a real run, where an x86_64 ioctl_fuzz from an
+# earlier host build was reused. Both are gitignored build artifacts.
+rm -f "$REPO_ROOT/anticheat" "$REPO_ROOT/test/ioctl_fuzz"
 make -C "$REPO_ROOT" CC="${CROSS_COMPILE}gcc" CFLAGS="-O2 -Wall -Wextra -Werror" daemon ioctl-fuzz
 
 # Guest-side paths and rootfs (see the vng invocation below for why):
