@@ -147,8 +147,14 @@ make -C "$REPO_ROOT" CC="${CROSS_COMPILE}gcc" CFLAGS="-O2 -Wall -Wextra -Werror"
 # with a --root chroot the guest cannot see host paths, so the repo and
 # the payload dir are mapped to fixed guest locations via
 # --rodir guestpath=hostpath, and the payload below runs from $GUEST_REPO.
-GUEST_REPO="/repo"
-GUEST_WORK="/work"
+# The guest paths reuse /mnt and /srv: both exist empty in the Ubuntu
+# cloud image, which matters -- virtme-init's rodir setup does
+# `mkdir -p` for missing mountpoints, and as guest-root mapped to the
+# unprivileged host user it cannot create directories under a root-owned
+# chroot (which is also what vng's own provisioning produces), so any
+# path needing creation would fail the mount and hang the boot.
+GUEST_REPO="/mnt"
+GUEST_WORK="/srv"
 # Fresh arm64 chroot per run under $WORKDIR (auto-removed by the EXIT
 # trap); set AC_ARM64_ROOT to reuse a prepared tree instead.
 ROOTDIR="${AC_ARM64_ROOT:-$WORKDIR/arm64-root}"
