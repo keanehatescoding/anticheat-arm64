@@ -30,6 +30,9 @@
 # workflow passes a fresh seed each run instead, so repeated nightly
 # runs accumulate coverage rather than re-fuzzing the identical sequence
 # forever.
+# Scratch space: the kernel tree is built under ${TMPDIR:-/tmp}; set
+# TMPDIR to a disk-backed directory on hosts where /tmp is a small
+# tmpfs, which a KASAN build will otherwise fill.
 # Cross-arch rootfs reuse: AC_ARM64_ROOT=/path/to/arm64-chroot reuses a
 # prepared Ubuntu arm64 tree instead of downloading a fresh cloud image
 # every run (vng uses the dir as-is when it already exists). Needed on
@@ -47,7 +50,13 @@ if ! [[ "$IOCTL_FUZZ_ITERATIONS" =~ ^[1-9][0-9]*$ && "$IOCTL_FUZZ_SEED" =~ ^[0-9
 fi
 
 KVER=6.12
-WORKDIR="$(mktemp -d /tmp/ac_kasan_boot.XXXXXXXX)"
+# ${TMPDIR:-/tmp}, not a hardcoded /tmp: the full KASAN kernel tree
+# built below wants tens of GB, and on a host whose /tmp is a small
+# RAM-backed tmpfs (systemd's default on several distros) that build
+# both runs out of space and competes for RAM with itself. Honouring
+# TMPDIR lets such a host point the build at real disk without editing
+# this script; CI's disk-backed /tmp is unaffected either way.
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/ac_kasan_boot.XXXXXXXX")"
 KDIR="$WORKDIR/linux-$KVER"
 # Written directly here, not under $WORKDIR: the EXIT trap below deletes
 # $WORKDIR on every exit path, including a mid-run cancellation (CI's
