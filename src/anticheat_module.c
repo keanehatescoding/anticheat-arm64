@@ -2109,31 +2109,90 @@ static unsigned long long ac_module_size(const struct module *mod)
  * address, poisoning both the hidden-module check and the syscall
  * plausibility filter.
  *
- * The is_vmalloc_addr() check guards against a subtler problem than a
- * torn entry: both walk sites below do
+ * The harder problem this guards is not a torn entry but the list
+ * sentinel: both walk sites below do
  * list_for_each_entry(m, &THIS_MODULE->list, list), which only stops
  * once it circles back to THIS_MODULE's own list node -- not the
- * kernel's real (unexported) `modules` list_head sentinel. A full walk
- * necessarily passes through that sentinel too, and list_for_each_entry
+ * kernel's real (unexported) `modules` list_head.  A full walk
+ * necessarily passes through that head too, and list_for_each_entry
  * unconditionally container_of()s it into a `struct module *` as if it
- * were a real entry, even though it isn't embedded in one. Dereferencing
- * that bogus pointer reads whatever kernel global happens to sit at
- * that computed offset -- a real, reproduced KASAN global-out-of-bounds
- * (confirmed: lands inside a kernel workqueue global on one tested
- * layout). A genuine struct module always lives inside that module's
- * own vmalloc'd core memory; the sentinel-derived pointer instead lands
- * in the kernel's statically-linked image, so is_vmalloc_addr() tells
- * the two apart without ever needing the sentinel's own (unexported)
- * address. */
+ * were a real entry, even though it isn't embedded in one.  Every field
+ * read off that pointer lands on whatever kernel global happens to sit
+ * at the computed offset.
+ *
+ * This used to be filtered with is_vmalloc_addr(), on the reasoning that
+ * a genuine struct module lives in its module's vmalloc'd core memory
+ * while the sentinel-derived pointer lands in the kernel's
+ * statically-linked image.  That reasoning does not hold on arm64:
+ * KIMAGE_VADDR == MODULES_END == VMALLOC_START there, and the kernel
+ * image is itself a vmalloc mapping (created by paging_init()), so
+ * is_vmalloc_addr() is true for kernel .data and the sentinel sailed
+ * through.  scripts/kasan_boot_test.sh reproduces it as 654
+ * global-out-of-bounds reports at two sites -- the m->state read below
+ * (4 bytes, attributed to module_mutex's redzone) and the
+ * m->mem[MOD_TEXT].base read 448 bytes further on (8 bytes, attributed
+ * to modinfo_attrs') -- both for the same pointer, &modules - 8.
+ *
+ * Two changes fix it for every architecture:
+ *
+ * 1. Read through copy_from_kernel_nofault().  Its loads come from
+ *    uninstrumented inline asm with an exception-table fixup, so a bad
+ *    pointer returns -EFAULT rather than oopsing, and never trips KASAN.
+ *    Nothing here may dereference m directly before it has been proven
+ *    to be a module.
+ *
+ * 2. Require the struct to be contained in its own MOD_DATA block.  A
+ *    real struct module *is* that module's .gnu.linkonce.this_module
+ *    section, which is SHF_ALLOC|SHF_WRITE and so laid out into MOD_DATA
+ *    by layout_sections().  Self-containment is therefore an invariant
+ *    of every genuine entry, and one the sentinel cannot satisfy no
+ *    matter where the kernel image sits relative to the vmalloc range.
+ *    It subsumes the old is_vmalloc_addr() test, which is why that test
+ *    is gone rather than merely augmented.
+ *
+ * Note this is a containment check, not a liveness check: it says the
+ * pointer is a module, not that the module cannot go away underneath us.
+ * The walk is still best-effort against concurrent unload, as before. */
 static bool ac_module_sane(const struct module *m)
 {
-    if (!is_vmalloc_addr(m))
+    unsigned long addr = (unsigned long)m;
+    void *data_base, *text_base;
+    unsigned int data_size, text_size;
+    enum module_state state;
+
+    if (!m)
         return false;
-    if (m->state != MODULE_STATE_LIVE)
+
+    if (copy_from_kernel_nofault(&data_base, &m->mem[MOD_DATA].base,
+                                 sizeof(data_base)) ||
+        copy_from_kernel_nofault(&data_size, &m->mem[MOD_DATA].size,
+                                 sizeof(data_size)))
         return false;
-    if (!m->mem[MOD_TEXT].base || !m->mem[MOD_TEXT].size)
+
+    /* Self-containment: decisive, and checked before anything else is
+     * believed.  Overflow-safe because base+size is bounded by the
+     * vmalloc allocation it describes. */
+    if (!data_base || !data_size)
         return false;
-    if (m->mem[MOD_TEXT].size > 0x40000000UL)   /* > 1 GiB text: bogus */
+    if (addr < (unsigned long)data_base ||
+        addr + sizeof(*m) > (unsigned long)data_base + data_size)
+        return false;
+
+    /* m is a real struct module from here on, but it is still shared
+     * with concurrent loads/unloads, so keep reading defensively. */
+    if (copy_from_kernel_nofault(&state, &m->state, sizeof(state)))
+        return false;
+    if (state != MODULE_STATE_LIVE)
+        return false;
+
+    if (copy_from_kernel_nofault(&text_base, &m->mem[MOD_TEXT].base,
+                                 sizeof(text_base)) ||
+        copy_from_kernel_nofault(&text_size, &m->mem[MOD_TEXT].size,
+                                 sizeof(text_size)))
+        return false;
+    if (!text_base || !text_size)
+        return false;
+    if (text_size > 0x40000000UL)   /* > 1 GiB text: bogus */
         return false;
     return true;
 }
