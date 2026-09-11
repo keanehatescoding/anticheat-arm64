@@ -30,6 +30,10 @@
 # workflow passes a fresh seed each run instead, so repeated nightly
 # runs accumulate coverage rather than re-fuzzing the identical sequence
 # forever.
+# Cross-arch rootfs reuse: AC_ARM64_ROOT=/path/to/arm64-chroot reuses a
+# prepared Ubuntu arm64 tree instead of downloading a fresh cloud image
+# every run (vng uses the dir as-is when it already exists). Needed on
+# hosts without passwordless sudo, which vng's own provisioning requires.
 set -euo pipefail
 
 cd "$(dirname "$0")/.." || exit 1
@@ -130,14 +134,32 @@ make -C "$REPO_ROOT" KDIR="$KDIR" module
 test -s "$REPO_ROOT/anticheat.ko"
 
 echo "== building userspace (daemon + ioctl_fuzz) =="
-make -C "$REPO_ROOT" CFLAGS="-O2 -Wall -Wextra -Werror" daemon ioctl-fuzz
+# Cross-built when the guest differs from the host: these binaries execute
+# *inside* the arm64 VM below, so host-cc output (x86_64 on an x86_64 build
+# machine) would die there with "cannot execute binary file". Same CC=
+# override ci.yml's own aarch64 cross-build check already uses; empty on a
+# native ARM64 host (plain gcc). Command-line only, deliberately not
+# exported: the environment would leak into the module build above, where
+# an explicit CC overrides the Makefile's own Kbuild toolchain detection.
+make -C "$REPO_ROOT" CC="${CROSS_COMPILE}gcc" CFLAGS="-O2 -Wall -Wextra -Werror" daemon ioctl-fuzz
+
+# Guest-side paths and rootfs (see the vng invocation below for why):
+# with a --root chroot the guest cannot see host paths, so the repo and
+# the payload dir are mapped to fixed guest locations via
+# --rodir guestpath=hostpath, and the payload below runs from $GUEST_REPO.
+GUEST_REPO="/repo"
+GUEST_WORK="/work"
+# Fresh arm64 chroot per run under $WORKDIR (auto-removed by the EXIT
+# trap); set AC_ARM64_ROOT to reuse a prepared tree instead.
+ROOTDIR="${AC_ARM64_ROOT:-$WORKDIR/arm64-root}"
+ROOT_RELEASE="noble"
 
 echo "== writing in-VM payload =="
 PAYLOAD="$WORKDIR/in_vm_payload.sh"
 cat > "$PAYLOAD" <<PAYLOAD_EOF
 #!/bin/bash
-# Runs as root inside the guest, against the host filesystem virtme-ng
-# shares in -- \$REPO_ROOT below is the real repo path, not a copy.
+# Runs as root inside the guest. $GUEST_REPO/$GUEST_WORK here are the
+# *guest-side* paths mapped by the vng invocation's --rodir flags below.
 #
 # -x only, deliberately not -e: this module's own CLI legitimately
 # returns nonzero for informational-not-broken outcomes (ENODEV when
@@ -152,7 +174,7 @@ cat > "$PAYLOAD" <<PAYLOAD_EOF
 # an explicit fatal check -- those failing means the payload itself is
 # broken, not that the module reported something.
 set -x
-cd "$REPO_ROOT" || exit 1
+cd "$GUEST_REPO" || exit 1
 
 insmod ./anticheat.ko ac_verbose=1 || { echo "AC_KASAN_BOOT: insmod failed"; exit 1; }
 sleep 0.3
@@ -228,7 +250,18 @@ echo "== booting via virtme-ng =="
 # armhf, ...) -- `aarch64` is rejected with "unsupported architecture"
 # and the guest never boots, which then surfaces misleadingly as the
 # "payload never reported completion" FAIL below.
-vng --arch arm64 --run "$KDIR" --memory 3072M --exec "$PAYLOAD" 2>&1 | tee "$CONSOLE_LOG" || true
+#
+# --root/--root-release: --arch on a non-ARM host additionally requires a
+# chroot ("--arch used without --root", same never-boots outcome).
+# $ROOTDIR doesn't exist on a fresh run, so vng provisions it from
+# Ubuntu's arm64 cloud image for $ROOT_RELEASE (needs sudo, same as the
+# CI job's apt step); an existing dir (see AC_ARM64_ROOT above) is used
+# as-is. --rodir guestpath=hostpath maps the repo and payload dir to the
+# fixed guest paths the payload runs from -- bare --rodir paths must live
+# inside the chroot and are rejected otherwise.
+vng --arch arm64 --root "$ROOTDIR" --root-release "$ROOT_RELEASE" \
+    --rodir "$GUEST_REPO=$REPO_ROOT" --rodir "$GUEST_WORK=$WORKDIR" \
+    --run "$KDIR" --memory 3072M --exec "$GUEST_WORK/in_vm_payload.sh" 2>&1 | tee "$CONSOLE_LOG" || true
 
 if ! grep -q "AC_KASAN_BOOT: payload complete" "$CONSOLE_LOG"; then
     echo "FAIL: payload never reported completion -- boot, insmod, or the in-VM script likely crashed/hung before finishing. See $CONSOLE_LOG." >&2
