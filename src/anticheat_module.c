@@ -283,6 +283,107 @@ static bool ac_entry_bad(unsigned long e)
     return !ac_plausible_handler(e, ac_anchor);
 }
 
+/* One [start, end) core range per live module, snapshotted once per
+ * ac_check_syscalls() pass (see below). ac_entry_bad() used to do its own
+ * preempt_disable() + full module-list walk for every one of up to
+ * __NR_syscalls table entries, all serialized behind ac_syscall_check_lock
+ * with no cond_resched() -- up to 512 preempt-disabled walks per
+ * CHECK_SYSCALLS ioctl. The snapshot moves that to a single walk; the
+ * per-entry test then scans private ranges with no list traversal and no
+ * preemption juggling. Ranges cover every core mem type (min base to max
+ * end), matching within_module_core()'s scope, under the same
+ * ac_module_sane() guard the per-entry walk uses. A module loading or
+ * unloading mid-pass simply lands in the next pass, same staleness the
+ * old per-entry walk already had between its first and last entry. */
+struct ac_mod_range {
+    unsigned long start;
+    unsigned long end;
+};
+
+static unsigned int ac_snapshot_mod_ranges(struct ac_mod_range *ranges,
+                                           unsigned int cap)
+{
+    struct module *m;
+    unsigned int n = 0;
+
+    preempt_disable();
+    list_for_each_entry(m, &THIS_MODULE->list, list) {
+        unsigned long lo = -1UL, hi = 0;
+
+        if (!ac_module_sane(m))
+            continue;
+        if (n >= cap)
+            break;
+        for_class_mod_mem_type(type, core) {
+            unsigned long b = (unsigned long)m->mem[type].base;
+            unsigned long sz = m->mem[type].size;
+
+            if (!b || !sz)
+                continue;
+            if (b < lo)
+                lo = b;
+            if (b + sz > hi)
+                hi = b + sz;
+        }
+        if (hi <= lo)
+            continue;
+        ranges[n].start = lo;
+        ranges[n].end = hi;
+        n++;
+    }
+    preempt_enable();
+    return n;
+}
+
+static bool ac_addr_in_ranges(unsigned long addr,
+                              const struct ac_mod_range *ranges,
+                              unsigned int n)
+{
+    unsigned int i;
+
+    for (i = 0; i < n; i++) {
+        if (addr >= ranges[i].start && addr < ranges[i].end)
+            return true;
+    }
+    return false;
+}
+
+/* Snapshot-backed variants of ac_in_core_text()/ac_plausible_handler()/
+ * ac_entry_bad() above: identical decisions, but the module-membership
+ * test runs against the pass snapshot instead of walking the live list. */
+static bool ac_in_core_text_snapshot(unsigned long addr,
+                                     const struct ac_mod_range *ranges,
+                                     unsigned int n)
+{
+    if (!ac_stext || !ac_text_end)
+        return false;
+    if (addr < ac_stext || addr >= ac_text_end)
+        return false;
+    if (ac_addr_in_ranges(addr, ranges, n))
+        return false;
+    return true;
+}
+
+static bool ac_plausible_handler_snapshot(unsigned long e, unsigned long anchor,
+                                          const struct ac_mod_range *ranges,
+                                          unsigned int n)
+{
+    if (!e)
+        return false;
+    if (ac_addr_in_ranges(e, ranges, n))
+        return false;
+    return e > anchor - 0x4000000UL && e < anchor + 0x4000000UL;
+}
+
+static bool ac_entry_bad_snapshot(unsigned long e,
+                                  const struct ac_mod_range *ranges,
+                                  unsigned int n)
+{
+    if (ac_stext && ac_text_end)
+        return !ac_in_core_text_snapshot(e, ranges, n);
+    return !ac_plausible_handler_snapshot(e, ac_anchor, ranges, n);
+}
+
 /* ------------------------------------------------------------------ */
 /* syscall table discovery                                             */
 /* ------------------------------------------------------------------ */
@@ -551,6 +652,8 @@ static int ac_check_syscalls(struct ac_syscall_check *out)
     unsigned int i;
     ac_sha256_ctx hash;
     uint8_t digest[32];
+    struct ac_mod_range *ranges;
+    unsigned int nranges = 0;
 
     memset(out, 0, sizeof(*out));
     out->table_addr = base;
@@ -560,7 +663,15 @@ static int ac_check_syscalls(struct ac_syscall_check *out)
     out->nr_syscalls = __NR_syscalls;
     out->baseline_ready = ac_syscall_baseline_ready;
 
+    /* One preempt-disabled module-list walk per CHECK_SYSCALLS call, not one
+     * per table entry (see ac_snapshot_mod_ranges() above). Falls back to
+     * the per-entry walk if the allocation fails, so correctness never
+     * depends on it. Allocated before the lock so a sleeping allocator
+     * doesn't extend the mutex hold time. */
+    ranges = kvmalloc_array(AC_MAX_MODS, sizeof(*ranges), GFP_KERNEL);
     mutex_lock(&ac_syscall_check_lock);
+    if (ranges)
+        nranges = ac_snapshot_mod_ranges(ranges, AC_MAX_MODS);
     ac_sha256_init(&hash);
     for (i = 0; i < __NR_syscalls; i++) {
         unsigned long e = 0;
@@ -582,6 +693,12 @@ static int ac_check_syscalls(struct ac_syscall_check *out)
             e = have_baseline ? ac_syscall_baseline[i] : 0;
         }
         ac_sha256_update(&hash, &e, sizeof(e));
+        /* Sleepable context (mutex, not spinlock): yield periodically so a
+         * 512-entry scan doesn't monopolize the CPU or stall other
+         * syscall-check callers queued on the mutex. Placed here, before
+         * the continue paths below, so every slot hits it. */
+        if ((i & 15) == 15)
+            cond_resched();
 
         if (!read_ok) {
             /* Leave ac_redirect_bitmap/ac_hooked_bitmap and the backfill
@@ -612,7 +729,8 @@ static int ac_check_syscalls(struct ac_syscall_check *out)
                               ac_syscall_baseline_hex);
                 clear_bit(i, ac_redirect_bitmap);
             } else if (e != ac_syscall_baseline[i]) {
-                if (!ac_entry_bad(e)) {
+                if (ranges ? !ac_entry_bad_snapshot(e, ranges, nranges) :
+                             !ac_entry_bad(e)) {
                     /* still inside core text but a different handler than
                      * what was there at boot -- the in-text-redirect case. */
                     out->redirected++;
@@ -631,7 +749,8 @@ static int ac_check_syscalls(struct ac_syscall_check *out)
         if (!e)
             continue;
         out->total++;
-        bad = ac_entry_bad(e);
+        bad = ranges ? ac_entry_bad_snapshot(e, ranges, nranges) :
+                       ac_entry_bad(e);
         if (bad) {
             out->non_text++;
             out->hooked++;
@@ -647,6 +766,7 @@ static int ac_check_syscalls(struct ac_syscall_check *out)
                 sizeof(out->baseline_sha256));   /* after the loop: reflects
                                                     * any backfill above */
     mutex_unlock(&ac_syscall_check_lock);
+    kvfree(ranges);
     ac_sha256_final(&hash, digest);
     ac_sha256_hex_digest(digest, out->current_sha256);
     out->checksum_mismatch = ac_syscall_baseline_ready &&
@@ -2095,14 +2215,13 @@ static int ac_build_vma_snapshot(struct ac_fd_state *st, int pid,
                     strscpy(vi->path, p, sizeof(vi->path));
             }
         }
-        if ((vma->vm_flags & (VM_EXEC | VM_WRITE)) == (VM_EXEC | VM_WRITE)) {
+        /* Record-only while holding the target's mmap_read_lock: ac_emit()
+         * takes ac_ring_lock, formats, and wakes waiters -- up to AC_MAX_VMAS
+         * times per scan. Emitting under the target's lock stalls its own
+         * mmap/page-fault path for the whole scan; the events go out after
+         * the unlock below, replayed in VMA order from this snapshot. */
+        if ((vma->vm_flags & (VM_EXEC | VM_WRITE)) == (VM_EXEC | VM_WRITE))
             st->rwx_count++;
-            if (emit_events)
-                ac_emit(AC_EV_RWX, pid, "?",
-                        "RWX mapping [0x%llx-0x%llx] %s",
-                        vi->start, vi->end,
-                        vi->path[0] ? vi->path : "(anonymous)");
-        }
         if (!vi->is_file && (vma->vm_flags & VM_EXEC)) {
             /* No backing file at all -- legitimate executable code is always
              * backed by a file (the binary or a shared library) via mmap.
@@ -2114,10 +2233,6 @@ static int ac_build_vma_snapshot(struct ac_fd_state *st, int pid,
              * on new entries appearing after a process is first observed,
              * not on the raw count. */
             st->anon_exec_count++;
-            if (emit_events)
-                ac_emit(AC_EV_ANON_EXEC, pid, "?",
-                        "anonymous executable mapping [0x%llx-0x%llx]",
-                        vi->start, vi->end);
         }
         if (vma->vm_flags & VM_EXEC)
             st->exec_count++;
@@ -2125,6 +2240,27 @@ static int ac_build_vma_snapshot(struct ac_fd_state *st, int pid,
     }
     vma_iter_invalidate(&vmi);
     mmap_read_unlock(mm);
+    /* Emit after the unlock: st->vmas[] is this fd's private snapshot (held
+     * under st->lock by the SCAN_BEGIN caller), so replaying it here emits
+     * the same events in the same VMA order without holding the target's
+     * mmap lock across up to AC_MAX_VMAS ring-buffer critical sections. */
+    if (emit_events) {
+        unsigned int i;
+
+        for (i = 0; i < n; i++) {
+            struct ac_vma_info *e = &st->vmas[i];
+
+            if ((e->flags & (VM_EXEC | VM_WRITE)) == (VM_EXEC | VM_WRITE))
+                ac_emit(AC_EV_RWX, pid, "?",
+                        "RWX mapping [0x%llx-0x%llx] %s",
+                        e->start, e->end,
+                        e->path[0] ? e->path : "(anonymous)");
+            if (!e->is_file && (e->flags & VM_EXEC))
+                ac_emit(AC_EV_ANON_EXEC, pid, "?",
+                        "anonymous executable mapping [0x%llx-0x%llx]",
+                        e->start, e->end);
+        }
+    }
     mmput(mm);
     kfree(pathbuf);
     st->n_vmas = n;
