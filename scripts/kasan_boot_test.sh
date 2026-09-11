@@ -67,8 +67,44 @@ KDIR="$WORKDIR/linux-$KVER"
 # matrix) don't overwrite each other's console log mid-write.
 CONSOLE_LOG="$REPO_ROOT/kasan-console-$$.log"
 
+# $WORKDIR holds the vng-provisioned arm64 chroot, which vng creates
+# through sudo (see the --root note at the vng invocation below). An
+# unprivileged `rm -rf` therefore fails with EPERM on most of that tree
+# -- /dev nodes, /etc, /root, /sys -- and two things follow that both
+# bit a real CI run:
+#
+#   1. This is an EXIT trap, and in bash the exit status of the last
+#      command run inside an EXIT trap becomes the script's exit status.
+#      A bare `rm -rf` returning 1 silently overwrote the verdict, so a
+#      run that printed PASS still failed the job. The status is
+#      captured first and re-exited explicitly, making the dmesg grep
+#      the only thing that can decide this script's exit code -- which
+#      is what the pass/fail comment below already claims.
+#   2. Removal still has to actually happen, or every run leaks a ~1 GiB
+#      chroot into $TMPDIR. Retry through sudo, non-interactively, so a
+#      host without passwordless sudo warns instead of blocking on a
+#      password prompt at exit.
+#
+# AC_ARM64_ROOT trees live outside $WORKDIR by construction and are
+# deliberately left alone -- reuse across runs is their whole point.
 cleanup() {
-    rm -rf "$WORKDIR"
+    local status=$?
+    if [ -d "$WORKDIR" ] && ! rm -rf "$WORKDIR" 2>/dev/null; then
+        # -n goes on the removal itself, never on a separate probe:
+        # sudo policy is per-command, so a `sudo -n true` that succeeds
+        # says nothing about whether `sudo rm` is allowed without a
+        # password, and the credential cache can expire between the two
+        # calls regardless. A prompt reached from here would hang the
+        # job at exit with no tty to answer it; -n makes sudo fail fast
+        # instead, and the warning below reports what was left behind.
+        if command -v sudo >/dev/null 2>&1; then
+            sudo -n rm -rf "$WORKDIR" 2>/dev/null || true
+        fi
+        if [ -d "$WORKDIR" ]; then
+            echo "warning: could not remove $WORKDIR (root-owned chroot); remove it manually" >&2
+        fi
+    fi
+    exit $status
 }
 trap cleanup EXIT
 
