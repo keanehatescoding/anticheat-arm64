@@ -18,9 +18,15 @@ jobs:
       # persist-credentials: false -- no later step needs authenticated
       # git access, so there's no reason to leave the checkout token
       # configured in local git config for the rest of the job.
+      # fetch-depth: 0 -- the AUR metadata check below runs
+      # `git tag --list "v$pkgver"` to catch sha256sums still SKIP after
+      # release; a shallow checkout can miss tags outside the single
+      # fetched commit and let that slip through (same reason the
+      # `changes` job below uses fetch-depth: 0).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Build with warnings-as-errors, run the full mock suite
         run: make ci
@@ -111,6 +117,7 @@ jobs:
       - name: Verify AUR packaging metadata is in sync
         run: |
           fail=0
+          pkgbase="$(sed -n 's/^pkgbase=//p' packaging/aur/PKGBUILD)"
           pkgver="$(sed -n 's/^pkgver=//p' packaging/aur/PKGBUILD)"
           pkgrel="$(sed -n 's/^pkgrel=//p' packaging/aur/PKGBUILD)"
           pkgarch="$(sed -n "s/^arch=('\(.*\)')/\1/p" packaging/aur/PKGBUILD)"
@@ -120,8 +127,16 @@ jobs:
               fail=1
             fi
           done
-          if ! grep -qF "hypranticheat-$pkgver.tar.gz" packaging/aur/.SRCINFO; then
-            echo "::error file=packaging/aur/.SRCINFO::source tarball out of sync with pkgver=$pkgver"
+          # Compare the complete filename::URL entry, not just the tarball
+          # name: a URL-only change in PKGBUILD keeps the filename but
+          # builds from a different location than .SRCINFO advertises.
+          # Expand the variables PKGBUILD's source= line uses ($pkgbase,
+          # $pkgver/${pkgver}) so the result matches .SRCINFO's already-
+          # expanded form (`source = file::url`, no quotes).
+          src_raw="$(sed -n 's/^source=("\(.*\)")$/\1/p' packaging/aur/PKGBUILD)"
+          src_expanded="$(printf '%s\n' "$src_raw" | sed -e "s/\$pkgbase/$pkgbase/g" -e "s/\${pkgver}/$pkgver/g" -e "s/\$pkgver/$pkgver/g")"
+          if ! grep -qF "source = $src_expanded" packaging/aur/.SRCINFO; then
+            echo "::error file=packaging/aur/.SRCINFO::source entry out of sync -- expected 'source = $src_expanded'"
             fail=1
           fi
           dkmsver="$(sed -n 's/^PACKAGE_VERSION="\(.*\)"/\1/p' dkms.conf)"
