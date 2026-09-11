@@ -90,8 +90,15 @@ CONSOLE_LOG="$REPO_ROOT/kasan-console-$$.log"
 cleanup() {
     local status=$?
     if [ -d "$WORKDIR" ] && ! rm -rf "$WORKDIR" 2>/dev/null; then
-        if sudo -n true 2>/dev/null; then
-            sudo rm -rf "$WORKDIR" 2>/dev/null || true
+        # -n goes on the removal itself, never on a separate probe:
+        # sudo policy is per-command, so a `sudo -n true` that succeeds
+        # says nothing about whether `sudo rm` is allowed without a
+        # password, and the credential cache can expire between the two
+        # calls regardless. A prompt reached from here would hang the
+        # job at exit with no tty to answer it; -n makes sudo fail fast
+        # instead, and the warning below reports what was left behind.
+        if command -v sudo >/dev/null 2>&1; then
+            sudo -n rm -rf "$WORKDIR" 2>/dev/null || true
         fi
         if [ -d "$WORKDIR" ]; then
             echo "warning: could not remove $WORKDIR (root-owned chroot); remove it manually" >&2
