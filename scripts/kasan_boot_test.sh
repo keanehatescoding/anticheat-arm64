@@ -272,6 +272,40 @@ echo "== booting via virtme-ng =="
 # and the guest never boots, which then surfaces misleadingly as the
 # "payload never reported completion" FAIL below.
 #
+# --force-9p: vng prefers virtiofs for the guest root whenever a
+# virtiofsd binary exists on the host, booting with root=ROOTFS
+# rootfstype=virtiofs. The kernel built above is a plain defconfig plus
+# the KASAN/lockdep fragment, and arm64 defconfig has CONFIG_VIRTIO_FS
+# unset with CONFIG_FUSE_FS=m -- so that root simply cannot be mounted:
+# "VFS: Cannot open root device \"ROOTFS\" ... error -19", then a panic
+# in prepare_namespace() before init ever runs. Confirmed on a real run
+# on a host with /usr/bin/virtiofsd installed. CI never hit this only
+# because GitHub runners ship no virtiofsd and vng therefore fell back
+# to 9p, which arm64 defconfig does build in (CONFIG_9P_FS=y,
+# CONFIG_NET_9P_VIRTIO=y). Forcing 9p makes every host take the
+# transport this kernel can actually mount, and makes a local run match
+# CI's exactly. (Enabling FUSE_FS=y/VIRTIO_FS=y in the fragment above
+# would be the faster-but-divergent alternative: virtiofs beats 9p under
+# TCG, at the cost of local and CI runs no longer booting alike.)
+#
+# --verbose: this is what puts the *kernel console* into $CONSOLE_LOG.
+# virtme only wires the console to the caller's stdout when fds 0/1/2
+# are all reopenable via /proc/self/fd; the `| tee` below makes fd 1 a
+# pipe, which fails that check (O_RDWR on a pipe), so without --verbose
+# virtme takes its fallback path and sends the console to /dev/null,
+# capturing only the payload's own stdout. That is not a theoretical
+# loss: a boot that panics before the payload runs then leaves a
+# completely empty log, while the FAIL below still tells the reader to
+# go read it -- observed exactly once, and it cost a full rebuild to
+# diagnose. With --verbose the fallback uses a stdio chardev for the
+# console instead, so console and payload output both reach the tee.
+#
+# --append kasan_multi_shot: KASAN's report_enabled() (mm/kasan/report.c)
+# is one-shot by default -- after the first report it silently drops
+# every later one. For a 300-iteration fuzz run that means one early
+# finding masks everything the rest of the run would have caught, and
+# the grep below would report a single bug where there may be several.
+#
 # --root/--root-release: --arch on a non-ARM host additionally requires a
 # chroot ("--arch used without --root", same never-boots outcome).
 # $ROOTDIR doesn't exist on a fresh run, so vng provisions it from
@@ -281,6 +315,7 @@ echo "== booting via virtme-ng =="
 # fixed guest paths the payload runs from -- bare --rodir paths must live
 # inside the chroot and are rejected otherwise.
 vng --arch arm64 --root "$ROOTDIR" --root-release "$ROOT_RELEASE" \
+    --force-9p --verbose --append kasan_multi_shot \
     --rodir "$GUEST_REPO=$REPO_ROOT" --rodir "$GUEST_WORK=$WORKDIR" \
     --run "$KDIR" --memory 3072M --exec "$GUEST_WORK/in_vm_payload.sh" 2>&1 | tee "$CONSOLE_LOG" || true
 
