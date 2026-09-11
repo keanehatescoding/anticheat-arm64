@@ -327,6 +327,13 @@ jobs:
               - 'src/anticheat_module.c'
               - 'src/anticheat.h'
               - 'test/ioctl_fuzz.c'
+              # The harness itself. Without this entry a change to the
+              # KASAN script skips the only job that runs it, so harness
+              # edits land unexercised and are first run by nightly on
+              # master -- which is exactly how a cleanup trap that
+              # discarded the verdict reached master. A change to the
+              # test is a change worth testing.
+              - 'scripts/kasan_boot_test.sh'
 
   # --- real-module fuzz seed: short KASAN run against the actual module ---
   # THREAT_MODEL.md's "What 'production-ready' claims today" section
