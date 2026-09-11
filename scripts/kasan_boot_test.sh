@@ -30,6 +30,13 @@
 # workflow passes a fresh seed each run instead, so repeated nightly
 # runs accumulate coverage rather than re-fuzzing the identical sequence
 # forever.
+# Scratch space: the kernel tree is built under ${TMPDIR:-/tmp}; set
+# TMPDIR to a disk-backed directory on hosts where /tmp is a small
+# tmpfs, which a KASAN build will otherwise fill.
+# Cross-arch rootfs reuse: AC_ARM64_ROOT=/path/to/arm64-chroot reuses a
+# prepared Ubuntu arm64 tree instead of downloading a fresh cloud image
+# every run (vng uses the dir as-is when it already exists). Needed on
+# hosts without passwordless sudo, which vng's own provisioning requires.
 set -euo pipefail
 
 cd "$(dirname "$0")/.." || exit 1
@@ -43,7 +50,13 @@ if ! [[ "$IOCTL_FUZZ_ITERATIONS" =~ ^[1-9][0-9]*$ && "$IOCTL_FUZZ_SEED" =~ ^[0-9
 fi
 
 KVER=6.12
-WORKDIR="$(mktemp -d /tmp/ac_kasan_boot.XXXXXXXX)"
+# ${TMPDIR:-/tmp}, not a hardcoded /tmp: the full KASAN kernel tree
+# built below wants tens of GB, and on a host whose /tmp is a small
+# RAM-backed tmpfs (systemd's default on several distros) that build
+# both runs out of space and competes for RAM with itself. Honouring
+# TMPDIR lets such a host point the build at real disk without editing
+# this script; CI's disk-backed /tmp is unaffected either way.
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/ac_kasan_boot.XXXXXXXX")"
 KDIR="$WORKDIR/linux-$KVER"
 # Written directly here, not under $WORKDIR: the EXIT trap below deletes
 # $WORKDIR on every exit path, including a mid-run cancellation (CI's
@@ -130,14 +143,44 @@ make -C "$REPO_ROOT" KDIR="$KDIR" module
 test -s "$REPO_ROOT/anticheat.ko"
 
 echo "== building userspace (daemon + ioctl_fuzz) =="
-make -C "$REPO_ROOT" CFLAGS="-O2 -Wall -Wextra -Werror" daemon ioctl-fuzz
+# Cross-built when the guest differs from the host: these binaries execute
+# *inside* the arm64 VM below, so host-cc output (x86_64 on an x86_64 build
+# machine) would die there with "cannot execute binary file". Same CC=
+# override ci.yml's own aarch64 cross-build check already uses; empty on a
+# native ARM64 host (plain gcc). Command-line only, deliberately not
+# exported: the environment would leak into the module build above, where
+# an explicit CC overrides the Makefile's own Kbuild toolchain detection.
+# Remove first: switching CC (host cc vs ${CROSS_COMPILE}gcc across runs)
+# doesn't invalidate make's timestamps, so a stale binary for the wrong
+# arch would otherwise survive and die in the guest with "cannot execute
+# binary file" -- seen in a real run, where an x86_64 ioctl_fuzz from an
+# earlier host build was reused. Both are gitignored build artifacts.
+rm -f "$REPO_ROOT/anticheat" "$REPO_ROOT/test/ioctl_fuzz"
+make -C "$REPO_ROOT" CC="${CROSS_COMPILE}gcc" CFLAGS="-O2 -Wall -Wextra -Werror" daemon ioctl-fuzz
+
+# Guest-side paths and rootfs (see the vng invocation below for why):
+# with a --root chroot the guest cannot see host paths, so the repo and
+# the payload dir are mapped to fixed guest locations via
+# --rodir guestpath=hostpath, and the payload below runs from $GUEST_REPO.
+# The guest paths reuse /mnt and /srv: both exist empty in the Ubuntu
+# cloud image, which matters -- virtme-init's rodir setup does
+# `mkdir -p` for missing mountpoints, and as guest-root mapped to the
+# unprivileged host user it cannot create directories under a root-owned
+# chroot (which is also what vng's own provisioning produces), so any
+# path needing creation would fail the mount and hang the boot.
+GUEST_REPO="/mnt"
+GUEST_WORK="/srv"
+# Fresh arm64 chroot per run under $WORKDIR (auto-removed by the EXIT
+# trap); set AC_ARM64_ROOT to reuse a prepared tree instead.
+ROOTDIR="${AC_ARM64_ROOT:-$WORKDIR/arm64-root}"
+ROOT_RELEASE="noble"
 
 echo "== writing in-VM payload =="
 PAYLOAD="$WORKDIR/in_vm_payload.sh"
 cat > "$PAYLOAD" <<PAYLOAD_EOF
 #!/bin/bash
-# Runs as root inside the guest, against the host filesystem virtme-ng
-# shares in -- \$REPO_ROOT below is the real repo path, not a copy.
+# Runs as root inside the guest. $GUEST_REPO/$GUEST_WORK here are the
+# *guest-side* paths mapped by the vng invocation's --rodir flags below.
 #
 # -x only, deliberately not -e: this module's own CLI legitimately
 # returns nonzero for informational-not-broken outcomes (ENODEV when
@@ -152,7 +195,7 @@ cat > "$PAYLOAD" <<PAYLOAD_EOF
 # an explicit fatal check -- those failing means the payload itself is
 # broken, not that the module reported something.
 set -x
-cd "$REPO_ROOT" || exit 1
+cd "$GUEST_REPO" || exit 1
 
 insmod ./anticheat.ko ac_verbose=1 || { echo "AC_KASAN_BOOT: insmod failed"; exit 1; }
 sleep 0.3
@@ -217,14 +260,64 @@ echo "== booting via virtme-ng =="
 # log on disk -- see the CONSOLE_LOG assignment above for why that's not
 # just under $WORKDIR.
 #
-# --arch aarch64, always: this is now an ARM64-only tree (see the KARCH
+# --arch arm64, always: this is now an ARM64-only tree (see the KARCH
 # block above), so the kernel just built under $KDIR is always an arm64
 # tree regardless of host. vng infers the target arch from the *host*
 # machine when --arch is omitted, not from the kernel tree it's handed --
 # confirmed against a real run on an x86_64 runner, where the omission
 # made it try (and fail: "cannot find qemu for x86_64") to boot with
-# qemu-system-x86_64, which this script never installs.
-vng --arch aarch64 --run "$KDIR" --memory 3072M --exec "$PAYLOAD" 2>&1 | tee "$CONSOLE_LOG" || true
+# qemu-system-x86_64, which this script never installs. Note the value is
+# `arm64`, not `aarch64`: vng takes Debian-style arch names (amd64, arm64,
+# armhf, ...) -- `aarch64` is rejected with "unsupported architecture"
+# and the guest never boots, which then surfaces misleadingly as the
+# "payload never reported completion" FAIL below.
+#
+# --force-9p: vng prefers virtiofs for the guest root whenever a
+# virtiofsd binary exists on the host, booting with root=ROOTFS
+# rootfstype=virtiofs. The kernel built above is a plain defconfig plus
+# the KASAN/lockdep fragment, and arm64 defconfig has CONFIG_VIRTIO_FS
+# unset with CONFIG_FUSE_FS=m -- so that root simply cannot be mounted:
+# "VFS: Cannot open root device \"ROOTFS\" ... error -19", then a panic
+# in prepare_namespace() before init ever runs. Confirmed on a real run
+# on a host with /usr/bin/virtiofsd installed. CI never hit this only
+# because GitHub runners ship no virtiofsd and vng therefore fell back
+# to 9p, which arm64 defconfig does build in (CONFIG_9P_FS=y,
+# CONFIG_NET_9P_VIRTIO=y). Forcing 9p makes every host take the
+# transport this kernel can actually mount, and makes a local run match
+# CI's exactly. (Enabling FUSE_FS=y/VIRTIO_FS=y in the fragment above
+# would be the faster-but-divergent alternative: virtiofs beats 9p under
+# TCG, at the cost of local and CI runs no longer booting alike.)
+#
+# --verbose: this is what puts the *kernel console* into $CONSOLE_LOG.
+# virtme only wires the console to the caller's stdout when fds 0/1/2
+# are all reopenable via /proc/self/fd; the `| tee` below makes fd 1 a
+# pipe, which fails that check (O_RDWR on a pipe), so without --verbose
+# virtme takes its fallback path and sends the console to /dev/null,
+# capturing only the payload's own stdout. That is not a theoretical
+# loss: a boot that panics before the payload runs then leaves a
+# completely empty log, while the FAIL below still tells the reader to
+# go read it -- observed exactly once, and it cost a full rebuild to
+# diagnose. With --verbose the fallback uses a stdio chardev for the
+# console instead, so console and payload output both reach the tee.
+#
+# --append kasan_multi_shot: KASAN's report_enabled() (mm/kasan/report.c)
+# is one-shot by default -- after the first report it silently drops
+# every later one. For a 300-iteration fuzz run that means one early
+# finding masks everything the rest of the run would have caught, and
+# the grep below would report a single bug where there may be several.
+#
+# --root/--root-release: --arch on a non-ARM host additionally requires a
+# chroot ("--arch used without --root", same never-boots outcome).
+# $ROOTDIR doesn't exist on a fresh run, so vng provisions it from
+# Ubuntu's arm64 cloud image for $ROOT_RELEASE (needs sudo, same as the
+# CI job's apt step); an existing dir (see AC_ARM64_ROOT above) is used
+# as-is. --rodir guestpath=hostpath maps the repo and payload dir to the
+# fixed guest paths the payload runs from -- bare --rodir paths must live
+# inside the chroot and are rejected otherwise.
+vng --arch arm64 --root "$ROOTDIR" --root-release "$ROOT_RELEASE" \
+    --force-9p --verbose --append kasan_multi_shot \
+    --rodir "$GUEST_REPO=$REPO_ROOT" --rodir "$GUEST_WORK=$WORKDIR" \
+    --run "$KDIR" --memory 3072M --exec "$GUEST_WORK/in_vm_payload.sh" 2>&1 | tee "$CONSOLE_LOG" || true
 
 if ! grep -q "AC_KASAN_BOOT: payload complete" "$CONSOLE_LOG"; then
     echo "FAIL: payload never reported completion -- boot, insmod, or the in-VM script likely crashed/hung before finishing. See $CONSOLE_LOG." >&2
