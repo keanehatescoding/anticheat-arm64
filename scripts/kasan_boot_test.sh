@@ -178,6 +178,52 @@ echo "== building anticheat.ko against this tree =="
 make -C "$REPO_ROOT" KDIR="$KDIR" module
 test -s "$REPO_ROOT/anticheat.ko"
 
+# Positive control for the module walk. The gate below is a dmesg grep
+# for sanitizer findings, which only ever proves the walk didn't *fault*
+# -- an ac_module_sane() that rejected every candidate unconditionally
+# would sail through it while silently disabling the hidden-module
+# detector entirely. A real CI run showed exactly that blind spot:
+# "0 modules in kernel list", because the walk skips THIS_MODULE and
+# anticheat.ko was the only module loaded, so the whole detector was
+# being exercised against an empty list.
+#
+# Loading one throwaway GPL module before anticheat gives the walk
+# something it is *required* to find, turning "didn't crash" into
+# "didn't crash and still works". Generated here rather than committed
+# as a source file: it is scaffolding for this script alone, and
+# $WORKDIR is already mapped into the guest as $GUEST_WORK.
+echo "== building the positive-control module =="
+mkdir -p "$WORKDIR/dummy"
+cat > "$WORKDIR/dummy/ac_dummy.c" <<'DUMMY_EOF'
+// SPDX-License-Identifier: GPL-2.0
+/* Positive control for scripts/kasan_boot_test.sh: a module that does
+ * nothing except exist, so the anticheat module walk has a non-empty
+ * list to find. Deliberately trivial -- it must not itself be capable
+ * of tripping the sanitizer gate.
+ */
+#include <linux/module.h>
+#include <linux/kernel.h>
+
+static int __init ac_dummy_init(void)
+{
+	pr_info("ac_dummy: positive control loaded\n");
+	return 0;
+}
+
+static void __exit ac_dummy_exit(void)
+{
+	pr_info("ac_dummy: positive control unloaded\n");
+}
+
+module_init(ac_dummy_init);
+module_exit(ac_dummy_exit);
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("KASAN boot test positive control");
+DUMMY_EOF
+printf 'obj-m := ac_dummy.o\n' > "$WORKDIR/dummy/Makefile"
+make -C "$KDIR" M="$WORKDIR/dummy" modules
+test -s "$WORKDIR/dummy/ac_dummy.ko"
+
 echo "== building userspace (daemon + ioctl_fuzz) =="
 # Cross-built when the guest differs from the host: these binaries execute
 # *inside* the arm64 VM below, so host-cc output (x86_64 on an x86_64 build
@@ -233,6 +279,10 @@ cat > "$PAYLOAD" <<PAYLOAD_EOF
 set -x
 cd "$GUEST_REPO" || exit 1
 
+# Loaded before anticheat so it is already in the kernel's module list
+# when the walk runs, and stays loaded across the fuzz run below.
+insmod $GUEST_WORK/dummy/ac_dummy.ko || { echo "AC_KASAN_BOOT: insmod ac_dummy failed"; exit 1; }
+
 insmod ./anticheat.ko ac_verbose=1 || { echo "AC_KASAN_BOOT: insmod failed"; exit 1; }
 sleep 0.3
 
@@ -255,8 +305,17 @@ echo "AC_KASAN_BOOT: events exited \$?"
 echo "AC_KASAN_BOOT: syscalls exited \$?"
 ./anticheat scan --pid \$\$
 echo "AC_KASAN_BOOT: scan exited \$?"
-./anticheat modules
-echo "AC_KASAN_BOOT: modules exited \$?"
+# The positive-control assertion. Emitted as a marker line because the
+# host-side gate's only view into the guest is the console log.
+MODS_OUT=\$(./anticheat modules 2>&1)
+MODS_RC=\$?
+echo "\$MODS_OUT"
+echo "AC_KASAN_BOOT: modules exited \$MODS_RC"
+if echo "\$MODS_OUT" | grep -qE '^[[:space:]]+ac_dummy[[:space:]]'; then
+    echo "AC_KASAN_BOOT: POSITIVE CONTROL OK (module walk found ac_dummy)"
+else
+    echo "AC_KASAN_BOOT: POSITIVE CONTROL FAILED (module walk did not find ac_dummy)"
+fi
 ./anticheat vmcheck
 echo "AC_KASAN_BOOT: vmcheck exited \$?"
 ./anticheat unprotect --pid "\$V"
@@ -268,6 +327,7 @@ echo "AC_KASAN_BOOT: running the real ioctl fuzz harness (full pointer-corruptio
 echo "AC_KASAN_BOOT: ioctl_fuzz exited \$? (informational -- see its own header comment on why this isn't the pass/fail gate)"
 
 rmmod anticheat || { echo "AC_KASAN_BOOT: rmmod failed"; exit 1; }
+rmmod ac_dummy || { echo "AC_KASAN_BOOT: rmmod ac_dummy failed"; exit 1; }
 
 # vng's --exec channel only carries this script's own stdout/stderr, not
 # the guest kernel's printk/dmesg ring buffer -- confirmed against a real
@@ -369,4 +429,25 @@ if grep -qE 'BUG:|KASAN:|WARNING:|Call Trace:|INFO: possible circular locking de
     exit 1
 fi
 
+# Second gate, independent of the sanitizer grep above. That grep can
+# only fail a walk that faults; it passes a walk that quietly finds
+# nothing, which is what a regression in ac_module_sane()'s accept
+# conditions would produce. Checked in both directions: an explicit
+# FAILED marker, and an absent OK marker (payload died before reaching
+# the assertion, ac_dummy never loaded, guest never booted) -- so the
+# gate cannot be satisfied by the check simply not running.
+if grep -q 'AC_KASAN_BOOT: POSITIVE CONTROL FAILED' "$CONSOLE_LOG"; then
+    echo "FAIL: module walk did not find ac_dummy. The walk ran without faulting," >&2
+    echo "      but found nothing it was required to find -- the hidden-module" >&2
+    echo "      detector is disabled, not merely quiet. See the console log above." >&2
+    exit 1
+fi
+if ! grep -q 'AC_KASAN_BOOT: POSITIVE CONTROL OK' "$CONSOLE_LOG"; then
+    echo "FAIL: positive-control marker absent from the console log. The payload" >&2
+    echo "      did not reach the module-walk assertion, so a clean sanitizer" >&2
+    echo "      grep above proves nothing. See the console log above." >&2
+    exit 1
+fi
+
 echo "PASS: kernel survived the real ioctl fuzz harness + CLI exercise under KASAN+lockdep with no findings"
+echo "      (module walk verified against a live positive control)"
