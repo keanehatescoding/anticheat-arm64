@@ -294,17 +294,24 @@ static bool ac_entry_bad(unsigned long e)
  * end), matching within_module_core()'s scope, under the same
  * ac_module_sane() guard the per-entry walk uses. A module loading or
  * unloading mid-pass simply lands in the next pass, same staleness the
- * old per-entry walk already had between its first and last entry. */
+ * old per-entry walk already had between its first and last entry.
+ * Truncation is reported, not hidden: if more recordable modules exist
+ * than fit, the snapshot would silently exempt the omitted ones from the
+ * module-membership test -- in the anchor-window fallback path that turns
+ * a hook into a pass -- so the caller must discard the snapshot and use
+ * the per-entry walk for that pass instead. */
 struct ac_mod_range {
     unsigned long start;
     unsigned long end;
 };
 
 static unsigned int ac_snapshot_mod_ranges(struct ac_mod_range *ranges,
-                                           unsigned int cap)
+                                           unsigned int cap, bool *truncated)
 {
     struct module *m;
     unsigned int n = 0;
+
+    *truncated = false;
 
     preempt_disable();
     list_for_each_entry(m, &THIS_MODULE->list, list) {
@@ -312,8 +319,6 @@ static unsigned int ac_snapshot_mod_ranges(struct ac_mod_range *ranges,
 
         if (!ac_module_sane(m))
             continue;
-        if (n >= cap)
-            break;
         for_class_mod_mem_type(type, core) {
             unsigned long b = (unsigned long)m->mem[type].base;
             unsigned long sz = m->mem[type].size;
@@ -327,6 +332,15 @@ static unsigned int ac_snapshot_mod_ranges(struct ac_mod_range *ranges,
         }
         if (hi <= lo)
             continue;
+        if (n >= cap) {
+            /* A recordable module had to be dropped: flag the snapshot
+             * incomplete (see above) and stop -- the caller disables it
+             * for this pass. Checked here, after the sanity/range work,
+             * so only a genuinely omitted module triggers it, not mere
+             * list length. */
+            *truncated = true;
+            break;
+        }
         ranges[n].start = lo;
         ranges[n].end = hi;
         n++;
@@ -665,13 +679,24 @@ static int ac_check_syscalls(struct ac_syscall_check *out)
 
     /* One preempt-disabled module-list walk per CHECK_SYSCALLS call, not one
      * per table entry (see ac_snapshot_mod_ranges() above). Falls back to
-     * the per-entry walk if the allocation fails, so correctness never
-     * depends on it. Allocated before the lock so a sleeping allocator
-     * doesn't extend the mutex hold time. */
+     * the per-entry walk if the allocation fails -- or if the snapshot was
+     * truncated, when more recordable modules exist than fit: a partial
+     * snapshot would silently exempt the omitted modules (a hook hiding in
+     * one passes the fallback proximity check), which is worse than the
+     * slower complete walk. Either way correctness never depends on the
+     * snapshot. Allocated before the lock so a sleeping allocator doesn't
+     * extend the mutex hold time. */
     ranges = kvmalloc_array(AC_MAX_MODS, sizeof(*ranges), GFP_KERNEL);
     mutex_lock(&ac_syscall_check_lock);
-    if (ranges)
-        nranges = ac_snapshot_mod_ranges(ranges, AC_MAX_MODS);
+    if (ranges) {
+        bool truncated = false;
+
+        nranges = ac_snapshot_mod_ranges(ranges, AC_MAX_MODS, &truncated);
+        if (truncated) {
+            kvfree(ranges);
+            ranges = NULL;
+        }
+    }
     ac_sha256_init(&hash);
     for (i = 0; i < __NR_syscalls; i++) {
         unsigned long e = 0;
