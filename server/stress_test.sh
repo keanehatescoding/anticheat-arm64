@@ -2,9 +2,10 @@
 # stress_test.sh -- sustained concurrent load against a real ac_server.py
 # instance: $STRESS_CONCURRENCY workers hammering /report in parallel for
 # $STRESS_DURATION seconds, verifying the server survives (no crash, no
-# unexpected errors) and that every successfully-201'd report is actually
-# durably recorded -- something test_server.sh's short, mostly-sequential
-# suite doesn't exercise. Complements test_ratelimiter_unit.py: that one
+# unexpected errors) and that no successfully-201'd report goes missing
+# from the DB beyond what Store's per-client_id retention cap trims on
+# purpose -- something test_server.sh's short, mostly-sequential suite
+# doesn't exercise. Complements test_ratelimiter_unit.py: that one
 # proves RateLimiter._buckets doesn't grow unboundedly in isolation; this
 # one proves the server as a whole holds up under real concurrent
 # ThreadingHTTPServer + one-SQLite-connection-per-request load.
@@ -32,6 +33,26 @@ if ! [[ "$DURATION" =~ ^[1-9][0-9]*$ && "$CONCURRENCY" =~ ^[1-9][0-9]*$ ]]; then
         "$DURATION" "$CONCURRENCY" >&2
     exit 2
 fi
+# Passed to the server explicitly rather than inherited from
+# ac_server.py's own default, because the durability check below has to
+# reason about it: Store.add_report() trims each client_id's rows to the
+# newest $CAP on every insert (#60), so a worker that sends more than
+# $CAP reports will legitimately find fewer rows than it sent. Leaving
+# this implicit is exactly how that check went stale -- at the 90s/20
+# worker defaults no worker reaches 1000 reports and it never fired, but
+# a 300s/30-worker dispatch run has every worker sending ~2600 and every
+# one of them "failing" a durability check that was really just watching
+# retention work as designed. Kept enabled (not set to 0) so the trim's
+# DELETE still runs on the hot write path this test exists to stress.
+CAP=1000
+# How many of the oldest retained rows the durability check treats as
+# retention's business rather than the server's (see below). Only
+# requests the worker abandoned client-side while the server was still
+# writing them can land out of sequence, and a worker has at most one
+# request in flight at a time, so the real reordering window is a couple
+# of rows -- 25 is slack well past that while still checking ~975 of the
+# $CAP retained rows.
+TRIM_MARGIN=25
 PORT=18900
 TESTDIR="$(mktemp -d /tmp/ac_server_stress.XXXXXXXX)"
 DB="$TESTDIR/ac_server.db"
@@ -110,6 +131,7 @@ echo
 AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
     python3 ./ac_server.py --host 127.0.0.1 --port "$PORT" --db "$DB" \
     --rate-limit 1000000 --rate-window 60 \
+    --max-reports-per-client "$CAP" \
     >"$TESTDIR/server.log" 2>&1 &
 SERVER_PID=$!
 
@@ -152,6 +174,14 @@ worker() {
     local errors=0
     local n=0
     local bodyfile="$TESTDIR/worker-$id.lastbody"
+    # $n increments on every attempt, but only a 201 proves the row is
+    # committed (the handler writes before it responds), so the sequence
+    # numbers that actually landed are a subset with arbitrary holes in
+    # it -- a timed-out or transport-failed attempt burns an $n that may
+    # legitimately have no row. The durability check needs the exact set
+    # the client was told succeeded, not a range, so record it here
+    # rather than trying to reconstruct it afterwards.
+    local ackfile="$TESTDIR/worker-$id.acked"
     local end=$(( $(date +%s) + DURATION ))
     while [ "$(date +%s)" -lt "$end" ]; do
         n=$((n + 1))
@@ -161,6 +191,7 @@ worker() {
         rc=$?
         if [ "$rc" -eq 0 ] && [ "$code" = "201" ]; then
             ok=$((ok + 1))
+            printf '%d\n' "$n" >> "$ackfile"
         elif [ "$rc" -eq 28 ]; then
             timeouts=$((timeouts + 1))
             printf 'n=%d rc=%d (timeout, response unavailable)\n' "$n" "$rc" >> "$TESTDIR/worker-$id.errlog"
@@ -202,28 +233,106 @@ for i in $(seq 1 "$CONCURRENCY"); do
     TOTAL_ERRORS=$((TOTAL_ERRORS + ERRORS))
     # Queried directly against the DB file, not the /reports API -- that
     # endpoint caps at 200 rows (see list_reports()'s default limit),
-    # which a sustained run can easily exceed; a direct COUNT(*) has no
-    # such cap and is the actual ground truth being checked here.
-    DB_COUNT=$(python3 -c "
+    # which a sustained run can easily exceed; a direct query has no such
+    # cap and is the actual ground truth being checked here.
+    #
+    # Each worker's detail field is "n=<seq>", so the retained rows can be
+    # matched against the exact set of sequence numbers that worker was
+    # told succeeded (worker-$i.acked). That comparison is what separates
+    # "trimmed on purpose" from "lost": retention only ever removes the
+    # oldest rows, so an acknowledged $n missing from above the trim
+    # boundary was dropped, not trimmed.
+    #
+    # Deliberately a set difference against the acknowledged numbers
+    # rather than a contiguity test over the retained ones. $n counts
+    # attempts, not successes, so a timed-out or transport-failed attempt
+    # legitimately leaves its $n with no row -- a hole in the retained
+    # sequence that proves nothing. Only a number the client saw a 201
+    # for is owed a row.
+    # Whether retention could have trimmed this client at all is decided
+    # from the worker's own attempt count, never from the row count: the
+    # rows are the thing under test, so "fewer rows than the cap" cannot
+    # be read as "nothing was trimmed" -- losing rows at the cap produces
+    # exactly that. Every iteration increments $n and lands in exactly one
+    # of the three buckets, so this is the worker's final $n.
+    ATTEMPTS=$((OK + TIMEOUTS + ERRORS))
+    read -r DB_COUNT DB_MISSING < <(python3 - "$DB" "$CID" "$TESTDIR/worker-$i.acked" "$ATTEMPTS" "$CAP" "$TRIM_MARGIN" <<'EOF'
+import os
 import sqlite3
-con = sqlite3.connect('$DB')
-print(con.execute('SELECT COUNT(*) FROM reports WHERE client_id = ?', ('$CID',)).fetchone()[0])
-")
-    # The real durability question is "did the DB lose anything the
-    # client saw succeed" (DB_COUNT < OK) -- NOT exact equality. A
-    # client-side timeout (curl gave up, counted above, not in $OK) for a
-    # request the server actually completed makes DB_COUNT > OK
-    # perfectly legitimately; treating that as a failure was itself a
-    # bug in this check, not a sign of one in the server (verified
-    # directly: every DB_COUNT > OK case traced back to a 000 in that
-    # worker's timeout count, and the server log showed a clean 201 for
-    # it, not an error).
-    if [ "$DB_COUNT" -lt "$OK" ]; then
-        fail "worker $i: sent $OK successful reports but DB only has $DB_COUNT rows for $CID"
+import sys
+
+db, cid, ackfile = sys.argv[1], sys.argv[2], sys.argv[3]
+attempts, cap, margin = int(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6])
+con = sqlite3.connect(db)
+try:
+    rows = con.execute(
+        "SELECT detail FROM reports WHERE client_id = ?", (cid,)
+    ).fetchall()
+finally:
+    con.close()
+stored = {int(r[0].split("=", 1)[1]) for r in rows}
+# A worker that never got a single 201 writes no ack file at all.
+if os.path.exists(ackfile):
+    with open(ackfile) as fh:
+        acked = {int(line) for line in fh if line.strip()}
+else:
+    acked = set()
+# add_report's DELETE only fires once a client exceeds $cap rows, and a
+# client cannot have more rows than the worker made attempts. So a worker
+# that sent no more than $cap requests was never trimmed, and every
+# acknowledged number is owed a row with no boundary to excuse it.
+# Checking the whole set matters because the row-count assertions cannot
+# carry this case on their own -- a timed-out attempt that committed
+# anyway fills the count left by a genuinely lost row, so DB_COUNT can
+# match $ok exactly while a report is missing.
+if attempts <= cap:
+    missing = len(acked - stored)
+else:
+    # At the cap, retention has trimmed, and what it trimmed is the
+    # oldest rows *by rowid*, which need not be the lowest $n: an attempt
+    # the worker abandoned client-side can still be committed after the
+    # next one was sent. Only the bottom $margin retained rows are close
+    # enough to that boundary for the distinction to matter; above them
+    # the ordering has no such excuse, and an acknowledged number with no
+    # row is a genuinely lost write.
+    kept = sorted(stored)
+    floor = kept[margin] if len(kept) > margin else kept[0]
+    missing = len([n for n in acked if n >= floor and n not in stored])
+print(len(stored), missing)
+EOF
+)
+    # Retention caps what can be on disk, so the most a worker's rows can
+    # ever be is $CAP -- compare against that, not against $OK, or every
+    # worker in a run long enough to exceed the cap "fails" for doing
+    # exactly what the cap asks. The real durability question is still
+    # "did the DB lose anything the client saw succeed", just now asked
+    # of the window retention actually keeps.
+    #
+    # Note this is a floor, not exact equality. A client-side timeout
+    # (curl gave up, counted above, not in $OK) for a request the server
+    # actually completed makes DB_COUNT > OK perfectly legitimately;
+    # treating that as a failure was itself a bug in this check, not a
+    # sign of one in the server (verified directly: every DB_COUNT > OK
+    # case traced back to a 000 in that worker's timeout count, and the
+    # server log showed a clean 201 for it, not an error).
+    EXPECTED="$OK"
+    [ "$EXPECTED" -gt "$CAP" ] && EXPECTED="$CAP"
+    if [ "$DB_COUNT" -lt "$EXPECTED" ]; then
+        fail "worker $i: sent $OK successful reports but DB only has $DB_COUNT rows for $CID (expected at least $EXPECTED after the $CAP-row retention cap)"
+        DB_MISMATCH=1
+    elif [ "$DB_COUNT" -gt "$CAP" ]; then
+        # The other side of the same coin: retention must hold under
+        # concurrent writes too, not just in the single-threaded unit
+        # test (test_store_retention_unit.py). A trim that silently
+        # stops working under load is the bug the cap exists to prevent.
+        fail "worker $i: DB has $DB_COUNT rows for $CID, above the $CAP-row retention cap (trim failed under concurrent load)"
+        DB_MISMATCH=1
+    elif [ "$DB_MISSING" -gt 0 ]; then
+        fail "worker $i: $DB_MISSING report(s) the server 201'd for $CID are missing from above the retention boundary (not explained by retention, which only trims the oldest)"
         DB_MISMATCH=1
     fi
 done
-[ "$DB_MISMATCH" -eq 0 ] && pass "no worker's successful reports went missing from the DB"
+[ "$DB_MISMATCH" -eq 0 ] && pass "no worker's successful reports went missing from the DB (retained window intact and within the $CAP-row cap)"
 
 pass "sustained load: $TOTAL_OK total successful reports across $CONCURRENCY workers in ${DURATION}s"
 if [ "$TOTAL_TIMEOUTS" -gt 0 ]; then
