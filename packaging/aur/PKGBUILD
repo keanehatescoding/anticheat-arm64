@@ -44,6 +44,7 @@ package_hypranticheat() {
     optdepends=('hypranticheat-dkms: kernel-level detection -- required for real use; the daemon alone can only run against its userspace mock')
 
     cd "$_reponame-$pkgver"
+    install -Dm755 anticheat "$pkgdir/usr/bin/anticheat"
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
     install -Dm644 THREAT_MODEL.md "$pkgdir/usr/share/doc/$pkgname/THREAT_MODEL.md"
     install -Dm644 TROUBLESHOOTING.md "$pkgdir/usr/share/doc/$pkgname/TROUBLESHOOTING.md"
