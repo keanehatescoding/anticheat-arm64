@@ -249,12 +249,20 @@ for i in $(seq 1 "$CONCURRENCY"); do
     # legitimately leaves its $n with no row -- a hole in the retained
     # sequence that proves nothing. Only a number the client saw a 201
     # for is owed a row.
-    read -r DB_COUNT DB_MISSING < <(python3 - "$DB" "$CID" "$TESTDIR/worker-$i.acked" "$TRIM_MARGIN" <<'EOF'
+    # Whether retention could have trimmed this client at all is decided
+    # from the worker's own attempt count, never from the row count: the
+    # rows are the thing under test, so "fewer rows than the cap" cannot
+    # be read as "nothing was trimmed" -- losing rows at the cap produces
+    # exactly that. Every iteration increments $n and lands in exactly one
+    # of the three buckets, so this is the worker's final $n.
+    ATTEMPTS=$((OK + TIMEOUTS + ERRORS))
+    read -r DB_COUNT DB_MISSING < <(python3 - "$DB" "$CID" "$TESTDIR/worker-$i.acked" "$ATTEMPTS" "$CAP" "$TRIM_MARGIN" <<'EOF'
 import os
 import sqlite3
 import sys
 
-db, cid, ackfile, margin = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+db, cid, ackfile = sys.argv[1], sys.argv[2], sys.argv[3]
+attempts, cap, margin = int(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6])
 con = sqlite3.connect(db)
 try:
     rows = con.execute(
@@ -269,19 +277,27 @@ if os.path.exists(ackfile):
         acked = {int(line) for line in fh if line.strip()}
 else:
     acked = set()
-# Everything below the trim boundary is retention's to remove. Take that
-# boundary $margin rows above the oldest retained row rather than at it:
-# retention trims by rowid, and an attempt the worker abandoned
-# client-side can still be committed after the next one was sent, so the
-# very oldest retained rows need not be the lowest $n. Above the margin
-# the ordering has no such excuse, and an acknowledged number with no row
-# is a genuinely lost write.
-kept = sorted(stored)
-if len(kept) > margin:
-    floor = kept[margin]
-    missing = len([n for n in acked if n >= floor and n not in stored])
+# add_report's DELETE only fires once a client exceeds $cap rows, and a
+# client cannot have more rows than the worker made attempts. So a worker
+# that sent no more than $cap requests was never trimmed, and every
+# acknowledged number is owed a row with no boundary to excuse it.
+# Checking the whole set matters because the row-count assertions cannot
+# carry this case on their own -- a timed-out attempt that committed
+# anyway fills the count left by a genuinely lost row, so DB_COUNT can
+# match $ok exactly while a report is missing.
+if attempts <= cap:
+    missing = len(acked - stored)
 else:
-    missing = 0
+    # At the cap, retention has trimmed, and what it trimmed is the
+    # oldest rows *by rowid*, which need not be the lowest $n: an attempt
+    # the worker abandoned client-side can still be committed after the
+    # next one was sent. Only the bottom $margin retained rows are close
+    # enough to that boundary for the distinction to matter; above them
+    # the ordering has no such excuse, and an acknowledged number with no
+    # row is a genuinely lost write.
+    kept = sorted(stored)
+    floor = kept[margin] if len(kept) > margin else kept[0]
+    missing = len([n for n in acked if n >= floor and n not in stored])
 print(len(stored), missing)
 EOF
 )
