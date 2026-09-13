@@ -4,11 +4,11 @@ Release:        1%{?dist}
 Summary:        Kernel-mode anticheat: syscall/module integrity, ptrace denial, RWX/anon-exec detection
 
 License:        GPL-2.0-only
-URL:            https://github.com/keanehatescoding/hypranticheat
+URL:            https://github.com/keanehatescoding/anticheat-arm64
 # Same immutable, tag-pinned release tarball the AUR PKGBUILD uses (see
-# packaging/aur/PKGBUILD) -- GitHub extracts this to hypranticheat-%{version}/
-# regardless of the tarball's own filename, verified there against a real
-# archive; %%autosetup below relies on that.
+# packaging/aur/PKGBUILD) -- GitHub extracts this to
+# anticheat-arm64-%{version}/ (repo name, not package name) regardless of
+# the tarball's own filename; %%autosetup below relies on that.
 Source0:        %{url}/archive/refs/tags/v%{version}.tar.gz
 
 BuildRequires:  gcc
@@ -63,7 +63,7 @@ password -> Reboot). Until you do this, the signed module will fail to
 load.
 
 %prep
-%autosetup -n hypranticheat-%{version}
+%autosetup -n anticheat-arm64-%{version}
 
 %build
 # The daemon only -- the kernel module isn't buildable at package-build
