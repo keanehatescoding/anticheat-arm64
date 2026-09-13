@@ -45,13 +45,14 @@ fi
 # retention work as designed. Kept enabled (not set to 0) so the trim's
 # DELETE still runs on the hot write path this test exists to stress.
 CAP=1000
-# How many of the oldest retained rows the gap check ignores (see the
-# durability check below). Only requests the worker abandoned client-side
-# while the server was still writing them can land out of sequence, and a
-# worker has at most one request in flight at a time, so the real
-# reordering window is a couple of rows -- 25 is slack well past that
-# while still gap-checking ~975 of the $CAP retained rows.
-GAP_MARGIN=25
+# How many of the oldest retained rows the durability check treats as
+# retention's business rather than the server's (see below). Only
+# requests the worker abandoned client-side while the server was still
+# writing them can land out of sequence, and a worker has at most one
+# request in flight at a time, so the real reordering window is a couple
+# of rows -- 25 is slack well past that while still checking ~975 of the
+# $CAP retained rows.
+TRIM_MARGIN=25
 PORT=18900
 TESTDIR="$(mktemp -d /tmp/ac_server_stress.XXXXXXXX)"
 DB="$TESTDIR/ac_server.db"
@@ -173,6 +174,14 @@ worker() {
     local errors=0
     local n=0
     local bodyfile="$TESTDIR/worker-$id.lastbody"
+    # $n increments on every attempt, but only a 201 proves the row is
+    # committed (the handler writes before it responds), so the sequence
+    # numbers that actually landed are a subset with arbitrary holes in
+    # it -- a timed-out or transport-failed attempt burns an $n that may
+    # legitimately have no row. The durability check needs the exact set
+    # the client was told succeeded, not a range, so record it here
+    # rather than trying to reconstruct it afterwards.
+    local ackfile="$TESTDIR/worker-$id.acked"
     local end=$(( $(date +%s) + DURATION ))
     while [ "$(date +%s)" -lt "$end" ]; do
         n=$((n + 1))
@@ -182,6 +191,7 @@ worker() {
         rc=$?
         if [ "$rc" -eq 0 ] && [ "$code" = "201" ]; then
             ok=$((ok + 1))
+            printf '%d\n' "$n" >> "$ackfile"
         elif [ "$rc" -eq 28 ]; then
             timeouts=$((timeouts + 1))
             printf 'n=%d rc=%d (timeout, response unavailable)\n' "$n" "$rc" >> "$TESTDIR/worker-$id.errlog"
@@ -226,16 +236,25 @@ for i in $(seq 1 "$CONCURRENCY"); do
     # which a sustained run can easily exceed; a direct query has no such
     # cap and is the actual ground truth being checked here.
     #
-    # Each worker's detail field is "n=<seq>", strictly increasing per
-    # client_id, so the retained rows carry enough information to tell
-    # "trimmed on purpose" apart from "lost": retention removes a prefix
-    # of the sequence, whereas a dropped write leaves a hole in the
-    # middle of it. GAPS below counts exactly those holes.
-    read -r DB_COUNT DB_GAPS < <(python3 - "$DB" "$CID" "$GAP_MARGIN" <<'EOF'
+    # Each worker's detail field is "n=<seq>", so the retained rows can be
+    # matched against the exact set of sequence numbers that worker was
+    # told succeeded (worker-$i.acked). That comparison is what separates
+    # "trimmed on purpose" from "lost": retention only ever removes the
+    # oldest rows, so an acknowledged $n missing from above the trim
+    # boundary was dropped, not trimmed.
+    #
+    # Deliberately a set difference against the acknowledged numbers
+    # rather than a contiguity test over the retained ones. $n counts
+    # attempts, not successes, so a timed-out or transport-failed attempt
+    # legitimately leaves its $n with no row -- a hole in the retained
+    # sequence that proves nothing. Only a number the client saw a 201
+    # for is owed a row.
+    read -r DB_COUNT DB_MISSING < <(python3 - "$DB" "$CID" "$TESTDIR/worker-$i.acked" "$TRIM_MARGIN" <<'EOF'
+import os
 import sqlite3
 import sys
 
-db, cid, margin = sys.argv[1], sys.argv[2], int(sys.argv[3])
+db, cid, ackfile, margin = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
 con = sqlite3.connect(db)
 try:
     rows = con.execute(
@@ -243,17 +262,27 @@ try:
     ).fetchall()
 finally:
     con.close()
-seqs = sorted(int(r[0].split("=", 1)[1]) for r in rows)
-# Skip the oldest $margin retained rows before looking for holes: those
-# sit right at the trim boundary, the one place where a legitimate
-# reordering shows up as a hole. A worker whose request timed out
-# client-side moves on and sends n+1 while the server is still writing
-# n, so n can land *after* n+1 and be the one retention drops -- a hole
-# at the boundary that says nothing about durability. The interior of
-# the window has no such excuse.
-core = seqs[margin:]
-gaps = (core[-1] - core[0] + 1) - len(core) if core else 0
-print(len(seqs), gaps)
+stored = {int(r[0].split("=", 1)[1]) for r in rows}
+# A worker that never got a single 201 writes no ack file at all.
+if os.path.exists(ackfile):
+    with open(ackfile) as fh:
+        acked = {int(line) for line in fh if line.strip()}
+else:
+    acked = set()
+# Everything below the trim boundary is retention's to remove. Take that
+# boundary $margin rows above the oldest retained row rather than at it:
+# retention trims by rowid, and an attempt the worker abandoned
+# client-side can still be committed after the next one was sent, so the
+# very oldest retained rows need not be the lowest $n. Above the margin
+# the ordering has no such excuse, and an acknowledged number with no row
+# is a genuinely lost write.
+kept = sorted(stored)
+if len(kept) > margin:
+    floor = kept[margin]
+    missing = len([n for n in acked if n >= floor and n not in stored])
+else:
+    missing = 0
+print(len(stored), missing)
 EOF
 )
     # Retention caps what can be on disk, so the most a worker's rows can
@@ -282,8 +311,8 @@ EOF
         # stops working under load is the bug the cap exists to prevent.
         fail "worker $i: DB has $DB_COUNT rows for $CID, above the $CAP-row retention cap (trim failed under concurrent load)"
         DB_MISMATCH=1
-    elif [ "$DB_GAPS" -gt 0 ]; then
-        fail "worker $i: $DB_GAPS report(s) missing from the middle of $CID's retained sequence (not explained by retention, which only trims the oldest)"
+    elif [ "$DB_MISSING" -gt 0 ]; then
+        fail "worker $i: $DB_MISSING report(s) the server 201'd for $CID are missing from above the retention boundary (not explained by retention, which only trims the oldest)"
         DB_MISMATCH=1
     fi
 done
