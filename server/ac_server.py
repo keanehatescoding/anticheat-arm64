@@ -51,6 +51,7 @@ import hmac
 import http.server
 import ipaddress
 import json
+import math
 import os
 import re
 import signal
@@ -65,6 +66,12 @@ import traceback
 
 CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 MAX_BODY_BYTES = 4096
+# SQLite stores integers as signed 64-bit; binding anything outside this
+# raises OverflowError at insert time. json.loads builds arbitrary-size
+# Python ints, so a report body well under MAX_BODY_BYTES can carry one
+# far outside it (see _handle_report's client_ts gate).
+SQLITE_INT_MIN = -(2 ** 63)
+SQLITE_INT_MAX = 2 ** 63 - 1
 
 
 class RateLimiter:
@@ -776,7 +783,35 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
                 return self._send_json(400, {"error": "invalid event_type"})
             if not isinstance(detail, str) or not (0 < len(detail) <= 2000):
                 return self._send_json(400, {"error": "invalid detail"})
-            if not isinstance(client_ts, (int, float)):
+            # json.loads accepts bare NaN/Infinity (stdlib default) and
+            # isinstance(True, int) is True, so a bare isinstance gate lets
+            # all three through to SQLite. Infinity round-trips as a float
+            # and json.dumps later emits it as a bare Infinity token
+            # (invalid strict JSON) on GET /reports, breaking strict
+            # consumers (Go encoding/json, jq); True is silently stored as
+            # 1. Normalize all of those to null (None) instead.
+            #
+            # Ints are range-checked rather than passed to math.isfinite,
+            # which is only meaningful for floats and actively harmful
+            # here: json.loads builds arbitrary-size ints, and isfinite()
+            # raises OverflowError converting one too big for a C double
+            # ("ts": 1 followed by 400 zeroes, ~450 bytes, well inside
+            # MAX_BODY_BYTES). A comparison has no such limit. The bound
+            # is SQLite's, not the double range, because an int can clear
+            # isfinite() and still be unstorable -- 10**30 converts to a
+            # double fine, then raises OverflowError binding to an
+            # INTEGER column. Both paths reached _dispatch's blanket
+            # handler as an unhandled exception: HTTP 500 plus a logged
+            # traceback, for a request the server should just be
+            # normalizing like any other unusable ts.
+            if isinstance(client_ts, bool) or not isinstance(
+                client_ts, (int, float)
+            ):
+                client_ts = None
+            elif isinstance(client_ts, int):
+                if not SQLITE_INT_MIN <= client_ts <= SQLITE_INT_MAX:
+                    client_ts = None
+            elif not math.isfinite(client_ts):
                 client_ts = None
             store.add_report(
                 client_id, event_type, detail, client_ts, self._client_ip()
