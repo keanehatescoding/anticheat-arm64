@@ -70,6 +70,7 @@ package_hypranticheat-dkms() {
     backup=('etc/dkms/framework.conf.d/anticheat.conf')
 
     cd "$_reponame-$pkgver"
+    local _dkmsdir="$pkgdir/usr/src/anticheat-${pkgver}"
     install -Dm644 Makefile "$_dkmsdir/Makefile"
     install -Dm644 dkms.conf "$_dkmsdir/dkms.conf"
     install -Dm755 scripts/dkms-build.sh "$_dkmsdir/scripts/dkms-build.sh"
