@@ -6,13 +6,17 @@
 # kernel-module AUR packages split this way. See RELEASING.md in the
 # upstream repo for how pkgver here is kept in sync with dkms.conf's
 # PACKAGE_VERSION / MODULE_VERSION(...).
+# Upstream repo hosting the tags -- not the same as pkgbase (the package
+# is called hypranticheat, the repo is anticheat-arm64), so the release
+# tarball extracts to $_reponame-$pkgver/, not $pkgbase-$pkgver/.
+_reponame=anticheat-arm64
 pkgbase=hypranticheat
 pkgname=(hypranticheat hypranticheat-dkms)
 pkgver=1.0.0
 pkgrel=1
 pkgdesc="Kernel-mode anticheat: syscall/module integrity, ptrace denial, RWX/anon-exec detection"
 arch=('aarch64')
-url="https://github.com/keanehatescoding/hypranticheat"
+url="https://github.com/keanehatescoding/anticheat-arm64"
 license=('GPL-2.0-only')
 makedepends=('dkms')
 # A git+#tag= VCS source is always sha256sums=('SKIP') by design (there's
@@ -21,11 +25,11 @@ makedepends=('dkms')
 # An immutable release tarball avoids that: the checksum below is real
 # and `updpkgsums` (see RELEASING.md step 7) actually computes it,
 # instead of being a no-op against a VCS source.
-source=("$pkgbase-$pkgver.tar.gz::https://github.com/keanehatescoding/hypranticheat/archive/refs/tags/v${pkgver}.tar.gz")
+source=("$pkgbase-$pkgver.tar.gz::https://github.com/keanehatescoding/anticheat-arm64/archive/refs/tags/v${pkgver}.tar.gz")
 sha256sums=('SKIP') # placeholder until v${pkgver} is tagged upstream and `updpkgsums` can fetch it for real -- see RELEASING.md
 
 build() {
-    cd "$pkgbase-$pkgver"
+    cd "$_reponame-$pkgver"
     # The Makefile's own CFLAGS default (-O2 -Wall -Wextra) has no
     # hardening flags of its own; makepkg's environment already carries
     # them (see /etc/makepkg.conf), so pass both through explicitly
@@ -39,7 +43,7 @@ package_hypranticheat() {
     depends=('glibc')
     optdepends=('hypranticheat-dkms: kernel-level detection -- required for real use; the daemon alone can only run against its userspace mock')
 
-    cd "$pkgbase-$pkgver"
+    cd "$_reponame-$pkgver"
     install -Dm755 anticheat "$pkgdir/usr/bin/anticheat"
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
     install -Dm644 THREAT_MODEL.md "$pkgdir/usr/share/doc/$pkgname/THREAT_MODEL.md"
@@ -66,7 +70,7 @@ package_hypranticheat-dkms() {
     # same protection every other /etc config file on the system gets.
     backup=('etc/dkms/framework.conf.d/anticheat.conf')
 
-    cd "$pkgbase-$pkgver"
+    cd "$_reponame-$pkgver"
     local _dkmsdir="$pkgdir/usr/src/anticheat-${pkgver}"
     install -Dm644 Makefile "$_dkmsdir/Makefile"
     install -Dm644 dkms.conf "$_dkmsdir/dkms.conf"

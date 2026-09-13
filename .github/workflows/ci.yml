@@ -139,6 +139,21 @@ jobs:
             echo "::error file=packaging/aur/.SRCINFO::source entry out of sync -- expected 'source = $src_expanded'"
             fail=1
           fi
+          # The tarball must be fetched from this repo's own tags. A stale
+          # owner/repo in source= 404s on first publish (or, worse, builds
+          # someone else's code if the name ever resolves elsewhere), and
+          # GitHub names the top-level dir after the repo, so the PKGBUILD
+          # cd lines must match too -- covered by comparing .SRCINFO
+          # against the same source= line above.
+          src_url="$(printf '%s\n' "$src_expanded" | sed -n 's/.*:://p')"
+          case "$src_url" in
+            "https://github.com/${GITHUB_REPOSITORY}/archive/"*)
+              ;;
+            *)
+              echo "::error file=packaging/aur/PKGBUILD::source URL '$src_url' does not point at this repo (${GITHUB_REPOSITORY}) -- first AUR publish would 404"
+              fail=1
+              ;;
+          esac
           dkmsver="$(sed -n 's/^PACKAGE_VERSION="\(.*\)"/\1/p' dkms.conf)"
           if [ "$pkgver" != "$dkmsver" ]; then
             echo "::error file=packaging/aur/PKGBUILD::pkgver=$pkgver disagrees with dkms.conf PACKAGE_VERSION=$dkmsver (RELEASING.md: bump together)"
