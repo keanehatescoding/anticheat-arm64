@@ -22,15 +22,16 @@ normal reason kernel-module AUR packages are structured this way.
 ## `source=` references a release tarball that doesn't exist yet
 
 `PKGBUILD`'s `source=` points at the GitHub release archive for
-`v${pkgver}` — an immutable tag-pinned tarball, not a mutable VCS ref, so
-`sha256sums` is a real, checkable checksum rather than the `SKIP` a
-`git+#tag=` source would force. This only resolves once that version is
-actually tagged (see `RELEASING.md`); `sha256sums` is a placeholder until
-then. To test mechanically before a real tag exists: build a local
-tarball with the same layout GitHub's archive produces —
+`v${pkgver}` in the `anticheat-arm64` repo — an immutable tag-pinned
+tarball, not a mutable VCS ref, so `sha256sums` is a real, checkable
+checksum rather than the `SKIP` a `git+#tag=` source would force. This
+only resolves once that version is actually tagged (see `RELEASING.md`);
+`sha256sums` is a placeholder until then. To test mechanically before a
+real tag exists: build a local tarball with the same layout GitHub's
+archive produces —
 
 ```sh
-git archive --format=tar --prefix=hypranticheat-<pkgver>/ HEAD \
+git archive --format=tar --prefix=anticheat-arm64-<pkgver>/ HEAD \
     | gzip > hypranticheat-<pkgver>.tar.gz
 ```
 
