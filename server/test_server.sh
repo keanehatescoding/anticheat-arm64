@@ -384,6 +384,59 @@ else
     fail "expected 'syscall hook' in reports listing (got: $OUT)"
 fi
 
+# 13b. non-finite / bool ts is normalized to null, not persisted --
+# json.loads accepts bare NaN/Infinity (stdlib default) and
+# isinstance(True, int) is True, so a bare isinstance gate lets all three
+# through to SQLite. Infinity round-trips as a float and json.dumps later
+# emits it as a bare Infinity token (invalid strict JSON) on GET /reports,
+# breaking strict consumers (Go encoding/json, jq) reviewing reports
+# before banning; True is silently stored as 1. (NaN happens to come back
+# from SQLite as NULL today, but still goes through the same gate so the
+# stored value never depends on that driver quirk.)
+INF_CID="test-inf-ts-$$"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/report" \
+    -H "Authorization: Bearer $REPORT_KEY" -H 'Content-Type: application/json' \
+    -d "{\"client_id\":\"$INF_CID\",\"event_type\":\"X\",\"detail\":\"inf-ts\",\"ts\":Infinity}")
+if [ "$CODE" = "201" ]; then
+    pass "POST /report with Infinity ts accepted -> 201 (normalized, not rejected)"
+else
+    fail "POST /report with Infinity ts should be 201 (got $CODE)"
+fi
+OUT=$(curl -s "$BASE/reports/$INF_CID" -H "Authorization: Bearer $ADMIN_KEY")
+if printf '%s' "$OUT" | grep -qE 'NaN|Infinity'; then
+    fail "reports listing must not contain bare NaN/Infinity tokens (got: $OUT)"
+else
+    pass "reports listing contains no bare NaN/Infinity tokens"
+fi
+if printf '%s' "$OUT" | python3 -c 'import json,sys
+def _reject(x):
+    raise ValueError(x)
+obj = json.loads(sys.stdin.read(), parse_constant=_reject)
+rows = obj.get("reports", [])
+sys.exit(0 if rows and rows[0].get("client_ts") is None else 1)'; then
+    pass "Infinity ts normalized to null and listing parses as strict JSON"
+else
+    fail "Infinity ts should be null with strict-JSON listing (got: $OUT)"
+fi
+BOOL_CID="test-bool-ts-$$"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/report" \
+    -H "Authorization: Bearer $REPORT_KEY" -H 'Content-Type: application/json' \
+    -d "{\"client_id\":\"$BOOL_CID\",\"event_type\":\"X\",\"detail\":\"bool-ts\",\"ts\":true}")
+if [ "$CODE" = "201" ]; then
+    pass "POST /report with bool ts accepted -> 201 (normalized, not rejected)"
+else
+    fail "POST /report with bool ts should be 201 (got $CODE)"
+fi
+OUT=$(curl -s "$BASE/reports/$BOOL_CID" -H "Authorization: Bearer $ADMIN_KEY")
+if printf '%s' "$OUT" | python3 -c 'import json,sys
+obj = json.loads(sys.stdin.read())
+rows = obj.get("reports", [])
+sys.exit(0 if rows and rows[0].get("client_ts") is None else 1)'; then
+    pass "bool ts normalized to null"
+else
+    fail "bool ts should be null (got: $OUT)"
+fi
+
 # 14. ban, then confirm banned lookup flips to true
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/ban" \
     -H "Authorization: Bearer $ADMIN_KEY" -H 'Content-Type: application/json' \

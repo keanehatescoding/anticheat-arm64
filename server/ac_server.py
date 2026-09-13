@@ -51,6 +51,7 @@ import hmac
 import http.server
 import ipaddress
 import json
+import math
 import os
 import re
 import signal
@@ -776,7 +777,18 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
                 return self._send_json(400, {"error": "invalid event_type"})
             if not isinstance(detail, str) or not (0 < len(detail) <= 2000):
                 return self._send_json(400, {"error": "invalid detail"})
-            if not isinstance(client_ts, (int, float)):
+            # json.loads accepts bare NaN/Infinity (stdlib default) and
+            # isinstance(True, int) is True, so a bare isinstance gate lets
+            # all three through to SQLite. Infinity round-trips as a float
+            # and json.dumps later emits it as a bare Infinity token
+            # (invalid strict JSON) on GET /reports, breaking strict
+            # consumers (Go encoding/json, jq); True is silently stored as
+            # 1. Normalize all of those to null (None) instead.
+            if (
+                isinstance(client_ts, bool)
+                or not isinstance(client_ts, (int, float))
+                or not math.isfinite(client_ts)
+            ):
                 client_ts = None
             store.add_report(
                 client_id, event_type, detail, client_ts, self._client_ip()
