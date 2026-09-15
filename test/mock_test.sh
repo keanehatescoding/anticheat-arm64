@@ -149,6 +149,9 @@ echo "== memory-integrity baselines (self-scan) =="
 expect_rc  "scan --hash --save"       0 bash -c "$SELFSCAN --hash --save"
 expect_rc  "scan --hash --check"      0 bash -c "$SELFSCAN --hash --check"
 expect_out "baseline matches"          "matches baseline" bash -c "$SELFSCAN --hash --check"
+expect_rc  "scan --hash --save --check rejected" 1 bash -c "$SELFSCAN --hash --save --check"
+expect_rc  "scan --save without --hash rejected" 1 bash -c "$SELFSCAN --save"
+expect_rc  "scan --check without --hash rejected" 1 bash -c "$SELFSCAN --check"
 
 echo "== syscall integrity (clean + compromised) =="
 expect_rc  "syscalls clean"           0 ./anticheat syscalls
