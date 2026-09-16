@@ -248,9 +248,11 @@ ci:
 # cross-built binary would survive and fail with an exec-format error).
 	@set -eu; \
 	if command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then \
-		$(MAKE) CC=aarch64-linux-gnu-gcc CFLAGS="-O2 -Wall -Wextra -Werror" daemon && \
-		file anticheat | grep -q 'aarch64\|ARM aarch64'; \
+		rc=0; \
+		$(MAKE) CC=aarch64-linux-gnu-gcc CFLAGS="-O2 -Wall -Wextra -Werror" daemon || rc=$$?; \
+		if [ "$$rc" -eq 0 ]; then file anticheat | grep -q 'aarch64\|ARM aarch64' || rc=$$?; fi; \
 		rm -f anticheat; \
+		if [ "$$rc" -ne 0 ]; then echo "error: aarch64 cross-build failed (exit $$rc)"; exit "$$rc"; fi; \
 	else \
 		echo "warning: aarch64-linux-gnu-gcc not installed -- skipping aarch64 cross-build (CI enforces it)"; \
 	fi
@@ -301,9 +303,13 @@ ci:
 # is actually tagged). Part of `make ci`, the single place the userspace
 # gate is written down (#77).
 #
-# GITHUB_REPOSITORY names this repo's slug in CI; locally it falls back to
-# the origin remote. When neither exists, only the source-URL pin is
-# skipped (with a warning) -- the file-consistency checks still run.
+# GITHUB_REPOSITORY names this repo's slug in CI. Locally that variable is
+# unset, and the origin remote of a fork checkout names the contributor's
+# fork -- which the AUR source entry must NOT match -- so there is no
+# reliable local source for the canonical slug. When unset, only the
+# source-URL pin is skipped (with a warning); the file-consistency checks
+# still run. Set GITHUB_REPOSITORY=owner/repo explicitly to enforce the pin
+# locally.
 ci-aur-check:
 	@set -eu; \
 	pkgbase="$$(sed -n 's/^pkgbase=//p' packaging/aur/PKGBUILD)"; \
@@ -325,17 +331,13 @@ ci-aur-check:
 	fi; \
 	src_url="$$(printf '%s\n' "$$src_expanded" | sed -n 's/.*:://p')"; \
 	repo="$${GITHUB_REPOSITORY:-}"; \
-	if [ -z "$$repo" ]; then \
-		origin="$$(git config --get remote.origin.url 2>/dev/null || true)"; \
-		repo="$$(printf '%s\n' "$$origin" | sed -e 's#^git@github.com:##' -e 's#^https\?://github.com/##' -e 's#\.git$$##')"; \
-	fi; \
 	if [ -n "$$repo" ]; then \
 		case "$$src_url" in \
 			"https://github.com/$$repo/archive/"*) ;; \
 			*) echo "::error file=packaging/aur/PKGBUILD::source URL '$$src_url' does not point at this repo ($$repo) -- first AUR publish would 404"; fail=1;; \
 		esac; \
 	else \
-		echo "warning: cannot determine repo slug (no GITHUB_REPOSITORY, no origin remote) -- skipping source-URL pin"; \
+		echo "warning: GITHUB_REPOSITORY unset -- skipping source-URL pin (set GITHUB_REPOSITORY=owner/repo to enforce it locally)"; \
 	fi; \
 	dkmsver="$$(sed -n 's/^PACKAGE_VERSION="\(.*\)"/\1/p' dkms.conf)"; \
 	if [ "$$pkgver" != "$$dkmsver" ]; then \

@@ -14,19 +14,26 @@ userspace-only project — read on before diving in.
   reason about (and review) against that context.
 - **Run the gate:** `make ci` — the userspace build with
   `-Wall -Wextra -Werror` plus the full no-root test suite, exactly what
-  CI's `userspace` job runs. If you touched the kernel module, also build
-  it against your own headers and, if you can, boot-test it in a VM —
-  per-push CI only cross-compiles and sparse-checks the module (against
+  CI's `userspace` job runs. If you touched the kernel module and you're on
+  ARM64, also build it against your own headers (`make module`) and, if you
+  can, boot-test it in a VM — the module is ARM64-only (its
+  `#ifndef CONFIG_ARM64` guard rejects an x86_64 kernel tree), so on other
+  arches rely on the CI `module` cross-build instead.
+  Per-push CI only cross-compiles and sparse-checks the module (against
   pinned 6.12 headers). A short KASAN fuzz seed does boot-test the loaded
   module on PRs that touch the module or fuzz sources (see below), but the
   full KASAN/lockdep and stress runs are nightly-only.
 
 ## Prerequisites
 
-- Linux with kernel headers **>= 6.12** if you're building/testing the
-  module itself — it uses APIs (`sized_strscpy`, the `_noprof` allocators,
-  `for_class_mod_mem_type`, maple-tree VMA iteration) that don't exist on
-  older kernels. The daemon, mock tests, and server don't need this.
+- Linux with ARM64 kernel headers **>= 6.12** if you're building/testing
+  the module itself — it uses APIs (`sized_strscpy`, the `_noprof`
+  allocators, `for_class_mod_mem_type`, maple-tree VMA iteration) that
+  don't exist on older kernels, and its `#ifndef CONFIG_ARM64` guard
+  rejects any non-ARM64 tree. On x86_64, either build against an ARM64
+  tree (`make KDIR=<path-to-arm64-tree> ARCH=arm64
+  CROSS_COMPILE=aarch64-linux-gnu- module`) or rely on CI's `module`
+  cross-build. The daemon, mock tests, and server don't need this.
 - `gcc` or `clang` (the Makefile auto-detects `LLVM=1` if your running
   kernel was itself built with clang), plus `gcc-aarch64-linux-gnu` for the
   ARM64 cross-build check inside `make ci` — without it that one step warns
