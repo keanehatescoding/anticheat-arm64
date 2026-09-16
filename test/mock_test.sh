@@ -146,6 +146,7 @@ expect_rc  "scan --pid \$\$"           0 ./anticheat scan --pid $$
 expect_out "scan summary"              "VMA(s)"         ./anticheat scan --pid $$
 
 echo "== memory-integrity baselines (self-scan) =="
+expect_rc  "scan --hash"              0 bash -c "$SELFSCAN --hash"
 expect_rc  "scan --hash --save"       0 bash -c "$SELFSCAN --hash --save"
 expect_rc  "scan --hash --check"      0 bash -c "$SELFSCAN --hash --check"
 expect_out "baseline matches"          "matches baseline" bash -c "$SELFSCAN --hash --check"
