@@ -1706,6 +1706,11 @@ static int cmd_scan(int argc, char **argv)
         else if (strcmp(argv[i], "--check-implicit-layers") == 0)
             do_implicit = 1;
     }
+    if (do_save && do_check)
+        die("--save and --check are mutually exclusive:"
+            " --check after --save would only compare a hash against itself");
+    if ((do_save || do_check) && !do_hash)
+        die("--save/--check require --hash");
     if (pid < 0)
         die("usage: anticheat scan --pid N [--ns-of REFPID] [--hash [--save|--check]] "
             "[--check-hooks] [--check-preload] [--check-vklayers] "
