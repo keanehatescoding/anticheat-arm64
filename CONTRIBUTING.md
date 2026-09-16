@@ -21,8 +21,8 @@ userspace-only project — read on before diving in.
   arches rely on the CI `module` cross-build instead.
   Per-push CI only cross-compiles and sparse-checks the module (against
   pinned 6.12 headers). A short KASAN fuzz seed does boot-test the loaded
-  module on PRs that touch the module or fuzz sources (see below), but the
-  full KASAN/lockdep and stress runs are nightly-only.
+  module on pushes and PRs that touch the module or fuzz sources (see
+  below), but the full KASAN/lockdep and stress runs are nightly-only.
 
 ## Prerequisites
 
@@ -117,12 +117,12 @@ That determines whether `AC_IOCTL_VERSION` needs to bump — see
   - `module` — cross-builds the kernel module for ARM64 against pinned
     linux-6.12 headers, plus a sparse run and an aarch64 daemon
     cross-build check.
-  - `kasan-fuzz-seed` — only on PRs touching `src/anticheat_module.c`,
-    `src/anticheat.h`, `test/ioctl_fuzz.c`, or
+  - `kasan-fuzz-seed` — only on pushes and PRs touching
+    `src/anticheat_module.c`, `src/anticheat.h`, `test/ioctl_fuzz.c`, or
     `scripts/kasan_boot_test.sh`: boots a real KASAN+lockdep kernel under
     virtme-ng and fuzzes the loaded module. That's load-time testing on a
-    PR — and it takes minutes (kernel build + VM boot), so expect a longer
-    wait when it triggers.
+    qualifying push or PR — and it takes minutes (kernel build + VM boot),
+    so expect a longer wait when it triggers.
 - An automated Claude Code Review comment will show up — treat it as a
   first-pass reviewer, not a merge gate.
 - Heavier jobs (the full KASAN/lockdep boot fuzz, the stress test) run
