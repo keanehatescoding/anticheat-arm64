@@ -12,18 +12,38 @@ userspace-only project — read on before diving in.
   `THREAT_MODEL.md` first. It defines the adversary model and trust
   boundaries this code actually needs to hold, so changes are easier to
   reason about (and review) against that context.
+- **Run the gate:** `make ci` — the userspace build with
+  `-Wall -Wextra -Werror` plus the full no-root test suite, exactly what
+  CI's `userspace` job runs. If you touched the kernel module and you're on
+  ARM64, also build it against your own headers (`make module`) and, if you
+  can, boot-test it in a VM — the module is ARM64-only (its
+  `#ifndef CONFIG_ARM64` guard rejects an x86_64 kernel tree), so on other
+  arches rely on the CI `module` cross-build instead.
+  Per-push CI only cross-compiles and sparse-checks the module (against
+  pinned 6.12 headers). A short KASAN fuzz seed does boot-test the loaded
+  module on pushes and PRs that touch the module or fuzz sources (see
+  below), but the full KASAN/lockdep and stress runs are nightly-only.
 
 ## Prerequisites
 
-- Linux with kernel headers **>= 6.12** if you're building/testing the
-  module itself — it uses APIs (`sized_strscpy`, the `_noprof` allocators,
-  `for_class_mod_mem_type`, maple-tree VMA iteration) that don't exist on
-  older kernels. The daemon, mock tests, and server don't need this.
+- Linux with ARM64 kernel headers **>= 6.12** if you're building/testing
+  the module itself — it uses APIs (`sized_strscpy`, the `_noprof`
+  allocators, `for_class_mod_mem_type`, maple-tree VMA iteration) that
+  don't exist on older kernels, and its `#ifndef CONFIG_ARM64` guard
+  rejects any non-ARM64 tree. On x86_64, either build against an ARM64
+  tree (`make KDIR=<path-to-arm64-tree> ARCH=arm64
+  CROSS_COMPILE=aarch64-linux-gnu- module`) or rely on CI's `module`
+  cross-build. The daemon, mock tests, and server don't need this.
 - `gcc` or `clang` (the Makefile auto-detects `LLVM=1` if your running
-  kernel was itself built with clang).
+  kernel was itself built with clang), plus `gcc-aarch64-linux-gnu` for the
+  ARM64 cross-build check inside `make ci` — without it that one step warns
+  and skips; CI installs it, so it still enforces it there.
 - Python 3, for the report server and its tests.
 - `shellcheck` and `sparse` if you want to run the same static analysis CI
-  does, locally (`apt install shellcheck sparse` on Debian/Ubuntu).
+  does, locally. On Debian/Ubuntu: `apt install shellcheck sparse`
+  (Arch: `pacman -S shellcheck sparse`; Fedora: `dnf install ShellCheck
+  sparse`). Without `shellcheck`, `make ci` warns and skips just the shell
+  checks — CI still enforces them.
 
 ## Building
 
@@ -35,12 +55,22 @@ userspace-only project — read on before diving in.
 
 Most changes don't need root or a VM:
 
+- **The full no-root gate** — `make ci` runs exactly what CI's `userspace`
+  job runs (that job only installs the cross-compiler and shellcheck
+  first). Run this before opening a PR; never add a CI userspace step the
+  `ci` target doesn't cover.
 - **Daemon/CLI logic** — `make test-mock` runs the daemon against an
   `LD_PRELOAD` mock of the kernel interface (`test/mock_anticheat.c`), no
-  module load, no root. This is exactly what CI's `userspace` job runs via
-  `make ci`.
-- **Server** — `./server/test_server.sh` and
-  `python3 server/test_ratelimiter_unit.py`, both plain userspace.
+  module load, no root.
+- **Daemon unit tests** — `make baseline-test`,
+  `make ac-report-status-test`, `make ac-report-url-test`,
+  `make ac-report-cooldown-test`. Each pulls `anticheat_daemon.c` in
+  directly (no kernel/mock scan involved) and proves one specific behavior
+  — see the comment above its target in the `Makefile`. Touching
+  `ac_report()`? Run the `ac-report-*` ones.
+- **Server** — `./server/test_server.sh`,
+  `python3 server/test_ratelimiter_unit.py`, and
+  `python3 server/test_store_retention_unit.py`, all plain userspace.
 - **A specific kernel-side behavior** — there's a purpose-built live test
   helper for most of the trickier ones: `priv-drop-test`, `render-hook-test`,
   `mount-ns-test`, `anon-exec-test`, `thread-exit-migration-test`,
@@ -52,19 +82,11 @@ Most changes don't need root or a VM:
   kernel module can panic or corrupt the host, not just crash a process.
 - **ioctl fuzzing** — `make ioctl-fuzz`, then
   `./test/ioctl_fuzz [iterations] [seed]`. Against the mock this only
-  proves the harness itself doesn't crash; the real test is against a
+  proves the harness itself doesn't crash (`make ci` runs this dry run
+  with `IOCTL_FUZZ_SAFE_POINTERS_ONLY=1`); the real test is against a
   loaded module as root, watching `dmesg` for anything the nightly
   KASAN/lockdep job would also flag (oops, warning, GPF, KASAN report).
   See the README's "ioctl fuzzing" section for more.
-
-## Before opening a PR
-
-Run what CI runs: `make ci` (userspace build with `-Wall -Wextra -Werror`,
-plus the full mock suite). If you touched the kernel module, also build it
-against your own headers and, if you can, boot-test it in a VM — the
-per-push CI job only compiles and sparse-checks the module (against pinned
-6.12 headers), it doesn't load it. Real load-time testing happens in the
-nightly KASAN/lockdep job, not on every PR.
 
 ## Code conventions
 
@@ -87,12 +109,23 @@ That determines whether `AC_IOCTL_VERSION` needs to bump — see
 
 ## What happens after you open a PR
 
-- `ci.yml` runs automatically: a userspace build + mock/server test suite,
-  and a kernel-module compile + sparse + DKMS-signing smoke test against
-  pinned linux-6.12 headers.
+- `ci.yml` runs automatically:
+  - `userspace` — `make ci`: userspace build with warnings-as-errors plus
+    the full no-root suite (mock, unit, server, and ioctl-fuzz dry run,
+    shellcheck + executable-bit + AUR metadata checks, aarch64
+    cross-build).
+  - `module` — cross-builds the kernel module for ARM64 against pinned
+    linux-6.12 headers, plus a sparse run and an aarch64 daemon
+    cross-build check.
+  - `kasan-fuzz-seed` — only on pushes and PRs touching
+    `src/anticheat_module.c`, `src/anticheat.h`, `test/ioctl_fuzz.c`, or
+    `scripts/kasan_boot_test.sh`: boots a real KASAN+lockdep kernel under
+    virtme-ng and fuzzes the loaded module. That's load-time testing on a
+    qualifying push or PR — and it takes minutes (kernel build + VM boot),
+    so expect a longer wait when it triggers.
 - An automated Claude Code Review comment will show up — treat it as a
   first-pass reviewer, not a merge gate.
-- Heavier jobs (the real KASAN/lockdep boot fuzz, the stress test) run
+- Heavier jobs (the full KASAN/lockdep boot fuzz, the stress test) run
   nightly rather than per-PR, so a green CI run doesn't cover everything —
   for a security-relevant change, expect to wait for or manually trigger
   one of those before it's merged.
