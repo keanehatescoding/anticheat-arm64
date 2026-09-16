@@ -229,13 +229,124 @@ test/ac_report_cooldown_test: test/ac_report_cooldown_test.c src/anticheat_daemo
 test-mock: mock daemon
 	./test/mock_test.sh
 
-# CI entry point: rebuild all userspace with warnings-as-errors and run the
-# full no-root test suite.  (The kernel module build needs real kernel
-# headers and is exercised separately in CI against a prepared kernel tree.)
+# CI entry point: the full no-root userspace gate -- the same gate CI's
+# `userspace` job runs (that job is a thin wrapper: toolchain installs, then
+# `make ci`). Keep them in sync: NEVER add a CI userspace step the `ci`
+# target doesn't cover, or contributors get a green `make ci` locally and a
+# red PR (#77). The kernel module build needs real kernel headers and is
+# exercised separately in CI against a prepared kernel tree.
+#
+# Graceful degradation, local-only: the aarch64 cross-build and shellcheck
+# are skipped with a warning when the tool isn't installed (CI installs both
+# first, so the gate still enforces them there); the git-dependent checks
+# are skipped outside a git checkout. Everything else fails the target.
 ci:
 	$(MAKE) clean
+# Compile check that the portable daemon still builds for the ARM64 target
+# it ships for. `rm` afterwards so the native build below rebuilds a
+# runnable ./anticheat (make doesn't track CFLAGS, so without this the
+# cross-built binary would survive and fail with an exec-format error).
+	@set -eu; \
+	if command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then \
+		$(MAKE) CC=aarch64-linux-gnu-gcc CFLAGS="-O2 -Wall -Wextra -Werror" daemon && \
+		file anticheat | grep -q 'aarch64\|ARM aarch64'; \
+		rm -f anticheat; \
+	else \
+		echo "warning: aarch64-linux-gnu-gcc not installed -- skipping aarch64 cross-build (CI enforces it)"; \
+	fi
 	$(MAKE) CFLAGS="-O2 -Wall -Wextra -Werror" daemon mock baseline-test ac-report-status-test ac-report-url-test ac-report-cooldown-test
 	./test/mock_test.sh
+	$(MAKE) CFLAGS="-O2 -Wall -Wextra -Werror" priv-drop-test render-hook-test mount-ns-test ioctl-fuzz
+# Dry run only -- against the mock, not a real kernel module: proves the
+# harness itself doesn't crash, not that the kernel survives malformed
+# input. IOCTL_FUZZ_SAFE_POINTERS_ONLY=1 because the mock is plain
+# userspace with no copy_from_user()/access_ok() of its own. The real run
+# is root + loaded module + full pointer fuzzing (see README).
+	LD_PRELOAD="$(PWD)/test/libmock_anticheat.so" AC_MOCK_ROOT=1 AC_MOCK_STATE="/tmp/ac_mock_fuzz_state_ci" IOCTL_FUZZ_SAFE_POINTERS_ONLY=1 ./test/ioctl_fuzz 1000 20260818
+	./server/test_server.sh
+	python3 server/test_ratelimiter_unit.py
+	python3 server/test_store_retention_unit.py
+# A rebase, auto-fix commit, or artifact re-download can silently drop a
+# script's mode from 100755 to 100644 -- catch it here, in the same gate
+# the contributor runs, rather than whichever scheduled workflow happens
+# to exec the script next.
+	@set -eu; \
+	if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then \
+		git ls-files '*.sh' | { fail=0; \
+			while IFS= read -r f; do \
+				if [ ! -x "$$f" ]; then \
+					echo "error: executable bit missing on $$f (mode $$(stat -c%a "$$f"))"; \
+					fail=1; \
+				fi; \
+			done; \
+			exit $$fail; }; \
+		if command -v shellcheck >/dev/null 2>&1; then \
+			git ls-files '*.sh' | xargs shellcheck; \
+		else \
+			echo "warning: shellcheck not installed -- skipping shell checks (CI enforces them)"; \
+		fi; \
+		$(MAKE) ci-aur-check; \
+	else \
+		echo "warning: not a git checkout -- skipping executable-bit, shellcheck, and AUR metadata checks"; \
+	fi
+
+# AUR publish correctness (see issue #46): packaging/aur/.SRCINFO is a
+# checked-in, hand-regenerated copy of PKGBUILD metadata (makepkg
+# --printsrcinfo), so it drifts silently -- arch = x86_64 survived the
+# ARM64-only port long after PKGBUILD moved to aarch64. A stale .SRCINFO
+# publishes the wrong architecture to AUR, and a pkgver cross-check against
+# dkms.conf catches the RELEASING.md "must move together" bump landing in
+# only one place. Textual comparison only: no makepkg/namcap needed, and no
+# network (the sha256sums SKIP placeholder stays legitimate until v<pkgver>
+# is actually tagged). Part of `make ci`, the single place the userspace
+# gate is written down (#77).
+#
+# GITHUB_REPOSITORY names this repo's slug in CI; locally it falls back to
+# the origin remote. When neither exists, only the source-URL pin is
+# skipped (with a warning) -- the file-consistency checks still run.
+ci-aur-check:
+	@set -eu; \
+	pkgbase="$$(sed -n 's/^pkgbase=//p' packaging/aur/PKGBUILD)"; \
+	pkgver="$$(sed -n 's/^pkgver=//p' packaging/aur/PKGBUILD)"; \
+	pkgrel="$$(sed -n 's/^pkgrel=//p' packaging/aur/PKGBUILD)"; \
+	pkgarch="$$(sed -n "s/^arch=('\(.*\)')/\1/p" packaging/aur/PKGBUILD)"; \
+	fail=0; \
+	for field in "pkgver = $$pkgver" "pkgrel = $$pkgrel" "arch = $$pkgarch"; do \
+		if ! grep -qF "$$field" packaging/aur/.SRCINFO; then \
+			echo "::error file=packaging/aur/.SRCINFO::missing '$$field' -- regenerate with 'makepkg --printsrcinfo > .SRCINFO'"; \
+			fail=1; \
+		fi; \
+		done; \
+	src_raw="$$(sed -n 's/^source=("\(.*\)")$$/\1/p' packaging/aur/PKGBUILD)"; \
+	src_expanded="$$(printf '%s\n' "$$src_raw" | sed -e 's/\$$pkgbase/'"$$pkgbase"'/g' -e 's/\$${pkgver}/'"$$pkgver"'/g' -e 's/\$$pkgver/'"$$pkgver"'/g')"; \
+	if ! grep -qF "source = $$src_expanded" packaging/aur/.SRCINFO; then \
+		echo "::error file=packaging/aur/.SRCINFO::source entry out of sync -- expected 'source = $$src_expanded'"; \
+		fail=1; \
+	fi; \
+	src_url="$$(printf '%s\n' "$$src_expanded" | sed -n 's/.*:://p')"; \
+	repo="$${GITHUB_REPOSITORY:-}"; \
+	if [ -z "$$repo" ]; then \
+		origin="$$(git config --get remote.origin.url 2>/dev/null || true)"; \
+		repo="$$(printf '%s\n' "$$origin" | sed -e 's#^git@github.com:##' -e 's#^https\?://github.com/##' -e 's#\.git$$##')"; \
+	fi; \
+	if [ -n "$$repo" ]; then \
+		case "$$src_url" in \
+			"https://github.com/$$repo/archive/"*) ;; \
+			*) echo "::error file=packaging/aur/PKGBUILD::source URL '$$src_url' does not point at this repo ($$repo) -- first AUR publish would 404"; fail=1;; \
+		esac; \
+	else \
+		echo "warning: cannot determine repo slug (no GITHUB_REPOSITORY, no origin remote) -- skipping source-URL pin"; \
+	fi; \
+	dkmsver="$$(sed -n 's/^PACKAGE_VERSION="\(.*\)"/\1/p' dkms.conf)"; \
+	if [ "$$pkgver" != "$$dkmsver" ]; then \
+		echo "::error file=packaging/aur/PKGBUILD::pkgver=$$pkgver disagrees with dkms.conf PACKAGE_VERSION=$$dkmsver (RELEASING.md: bump together)"; \
+		fail=1; \
+	fi; \
+	if grep -q "sha256sums=('SKIP')" packaging/aur/PKGBUILD && git tag --list "v$$pkgver" | grep -q .; then \
+		echo "::error file=packaging/aur/PKGBUILD::v$$pkgver is tagged but sha256sums is still SKIP -- run updpkgsums (issue #46)"; \
+		fail=1; \
+	fi; \
+	exit $$fail
 
 clean:
 	@if [ -d "$(KDIR)" ]; then $(MAKE) -C "$(KDIR)" M="$(PWD)" clean; fi
@@ -274,4 +385,4 @@ install-deck: all
 uninstall-deck:
 	rm -rf "$(DECK_PREFIX)"
 
-.PHONY: all module daemon mock test-mock priv-drop-test render-hook-test mount-ns-test thread-exit-migration-test thread-spawn-after-protect-test ioctl-fuzz baseline-test ac-report-status-test ac-report-url-test ac-report-cooldown-test ci clean install uninstall install-deck uninstall-deck
+.PHONY: all module daemon mock test-mock priv-drop-test render-hook-test mount-ns-test thread-exit-migration-test thread-spawn-after-protect-test ioctl-fuzz baseline-test ac-report-status-test ac-report-url-test ac-report-cooldown-test ci ci-aur-check clean install uninstall install-deck uninstall-deck

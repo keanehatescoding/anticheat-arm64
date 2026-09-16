@@ -28,142 +28,23 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Build with warnings-as-errors, run the full mock suite
-        run: make ci
-
-      # The userspace daemon is portable C, but this project ships it for
-      # ARM64 -- prove the target-arch build compiles with warnings-as-
-      # errors too (the module job below does the same for the daemon
-      # alongside the LKM; this keeps the failure attribution in the
-      # userspace job where it belongs).
-      - name: Cross-build the daemon for aarch64 (compile check)
+      # Gate tooling `make ci` enforces but doesn't install itself: the
+      # aarch64 cross-compiler and shellcheck. Everything else the gate
+      # needs (gcc, python3, file, git) is already on ubuntu-latest.
+      - name: Install gate tooling (cross-compiler, shellcheck)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
-          make CC=aarch64-linux-gnu-gcc CFLAGS="-O2 -Wall -Wextra -Werror" daemon
-          file anticheat | grep -q 'aarch64\|ARM aarch64'
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu shellcheck
 
-      - name: Build the privilege-drop test helper (compile check only)
-        run: make CFLAGS="-O2 -Wall -Wextra -Werror" priv-drop-test
-
-      - name: Build the render-hook test helper (compile check only)
-        run: make CFLAGS="-O2 -Wall -Wextra -Werror" render-hook-test
-
-      - name: Build the mount-namespace test helper (compile check only)
-        run: make CFLAGS="-O2 -Wall -Wextra -Werror" mount-ns-test
-
-      # Dry run only -- against the mock, not a real kernel module, so
-      # this proves the harness itself is correct (doesn't crash from its
-      # own bugs, exercises every ioctl), not that the kernel survives
-      # malformed input. IOCTL_FUZZ_SAFE_POINTERS_ONLY=1 because the mock
-      # is plain userspace code with no copy_from_user()/access_ok() of
-      # its own -- handing it a NULL/unmapped/wild pointer crashes the
-      # mock, not the module under test. See ioctl_fuzz.c's own header
-      # comment and README's "ioctl fuzzing" section for the real run
-      # (root, a loaded module, full pointer-corruption fuzzing included).
-      - name: ioctl fuzz harness dry run against the mock (no root)
-        run: |
-          make CFLAGS="-O2 -Wall -Wextra -Werror" ioctl-fuzz mock daemon
-          LD_PRELOAD="$PWD/test/libmock_anticheat.so" \
-            AC_MOCK_ROOT=1 \
-            AC_MOCK_STATE="/tmp/ac_mock_fuzz_state_ci" \
-            IOCTL_FUZZ_SAFE_POINTERS_ONLY=1 \
-            ./test/ioctl_fuzz 1000 20260818
-
-      - name: Ban-pipeline server test (no root, pure Python + HTTP)
-        run: ./server/test_server.sh
-
-      - name: RateLimiter bucket-pruning unit test (no root, no network)
-        run: python3 server/test_ratelimiter_unit.py
-
-      - name: Store per-client report retention unit test (no root, no network)
-        run: python3 server/test_store_retention_unit.py
-
-      # A rebase, auto-fix commit, or artifact re-download can silently
-      # drop a script's mode from 100755 to 100644 (this happened to
-      # scripts/kasan_boot_test.sh once, and only surfaced when the
-      # nightly kasan-boot.yml workflow failed trying to exec it). Catch
-      # that regression class here, in the PR that introduces it, rather
-      # than waiting on whichever scheduled workflow happens to invoke
-      # the affected script next.
-      - name: Verify scripts kept their executable bit
-        run: |
-          fail=0
-          while IFS= read -r f; do
-            if [ ! -x "$f" ]; then
-              echo "::error file=$f::executable bit missing (mode $(stat -c%a "$f"))"
-              fail=1
-            fi
-          done < <(git ls-files '*.sh')
-          exit "$fail"
-
-      - name: Shellcheck the shell scripts
-        run: |
-          command -v shellcheck >/dev/null 2>&1 || \
-            { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
-          git ls-files '*.sh' | xargs shellcheck
-
-      # AUR publish correctness (see issue #46): packaging/aur/.SRCINFO is
-      # a checked-in, hand-regenerated copy of PKGBUILD metadata
-      # (makepkg --printsrcinfo), so it drifts silently -- arch = x86_64
-      # survived the ARM64-only port long after PKGBUILD moved to
-      # aarch64. A stale .SRCINFO publishes the wrong architecture to AUR,
-      # and a pkgver cross-check against dkms.conf catches the RELEASING.md
-      # "must move together" bump landing in only one place. Textual
-      # comparison only: no makepkg/namcap on the ubuntu runner, and no
-      # network (the sha256sums SKIP placeholder itself stays legitimate
-      # until v<pkgver> is actually tagged -- filling it needs the real
-      # release tarball, not CI).
-      - name: Verify AUR packaging metadata is in sync
-        run: |
-          fail=0
-          pkgbase="$(sed -n 's/^pkgbase=//p' packaging/aur/PKGBUILD)"
-          pkgver="$(sed -n 's/^pkgver=//p' packaging/aur/PKGBUILD)"
-          pkgrel="$(sed -n 's/^pkgrel=//p' packaging/aur/PKGBUILD)"
-          pkgarch="$(sed -n "s/^arch=('\(.*\)')/\1/p" packaging/aur/PKGBUILD)"
-          for field in "pkgver = $pkgver" "pkgrel = $pkgrel" "arch = $pkgarch"; do
-            if ! grep -qF "$field" packaging/aur/.SRCINFO; then
-              echo "::error file=packaging/aur/.SRCINFO::missing '$field' -- regenerate with 'makepkg --printsrcinfo > .SRCINFO'"
-              fail=1
-            fi
-          done
-          # Compare the complete filename::URL entry, not just the tarball
-          # name: a URL-only change in PKGBUILD keeps the filename but
-          # builds from a different location than .SRCINFO advertises.
-          # Expand the variables PKGBUILD's source= line uses ($pkgbase,
-          # $pkgver/${pkgver}) so the result matches .SRCINFO's already-
-          # expanded form (`source = file::url`, no quotes).
-          src_raw="$(sed -n 's/^source=("\(.*\)")$/\1/p' packaging/aur/PKGBUILD)"
-          src_expanded="$(printf '%s\n' "$src_raw" | sed -e "s/\$pkgbase/$pkgbase/g" -e "s/\${pkgver}/$pkgver/g" -e "s/\$pkgver/$pkgver/g")"
-          if ! grep -qF "source = $src_expanded" packaging/aur/.SRCINFO; then
-            echo "::error file=packaging/aur/.SRCINFO::source entry out of sync -- expected 'source = $src_expanded'"
-            fail=1
-          fi
-          # The tarball must be fetched from this repo's own tags. A stale
-          # owner/repo in source= 404s on first publish (or, worse, builds
-          # someone else's code if the name ever resolves elsewhere), and
-          # GitHub names the top-level dir after the repo, so the PKGBUILD
-          # cd lines must match too -- covered by comparing .SRCINFO
-          # against the same source= line above.
-          src_url="$(printf '%s\n' "$src_expanded" | sed -n 's/.*:://p')"
-          case "$src_url" in
-            "https://github.com/${GITHUB_REPOSITORY}/archive/"*)
-              ;;
-            *)
-              echo "::error file=packaging/aur/PKGBUILD::source URL '$src_url' does not point at this repo (${GITHUB_REPOSITORY}) -- first AUR publish would 404"
-              fail=1
-              ;;
-          esac
-          dkmsver="$(sed -n 's/^PACKAGE_VERSION="\(.*\)"/\1/p' dkms.conf)"
-          if [ "$pkgver" != "$dkmsver" ]; then
-            echo "::error file=packaging/aur/PKGBUILD::pkgver=$pkgver disagrees with dkms.conf PACKAGE_VERSION=$dkmsver (RELEASING.md: bump together)"
-            fail=1
-          fi
-          if grep -q "sha256sums=('SKIP')" packaging/aur/PKGBUILD && git tag --list "v$pkgver" | grep -q .; then
-            echo "::error file=packaging/aur/PKGBUILD::v$pkgver is tagged but sha256sums is still SKIP -- run updpkgsums (issue #46)"
-            fail=1
-          fi
-          exit "$fail"
+      # The full no-root userspace gate lives in the Makefile's `ci`
+      # target -- the same gate contributors run locally via `make ci`.
+      # Keep this job a thin wrapper: NEVER add a userspace step here
+      # that `make ci` doesn't cover, or contributors get a green
+      # `make ci` locally and a red PR (#77). The `ci` target skips only
+      # what can't run here -- nothing, since the step above installs
+      # both tools it would otherwise degrade without.
+      - name: Build with warnings-as-errors, run the full userspace gate
+        run: make ci
 
   # --- kernel module: compile smoke test against a pinned modern tree ---
   # The module targets kernels >= 6.12 (uses sized_strscpy, the _noprof
