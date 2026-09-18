@@ -292,13 +292,16 @@ ci:
 		echo "warning: not a git checkout -- skipping executable-bit, shellcheck, and AUR metadata checks"; \
 	fi
 
-# AUR publish correctness (see issue #46): packaging/aur/.SRCINFO is a
+# Packaging version consistency (see issues #46, #91): packaging/aur/.SRCINFO is a
 # checked-in, hand-regenerated copy of PKGBUILD metadata (makepkg
 # --printsrcinfo), so it drifts silently -- arch = x86_64 survived the
 # ARM64-only port long after PKGBUILD moved to aarch64. A stale .SRCINFO
-# publishes the wrong architecture to AUR, and a pkgver cross-check against
-# dkms.conf catches the RELEASING.md "must move together" bump landing in
-# only one place. Textual comparison only: no makepkg/namcap needed, and no
+# publishes the wrong architecture to AUR, and the version cross-checks below
+# catch the RELEASING.md "must move together" bump landing in only one place.
+# RELEASING.md names dkms.conf PACKAGE_VERSION + MODULE_VERSION as the primary
+# pair, with PKGBUILD pkgver plus the Debian changelog and Fedora spec kept in
+# step at release time -- so all five are compared here, not just AUR vs DKMS.
+# Textual comparison only: no makepkg/namcap needed, and no
 # network (the sha256sums SKIP placeholder stays legitimate until v<pkgver>
 # is actually tagged). Part of `make ci`, the single place the userspace
 # gate is written down (#77).
@@ -342,6 +345,21 @@ ci-aur-check:
 	dkmsver="$$(sed -n 's/^PACKAGE_VERSION="\(.*\)"/\1/p' dkms.conf)"; \
 	if [ "$$pkgver" != "$$dkmsver" ]; then \
 		echo "::error file=packaging/aur/PKGBUILD::pkgver=$$pkgver disagrees with dkms.conf PACKAGE_VERSION=$$dkmsver (RELEASING.md: bump together)"; \
+		fail=1; \
+	fi; \
+	modver="$$(sed -n 's/^MODULE_VERSION("\(.*\)");/\1/p' src/anticheat_module.c)"; \
+	if [ "$$modver" != "$$dkmsver" ]; then \
+		echo "::error file=src/anticheat_module.c::MODULE_VERSION=$$modver disagrees with dkms.conf PACKAGE_VERSION=$$dkmsver (RELEASING.md: bump together)"; \
+		fail=1; \
+	fi; \
+	debver="$$(sed -n 's/^hypranticheat (\([^-)]*\).*/\1/p' packaging/debian/changelog)"; \
+	if [ "$$debver" != "$$dkmsver" ]; then \
+		echo "::error file=packaging/debian/changelog::version=$$debver disagrees with dkms.conf PACKAGE_VERSION=$$dkmsver (RELEASING.md: bump together)"; \
+		fail=1; \
+	fi; \
+	specver="$$(sed -n 's/^Version:[[:space:]]*\(.*\)/\1/p' packaging/fedora/hypranticheat.spec)"; \
+	if [ "$$specver" != "$$dkmsver" ]; then \
+		echo "::error file=packaging/fedora/hypranticheat.spec::Version=$$specver disagrees with dkms.conf PACKAGE_VERSION=$$dkmsver (RELEASING.md: bump together)"; \
 		fail=1; \
 	fi; \
 	if grep -q "sha256sums=('SKIP')" packaging/aur/PKGBUILD && git tag --list "v$$pkgver" | grep -q .; then \
