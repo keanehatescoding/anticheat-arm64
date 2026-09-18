@@ -48,13 +48,73 @@ int main(void)
               strcmp(dest.port, "8787") == 0,
           "literal IPv4:port parses to a TCP destination");
 
-    /* an IPv6 literal has multiple colons -- strrchr() (last colon) is
-     * what picks out the port, same as before this change */
-    CHECK(ac_report_parse_url("::1:8787", &dest) == 0 &&
+    /* Bracketed IPv6 literals (issue #81): the only unambiguous way to
+     * express host:port for a literal containing colons. */
+    CHECK(ac_report_parse_url("[::1]:8787", &dest) == 0 &&
               !dest.is_unix &&
               strcmp(dest.host, "::1") == 0 &&
               strcmp(dest.port, "8787") == 0,
-          "last colon splits host:port even with extra colons in host");
+          "bracketed [ipv6]:port parses to a TCP destination");
+
+    CHECK(ac_report_parse_url("[2001:db8::1]:9000", &dest) == 0 &&
+              !dest.is_unix &&
+              strcmp(dest.host, "2001:db8::1") == 0 &&
+              strcmp(dest.port, "9000") == 0,
+          "bracketed long-form IPv6 parses to a TCP destination");
+
+    /* A bare IPv6 literal without brackets is ambiguous with the
+     * host:port split (strrchr), so it must be rejected with a hint
+     * toward the bracketed form -- including the bare "::1" with no
+     * port, which previously mis-split into host ":" port "1". */
+    CHECK(ac_report_parse_url("::1:8787", &dest) == -1,
+          "bare IPv6 host:port without brackets is rejected");
+    CHECK(ac_report_parse_url("::1", &dest) == -1,
+          "bare IPv6 without port is rejected");
+
+    CHECK(ac_report_parse_url("[::1]", &dest) == -1,
+          "bracketed IPv6 without :port is rejected");
+    CHECK(ac_report_parse_url("[::1]:", &dest) == -1,
+          "bracketed IPv6 with an empty port is rejected");
+    CHECK(ac_report_parse_url("[]:8787", &dest) == -1,
+          "bracketed IPv6 with an empty host is rejected");
+    CHECK(ac_report_parse_url("[::1:8787", &dest) == -1,
+          "IPv6 missing its closing bracket is rejected");
+    CHECK(ac_report_parse_url("foo[bar]:80", &dest) == -1,
+          "misplaced brackets outside [ipv6]:port are rejected");
+
+    /* Overlong URLs (issue #81): the host:port branch must reject, not
+     * truncate, mirroring the unix:// branch directly above it. */
+    {
+        char longhost[300];
+        char longurl[sizeof(longhost) + 8];
+        size_t i;
+
+        for (i = 0; i + 1 < sizeof(longhost); i++)
+            longhost[i] = 'a';
+        longhost[sizeof(longhost) - 1] = '\0';
+        snprintf(longurl, sizeof(longurl), "%s:8787", longhost);
+        CHECK(ac_report_parse_url(longurl, &dest) == -1,
+              "a host:port URL longer than the host buffer is rejected, "
+              "not silently truncated");
+    }
+    {
+        char longport[64];
+
+        memset(longport, '1', sizeof(longport) - 1);
+        longport[sizeof(longport) - 1] = '\0';
+        {
+            char url[sizeof(longport) + 16];
+
+            snprintf(url, sizeof(url), "example.com:%s", longport);
+            CHECK(ac_report_parse_url(url, &dest) == -1,
+                  "a host:port URL with an overlong port is rejected");
+        }
+    }
+
+    CHECK(ac_report_parse_url("example.com:", &dest) == -1,
+          "a URL with an empty port is rejected");
+    CHECK(ac_report_parse_url(":8787", &dest) == -1,
+          "a URL with an empty host is rejected");
 
     CHECK(ac_report_parse_url("no-colon-here", &dest) == -1,
           "a URL with no colon and no unix:// prefix is rejected");
