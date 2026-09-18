@@ -222,6 +222,11 @@ jobs:
             module:
               - 'src/anticheat_module.c'
               - 'src/anticheat.h'
+              # Linked into anticheat.ko via anticheat-objs (Makefile:97);
+              # a change here alters the loaded module, so it must trigger
+              # the KASAN fuzz seed like any other module source (#89).
+              - 'src/sha256.c'
+              - 'src/sha256.h'
               - 'test/ioctl_fuzz.c'
               # The harness itself. Without this entry a change to the
               # KASAN script skips the only job that runs it, so harness
