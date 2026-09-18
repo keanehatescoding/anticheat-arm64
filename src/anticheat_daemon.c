@@ -3952,14 +3952,25 @@ static void ac_report_note_success(void)
  * hostnames and IPv4 literals pass through unchanged; IPv6 literals
  * (which ac_report_parse_url() stores bare, without brackets, for
  * getaddrinfo()) get their brackets back, since HTTP authority syntax
- * (RFC 9110 section 7.2) requires them. */
+ * (RFC 9110 section 7.2) requires them. The port is appended as
+ * ":port" unless it is the HTTP default (80) or empty (unix://
+ * destinations carry no port) -- RFC 7230 section 5.4 / RFC 9110
+ * section 7.2 require the port when it differs from the default, so
+ * that multi-vhost servers routing by authority see "[::1]:9000"
+ * rather than a bare "[::1]". */
 static void ac_report_host_header(const struct ac_report_dest *dest,
                                   char *out, size_t outsz)
 {
+    char base[sizeof(dest->host) + 2];
+
     if (strchr(dest->host, ':'))
-        snprintf(out, outsz, "[%s]", dest->host);
+        snprintf(base, sizeof(base), "[%s]", dest->host);
     else
-        snprintf(out, outsz, "%s", dest->host);
+        snprintf(base, sizeof(base), "%s", dest->host);
+    if (dest->port[0] && strcmp(dest->port, "80") != 0)
+        snprintf(out, outsz, "%s:%s", base, dest->port);
+    else
+        snprintf(out, outsz, "%s", base);
 }
 
 static void ac_report(const char *event_type, const char *detail)
@@ -4014,7 +4025,7 @@ static void ac_report(const char *event_type, const char *detail)
      * when it truncated req[] -- a long AC_REPORT_KEY could otherwise
      * silently truncate while Content-Length still names the full body. */
     {
-        char host_header[sizeof(dest.host) + 2];
+        char host_header[sizeof(dest.host) + sizeof(dest.port) + 4];
 
         ac_report_host_header(&dest, host_header, sizeof(host_header));
         {

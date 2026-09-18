@@ -116,29 +116,58 @@ int main(void)
     CHECK(ac_report_parse_url(":8787", &dest) == -1,
           "a URL with an empty host is rejected");
 
-    /* HTTP Host: header formatting: bare hostnames/IPv4 pass through,
-     * IPv6 literals get their brackets back (RFC 9110 authority syntax),
-     * since dest.host stores the bare literal for getaddrinfo(). */
+    /* HTTP Host: header formatting: bare hostnames/IPv4 pass through
+     * with a non-default port appended, IPv6 literals get their
+     * brackets back (RFC 9110 authority syntax) plus the port, since
+     * dest.host stores the bare literal for getaddrinfo(). The default
+     * HTTP port (80) is omitted; unix:// destinations carry no port so
+     * their fixed "localhost" placeholder stays bare. */
     {
-        char hdr[sizeof(dest.host) + 2];
+        char hdr[sizeof(dest.host) + sizeof(dest.port) + 4];
 
         CHECK(ac_report_parse_url("example.com:8787", &dest) == 0,
               "host header fixture parses");
         ac_report_host_header(&dest, hdr, sizeof(hdr));
-        CHECK(strcmp(hdr, "example.com") == 0,
-              "hostname passes through the Host header unchanged");
+        CHECK(strcmp(hdr, "example.com:8787") == 0,
+              "hostname keeps its non-default port in the Host header");
 
         CHECK(ac_report_parse_url("127.0.0.1:8787", &dest) == 0,
               "IPv4 fixture parses");
         ac_report_host_header(&dest, hdr, sizeof(hdr));
-        CHECK(strcmp(hdr, "127.0.0.1") == 0,
-              "IPv4 literal passes through the Host header unchanged");
+        CHECK(strcmp(hdr, "127.0.0.1:8787") == 0,
+              "IPv4 literal keeps its non-default port in the Host header");
 
         CHECK(ac_report_parse_url("[::1]:8787", &dest) == 0,
               "IPv6 fixture parses");
         ac_report_host_header(&dest, hdr, sizeof(hdr));
+        CHECK(strcmp(hdr, "[::1]:8787") == 0,
+              "IPv6 literal regains brackets and keeps its port in "
+              "the Host header");
+
+        CHECK(ac_report_parse_url("[::1]:9000", &dest) == 0,
+              "IPv6 non-default-port fixture parses");
+        ac_report_host_header(&dest, hdr, sizeof(hdr));
+        CHECK(strcmp(hdr, "[::1]:9000") == 0,
+              "IPv6 literal formats a non-default port as [host]:port");
+
+        CHECK(ac_report_parse_url("example.com:80", &dest) == 0,
+              "default-port fixture parses");
+        ac_report_host_header(&dest, hdr, sizeof(hdr));
+        CHECK(strcmp(hdr, "example.com") == 0,
+              "default HTTP port 80 is omitted from the Host header");
+
+        CHECK(ac_report_parse_url("[::1]:80", &dest) == 0,
+              "IPv6 default-port fixture parses");
+        ac_report_host_header(&dest, hdr, sizeof(hdr));
         CHECK(strcmp(hdr, "[::1]") == 0,
-              "IPv6 literal regains brackets in the Host header");
+              "IPv6 literal omits default port 80 but keeps brackets");
+
+        CHECK(ac_report_parse_url("unix:///run/anticheat/ac_server.sock",
+                                  &dest) == 0,
+              "unix fixture parses for the Host header");
+        ac_report_host_header(&dest, hdr, sizeof(hdr));
+        CHECK(strcmp(hdr, "localhost") == 0,
+              "unix-socket placeholder stays bare with no port");
     }
 
     CHECK(ac_report_parse_url("no-colon-here", &dest) == -1,
@@ -193,6 +222,87 @@ int main(void)
                   strlen(dest.sock_path) == cap - 1,
               "a unix socket path at exactly the longest length that "
               "fits is accepted");
+    }
+
+    /* ac_report() request-size guard (issue #82): an oversized
+     * formatted request must be rejected before DNS or connect(), the
+     * warning must fire exactly once across repeated reports, and the
+     * endpoint failure state must stay untouched (the condition is
+     * permanent -- driven by key/URL lengths -- not a delivery
+     * failure, so it must neither increment the consecutive-failure
+     * counter nor arm the cooldown). Loopback with a closed port is
+     * used deliberately: if the guard ever regressed, the report
+     * would fail fast via refused connect() (visible as failure
+     * state + "could not connect" output) instead of stalling for a
+     * full resolve timeout. */
+    {
+        char bigkey[3000];
+        size_t i;
+        int saved_stderr;
+        FILE *cap;
+        char capbuf[4096];
+        size_t caplen;
+        int warns;
+        const char *p;
+
+        for (i = 0; i + 1 < sizeof(bigkey); i++)
+            bigkey[i] = 'k';
+        bigkey[sizeof(bigkey) - 1] = '\0';
+
+        ac_report_consec_fail = 0;
+        ac_report_cooldown_until.tv_sec = 0;
+        ac_report_cooldown_until.tv_nsec = 0;
+        ac_report_req_too_large_warned = 0;
+        setenv("AC_REPORT_URL", "127.0.0.1:9", 1);
+        setenv("AC_REPORT_KEY", bigkey, 1);
+
+        saved_stderr = dup(STDERR_FILENO);
+        CHECK(saved_stderr >= 0, "oversized-guard fixture can dup stderr");
+        cap = tmpfile();
+        CHECK(cap != NULL, "oversized-guard fixture can open a capture");
+        if (saved_stderr >= 0 && cap != NULL) {
+            fflush(stderr);
+            CHECK(dup2(fileno(cap), STDERR_FILENO) >= 0,
+                  "oversized-guard fixture can redirect stderr");
+            ac_report("TEST", "detail");
+            ac_report("TEST", "detail");
+            fflush(stderr);
+            CHECK(dup2(saved_stderr, STDERR_FILENO) >= 0,
+                  "oversized-guard fixture restores stderr");
+        }
+        if (saved_stderr >= 0)
+            close(saved_stderr);
+        if (cap != NULL) {
+            rewind(cap);
+            caplen = fread(capbuf, 1, sizeof(capbuf) - 1, cap);
+            capbuf[caplen] = '\0';
+            fclose(cap);
+        } else {
+            capbuf[0] = '\0';
+        }
+        unsetenv("AC_REPORT_URL");
+        unsetenv("AC_REPORT_KEY");
+
+        warns = 0;
+        for (p = capbuf; (p = strstr(p, "request too large")) != NULL; p++)
+            warns++;
+        CHECK(warns == 1,
+              "an oversized request warns exactly once across repeated "
+              "reports");
+        CHECK(strstr(capbuf, "could not resolve") == NULL &&
+              strstr(capbuf, "could not connect") == NULL,
+              "an oversized request never reaches DNS or connect");
+        CHECK(ac_report_consec_fail == 0,
+              "an oversized request leaves the failure counter untouched");
+        CHECK(ac_report_cooldown_until.tv_sec == 0 &&
+              ac_report_cooldown_until.tv_nsec == 0,
+              "an oversized request does not arm the cooldown");
+        CHECK(ac_report_req_too_large_warned == 1,
+              "the oversized-request warn-once latch is set");
+        ac_report_req_too_large_warned = 0;   /* no test pollution */
+        ac_report_consec_fail = 0;
+        ac_report_cooldown_until.tv_sec = 0;
+        ac_report_cooldown_until.tv_nsec = 0;
     }
 
     if (failures) {
