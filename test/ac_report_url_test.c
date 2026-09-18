@@ -116,6 +116,31 @@ int main(void)
     CHECK(ac_report_parse_url(":8787", &dest) == -1,
           "a URL with an empty host is rejected");
 
+    /* HTTP Host: header formatting: bare hostnames/IPv4 pass through,
+     * IPv6 literals get their brackets back (RFC 9110 authority syntax),
+     * since dest.host stores the bare literal for getaddrinfo(). */
+    {
+        char hdr[sizeof(dest.host) + 2];
+
+        CHECK(ac_report_parse_url("example.com:8787", &dest) == 0,
+              "host header fixture parses");
+        ac_report_host_header(&dest, hdr, sizeof(hdr));
+        CHECK(strcmp(hdr, "example.com") == 0,
+              "hostname passes through the Host header unchanged");
+
+        CHECK(ac_report_parse_url("127.0.0.1:8787", &dest) == 0,
+              "IPv4 fixture parses");
+        ac_report_host_header(&dest, hdr, sizeof(hdr));
+        CHECK(strcmp(hdr, "127.0.0.1") == 0,
+              "IPv4 literal passes through the Host header unchanged");
+
+        CHECK(ac_report_parse_url("[::1]:8787", &dest) == 0,
+              "IPv6 fixture parses");
+        ac_report_host_header(&dest, hdr, sizeof(hdr));
+        CHECK(strcmp(hdr, "[::1]") == 0,
+              "IPv6 literal regains brackets in the Host header");
+    }
+
     CHECK(ac_report_parse_url("no-colon-here", &dest) == -1,
           "a URL with no colon and no unix:// prefix is rejected");
 

@@ -3717,12 +3717,15 @@ static int ac_http_status_code(const char *resp)
 #define AC_REPORT_UNIX_PREFIX "unix://"
 
 /* A parsed AC_REPORT_URL: either a TCP host:port, or an AF_UNIX socket
- * path. `host` is dual-purpose -- for TCP it's the bare hostname passed
- * to ac_resolve_timeout() and reused verbatim as the HTTP Host: header;
- * for a unix:// destination there's no real hostname, so it's filled
- * with a fixed "localhost" placeholder for the Host: header only (the
- * same convention curl's --unix-socket uses), and sock_path carries the
- * actual filesystem path instead. */
+ * path. `host` is the bare hostname passed to ac_resolve_timeout() -- for
+ * bracketed IPv6 input ([::1]:8787) this is the interior without brackets
+ * (::1), since getaddrinfo() wants the bare literal. The HTTP Host:
+ * header is derived from it at request-format time via
+ * ac_report_host_header(), which re-adds brackets around colon-containing
+ * hosts; for a unix:// destination there's no real hostname, so it's
+ * filled with a fixed "localhost" placeholder for the Host: header only
+ * (the same convention curl's --unix-socket uses), and sock_path carries
+ * the actual filesystem path instead. */
 struct ac_report_dest {
     int is_unix;
     char host[256];
@@ -3945,6 +3948,20 @@ static void ac_report_note_success(void)
     ac_report_cooldown_until.tv_nsec = 0;
 }
 
+/* Formats the HTTP Host: header value for a parsed destination. Bare
+ * hostnames and IPv4 literals pass through unchanged; IPv6 literals
+ * (which ac_report_parse_url() stores bare, without brackets, for
+ * getaddrinfo()) get their brackets back, since HTTP authority syntax
+ * (RFC 9110 section 7.2) requires them. */
+static void ac_report_host_header(const struct ac_report_dest *dest,
+                                  char *out, size_t outsz)
+{
+    if (strchr(dest->host, ':'))
+        snprintf(out, outsz, "[%s]", dest->host);
+    else
+        snprintf(out, outsz, "%s", dest->host);
+}
+
 static void ac_report(const char *event_type, const char *detail)
 {
     const char *url = getenv("AC_REPORT_URL");
@@ -3997,24 +4014,29 @@ static void ac_report(const char *event_type, const char *detail)
      * when it truncated req[] -- a long AC_REPORT_KEY could otherwise
      * silently truncate while Content-Length still names the full body. */
     {
-        int reqn = snprintf(req, sizeof(req),
-                 "POST /report HTTP/1.1\r\n"
-                 "Host: %s\r\n"
-                 "Authorization: Bearer %s\r\n"
-                 "Content-Type: application/json\r\n"
-                 "Content-Length: %zu\r\n"
-                 "Connection: close\r\n"
-                 "\r\n"
-                 "%s",
-                 dest.host, key, strlen(body), body);
+        char host_header[sizeof(dest.host) + 2];
 
-        if (reqn < 0 || (size_t)reqn >= sizeof(req)) {
-            if (!ac_report_req_too_large_warned) {
-                ac_report_req_too_large_warned = 1;
-                fprintf(stderr, "ac_report: request too large to send "
-                        "(AC_REPORT_KEY/AC_REPORT_URL too long?)\n");
+        ac_report_host_header(&dest, host_header, sizeof(host_header));
+        {
+            int reqn = snprintf(req, sizeof(req),
+                     "POST /report HTTP/1.1\r\n"
+                     "Host: %s\r\n"
+                     "Authorization: Bearer %s\r\n"
+                     "Content-Type: application/json\r\n"
+                     "Content-Length: %zu\r\n"
+                     "Connection: close\r\n"
+                     "\r\n"
+                     "%s",
+                     host_header, key, strlen(body), body);
+
+            if (reqn < 0 || (size_t)reqn >= sizeof(req)) {
+                if (!ac_report_req_too_large_warned) {
+                    ac_report_req_too_large_warned = 1;
+                    fprintf(stderr, "ac_report: request too large to send "
+                            "(AC_REPORT_KEY/AC_REPORT_URL too long?)\n");
+                }
+                return;
             }
-            return;
         }
     }
 
