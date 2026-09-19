@@ -3814,6 +3814,16 @@ static int ac_report_parse_url(const char *url, struct ac_report_dest *out)
                         "ac_report: AC_REPORT_URL port too long\n");
                 return -1;
             }
+            /* A second authority delimiter means a malformed URL, not a
+             * port: "[::1]:9000:extra" would otherwise store
+             * "9000:extra" as the port and emit an invalid authority
+             * value from ac_report_host_header(). */
+            if (strpbrk(portpart, ":[]")) {
+                fprintf(stderr,
+                        "ac_report: AC_REPORT_URL port must not contain "
+                        "':', '[' or ']'\n");
+                return -1;
+            }
             /* Brackets are reserved for IPv6 literals -- anything else
              * enclosed ([example.com], [127.0.0.1]) is malformed and
              * must not fall through to getaddrinfo() as a DNS name or
@@ -3875,6 +3885,17 @@ static int ac_report_parse_url(const char *url, struct ac_report_dest *out)
             if (strlen(colon + 1) >= sizeof(out->port)) {
                 fprintf(stderr,
                         "ac_report: AC_REPORT_URL port too long\n");
+                return -1;
+            }
+            /* Same authority-delimiter guard as the bracketed branch
+             * above: brackets never belong in a host:port port. (A ':'
+             * cannot occur here by construction -- colon is the last
+             * one in the URL -- but checking all three keeps the two
+             * branches uniform.) */
+            if (strpbrk(colon + 1, ":[]")) {
+                fprintf(stderr,
+                        "ac_report: AC_REPORT_URL port must not contain "
+                        "':', '[' or ']'\n");
                 return -1;
             }
             snprintf(out->port, sizeof(out->port), "%s", colon + 1);

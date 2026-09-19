@@ -92,6 +92,17 @@ int main(void)
     CHECK(ac_report_parse_url("[example:com]:80", &dest) == -1,
           "a colon-containing non-IPv6 value inside brackets is "
           "rejected");
+    /* A second authority delimiter is a malformed URL, not a port:
+     * "[::1]:9000:extra" must be rejected, not stored as port
+     * "9000:extra" and resolved. */
+    CHECK(ac_report_parse_url("[::1]:9000:extra", &dest) == -1,
+          "a bracketed URL with a second colon in the port is rejected");
+    CHECK(ac_report_parse_url("[::1]:80]", &dest) == -1,
+          "a bracketed URL with ']' in the port is rejected");
+    CHECK(ac_report_parse_url("[::1]:[80]", &dest) == -1,
+          "a bracketed URL with brackets in the port is rejected");
+    CHECK(ac_report_parse_url("example.com:8]0", &dest) == -1,
+          "a host:port URL with ']' in the port is rejected");
     CHECK(ac_report_parse_url("[::ffff:192.0.2.1]:9000", &dest) == 0 &&
               !dest.is_unix &&
               strcmp(dest.host, "::ffff:192.0.2.1") == 0 &&
