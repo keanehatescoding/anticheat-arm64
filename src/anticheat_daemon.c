@@ -61,6 +61,7 @@
 #include <ctype.h>
 #include <elf.h>
 #include <netdb.h>
+#include <arpa/inet.h>
 #include <poll.h>
 #include <pwd.h>
 #include <sys/file.h>
@@ -3717,12 +3718,15 @@ static int ac_http_status_code(const char *resp)
 #define AC_REPORT_UNIX_PREFIX "unix://"
 
 /* A parsed AC_REPORT_URL: either a TCP host:port, or an AF_UNIX socket
- * path. `host` is dual-purpose -- for TCP it's the bare hostname passed
- * to ac_resolve_timeout() and reused verbatim as the HTTP Host: header;
- * for a unix:// destination there's no real hostname, so it's filled
- * with a fixed "localhost" placeholder for the Host: header only (the
- * same convention curl's --unix-socket uses), and sock_path carries the
- * actual filesystem path instead. */
+ * path. `host` is the bare hostname passed to ac_resolve_timeout() -- for
+ * bracketed IPv6 input ([::1]:8787) this is the interior without brackets
+ * (::1), since getaddrinfo() wants the bare literal. The HTTP Host:
+ * header is derived from it at request-format time via
+ * ac_report_host_header(), which re-adds brackets around colon-containing
+ * hosts; for a unix:// destination there's no real hostname, so it's
+ * filled with a fixed "localhost" placeholder for the Host: header only
+ * (the same convention curl's --unix-socket uses), and sock_path carries
+ * the actual filesystem path instead. */
 struct ac_report_dest {
     int is_unix;
     char host[256];
@@ -3763,19 +3767,140 @@ static int ac_report_parse_url(const char *url, struct ac_report_dest *out)
     }
 
     {
-        char *colon;
-
-        snprintf(out->host, sizeof(out->host), "%s", url);
-        colon = strrchr(out->host, ':');
-        if (!colon) {
-            fprintf(stderr,
-                    "ac_report: AC_REPORT_URL must be host:port or "
-                    "unix:///path/to/socket\n");
+        /* Issue #81: bound-check before copying, mirroring the unix://
+         * branch above -- snprintf() would otherwise truncate a >255-byte
+         * URL before the split, producing a misleading "must be
+         * host:port" error or a bogus host/port handed to getaddrinfo(). */
+        if (strlen(url) >= sizeof(out->host)) {
+            fprintf(stderr, "ac_report: AC_REPORT_URL too long: %s\n", url);
             return -1;
         }
-        *colon = '\0';
-        snprintf(out->port, sizeof(out->port), "%s", colon + 1);
-        return 0;
+        /* Bracketed IPv6 literals ([::1]:8787). A bare IPv6 address
+         * without brackets is ambiguous with the host:port split
+         * (strrchr picks the last colon, so bare "::1" becomes host ":"
+         * port "1"), so require brackets and reject a colon-containing
+         * host that didn't use them. */
+        if (url[0] == '[') {
+            const char *close = strchr(url, ']');
+            const char *portpart;
+            size_t hostlen;
+
+            if (!close) {
+                fprintf(stderr,
+                        "ac_report: AC_REPORT_URL missing closing ']' in "
+                        "IPv6 literal\n");
+                return -1;
+            }
+            hostlen = (size_t)(close - url - 1);
+            if (hostlen == 0) {
+                fprintf(stderr,
+                        "ac_report: AC_REPORT_URL empty IPv6 host\n");
+                return -1;
+            }
+            if (hostlen >= sizeof(out->host)) {
+                fprintf(stderr, "ac_report: AC_REPORT_URL IPv6 host too "
+                        "long\n");
+                return -1;
+            }
+            if (close[1] != ':' || !close[2]) {
+                fprintf(stderr,
+                        "ac_report: AC_REPORT_URL must be [ipv6]:port, "
+                        "host:port or unix:///path/to/socket\n");
+                return -1;
+            }
+            portpart = close + 2;
+            if (strlen(portpart) >= sizeof(out->port)) {
+                fprintf(stderr,
+                        "ac_report: AC_REPORT_URL port too long\n");
+                return -1;
+            }
+            /* A second authority delimiter means a malformed URL, not a
+             * port: "[::1]:9000:extra" would otherwise store
+             * "9000:extra" as the port and emit an invalid authority
+             * value from ac_report_host_header(). */
+            if (strpbrk(portpart, ":[]")) {
+                fprintf(stderr,
+                        "ac_report: AC_REPORT_URL port must not contain "
+                        "':', '[' or ']'\n");
+                return -1;
+            }
+            /* Brackets are reserved for IPv6 literals -- anything else
+             * enclosed ([example.com], [127.0.0.1]) is malformed and
+             * must not fall through to getaddrinfo() as a DNS name or
+             * IPv4 address. Validate with inet_pton() before copying. */
+            {
+                char ipbuf[sizeof(out->host)];
+                struct in6_addr addr6;
+
+                memcpy(ipbuf, url + 1, hostlen);
+                ipbuf[hostlen] = '\0';
+                if (inet_pton(AF_INET6, ipbuf, &addr6) != 1) {
+                    fprintf(stderr,
+                            "ac_report: AC_REPORT_URL bracketed host is "
+                            "not a valid IPv6 literal\n");
+                    return -1;
+                }
+            }
+            memcpy(out->host, url + 1, hostlen);
+            out->host[hostlen] = '\0';
+            snprintf(out->port, sizeof(out->port), "%s", portpart);
+            if (!out->port[0]) {
+                fprintf(stderr,
+                        "ac_report: AC_REPORT_URL must be host:port or "
+                        "unix:///path/to/socket\n");
+                return -1;
+            }
+            return 0;
+        }
+        if (strchr(url, '[') || strchr(url, ']')) {
+            fprintf(stderr,
+                    "ac_report: AC_REPORT_URL misplaced bracket -- IPv6 "
+                    "literals must use [ipv6]:port\n");
+            return -1;
+        }
+        {
+            char *colon;
+
+            snprintf(out->host, sizeof(out->host), "%s", url);
+            colon = strrchr(out->host, ':');
+            if (!colon) {
+                fprintf(stderr,
+                        "ac_report: AC_REPORT_URL must be host:port or "
+                        "unix:///path/to/socket\n");
+                return -1;
+            }
+            *colon = '\0';
+            if (!out->host[0] || !colon[1]) {
+                fprintf(stderr,
+                        "ac_report: AC_REPORT_URL must be host:port or "
+                        "unix:///path/to/socket\n");
+                return -1;
+            }
+            if (strchr(out->host, ':')) {
+                fprintf(stderr,
+                        "ac_report: AC_REPORT_URL IPv6 literals must use "
+                        "[ipv6]:port\n");
+                return -1;
+            }
+            if (strlen(colon + 1) >= sizeof(out->port)) {
+                fprintf(stderr,
+                        "ac_report: AC_REPORT_URL port too long\n");
+                return -1;
+            }
+            /* Same authority-delimiter guard as the bracketed branch
+             * above: brackets never belong in a host:port port. (A ':'
+             * cannot occur here by construction -- colon is the last
+             * one in the URL -- but checking all three keeps the two
+             * branches uniform.) */
+            if (strpbrk(colon + 1, ":[]")) {
+                fprintf(stderr,
+                        "ac_report: AC_REPORT_URL port must not contain "
+                        "':', '[' or ']'\n");
+                return -1;
+            }
+            snprintf(out->port, sizeof(out->port), "%s", colon + 1);
+            return 0;
+        }
     }
 }
 
@@ -3799,6 +3924,13 @@ static int ac_report_parse_url(const char *url, struct ac_report_dest *out)
 #define AC_REPORT_COOLDOWN_SEC 60
 static unsigned ac_report_consec_fail = 0;
 static struct timespec ac_report_cooldown_until = { 0, 0 };
+
+/* Issue #82: the request-too-large condition below is deterministic and
+ * permanent (driven by AC_REPORT_KEY/AC_REPORT_URL lengths, not by the
+ * endpoint being down), so a 60s cooldown that re-arms forever is the
+ * wrong tool -- and logging once per event floods the log. Latch after
+ * the first message and suppress this path entirely from then on. */
+static int ac_report_req_too_large_warned = 0;
 
 /* Remaining milliseconds from now until deadline; <= 0 means expired.
  * Kept separate (instead of inline arithmetic at each call site) so the
@@ -3855,6 +3987,31 @@ static void ac_report_note_success(void)
     ac_report_cooldown_until.tv_nsec = 0;
 }
 
+/* Formats the HTTP Host: header value for a parsed destination. Bare
+ * hostnames and IPv4 literals pass through unchanged; IPv6 literals
+ * (which ac_report_parse_url() stores bare, without brackets, for
+ * getaddrinfo()) get their brackets back, since HTTP authority syntax
+ * (RFC 9110 section 7.2) requires them. The port is appended as
+ * ":port" unless it is the HTTP default (80) or empty (unix://
+ * destinations carry no port) -- RFC 7230 section 5.4 / RFC 9110
+ * section 7.2 require the port when it differs from the default, so
+ * that multi-vhost servers routing by authority see "[::1]:9000"
+ * rather than a bare "[::1]". */
+static void ac_report_host_header(const struct ac_report_dest *dest,
+                                  char *out, size_t outsz)
+{
+    char base[sizeof(dest->host) + 2];
+
+    if (strchr(dest->host, ':'))
+        snprintf(base, sizeof(base), "[%s]", dest->host);
+    else
+        snprintf(base, sizeof(base), "%s", dest->host);
+    if (dest->port[0] && strcmp(dest->port, "80") != 0)
+        snprintf(out, outsz, "%s:%s", base, dest->port);
+    else
+        snprintf(out, outsz, "%s", base);
+}
+
 static void ac_report(const char *event_type, const char *detail)
 {
     const char *url = getenv("AC_REPORT_URL");
@@ -3897,6 +4054,41 @@ static void ac_report(const char *event_type, const char *detail)
              "{\"client_id\":\"%s\",\"event_type\":\"%s\",\"detail\":\"%s\","
              "\"ts\":%lld}",
              client_id_esc, et_esc, detail_esc, (long long)time(NULL));
+
+    /* Issue #82: the request size is fully determined here (host/key/
+     * body are all known), so validate before touching the network.
+     * Formatting after connect wastes a resolve plus a deadline-bounded
+     * connect on a request that can never be sent, stalling the monitor
+     * loop once per event without ever arming the #9 circuit breaker.
+     * snprintf() returns the length the request would have needed even
+     * when it truncated req[] -- a long AC_REPORT_KEY could otherwise
+     * silently truncate while Content-Length still names the full body. */
+    {
+        char host_header[sizeof(dest.host) + sizeof(dest.port) + 4];
+
+        ac_report_host_header(&dest, host_header, sizeof(host_header));
+        {
+            int reqn = snprintf(req, sizeof(req),
+                     "POST /report HTTP/1.1\r\n"
+                     "Host: %s\r\n"
+                     "Authorization: Bearer %s\r\n"
+                     "Content-Type: application/json\r\n"
+                     "Content-Length: %zu\r\n"
+                     "Connection: close\r\n"
+                     "\r\n"
+                     "%s",
+                     host_header, key, strlen(body), body);
+
+            if (reqn < 0 || (size_t)reqn >= sizeof(req)) {
+                if (!ac_report_req_too_large_warned) {
+                    ac_report_req_too_large_warned = 1;
+                    fprintf(stderr, "ac_report: request too large to send "
+                            "(AC_REPORT_KEY/AC_REPORT_URL too long?)\n");
+                }
+                return;
+            }
+        }
+    }
 
     if (dest.is_unix) {
         struct sockaddr_un sun;
@@ -3990,33 +4182,8 @@ static void ac_report(const char *event_type, const char *detail)
         }
     }
 
-    {
-        int reqn = snprintf(req, sizeof(req),
-                 "POST /report HTTP/1.1\r\n"
-                 "Host: %s\r\n"
-                 "Authorization: Bearer %s\r\n"
-                 "Content-Type: application/json\r\n"
-                 "Content-Length: %zu\r\n"
-                 "Connection: close\r\n"
-                 "\r\n"
-                 "%s",
-                 dest.host, key, strlen(body), body);
-
-        /* snprintf() returns the length the fully-formatted request would
-         * have needed, even when it truncated req[] to fit -- an
-         * unusually long AC_REPORT_KEY (an operator-controlled env var,
-         * but nothing bounds its length before this point) could
-         * otherwise silently truncate the request while Content-Length
-         * still names the full, untruncated body's size: a malformed
-         * request whose own framing header lies about what follows it.
-         * Bail out instead of sending that. */
-        if (reqn < 0 || (size_t)reqn >= sizeof(req)) {
-            fprintf(stderr, "ac_report: request too large to send "
-                    "(AC_REPORT_KEY/AC_REPORT_URL too long?)\n");
-            close(fd);
-            return;
-        }
-    }
+    /* req[] was already formatted and size-checked before connect (see
+     * above), so it is ready to send here with no further validation. */
 
     {
         size_t reqlen = strlen(req);
