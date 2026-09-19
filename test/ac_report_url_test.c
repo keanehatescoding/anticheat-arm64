@@ -82,6 +82,22 @@ int main(void)
     CHECK(ac_report_parse_url("foo[bar]:80", &dest) == -1,
           "misplaced brackets outside [ipv6]:port are rejected");
 
+    /* Brackets are reserved for IPv6 literals: a hostname or IPv4
+     * address inside brackets must be rejected, not stripped and
+     * handed to getaddrinfo() as a DNS name / IPv4 address. */
+    CHECK(ac_report_parse_url("[example.com]:80", &dest) == -1,
+          "a hostname inside brackets is rejected");
+    CHECK(ac_report_parse_url("[127.0.0.1]:80", &dest) == -1,
+          "an IPv4 address inside brackets is rejected");
+    CHECK(ac_report_parse_url("[example:com]:80", &dest) == -1,
+          "a colon-containing non-IPv6 value inside brackets is "
+          "rejected");
+    CHECK(ac_report_parse_url("[::ffff:192.0.2.1]:9000", &dest) == 0 &&
+              !dest.is_unix &&
+              strcmp(dest.host, "::ffff:192.0.2.1") == 0 &&
+              strcmp(dest.port, "9000") == 0,
+          "an IPv4-mapped IPv6 literal in brackets is accepted");
+
     /* Overlong URLs (issue #81): the host:port branch must reject, not
      * truncate, mirroring the unix:// branch directly above it. */
     {

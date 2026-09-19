@@ -61,6 +61,7 @@
 #include <ctype.h>
 #include <elf.h>
 #include <netdb.h>
+#include <arpa/inet.h>
 #include <poll.h>
 #include <pwd.h>
 #include <sys/file.h>
@@ -3812,6 +3813,23 @@ static int ac_report_parse_url(const char *url, struct ac_report_dest *out)
                 fprintf(stderr,
                         "ac_report: AC_REPORT_URL port too long\n");
                 return -1;
+            }
+            /* Brackets are reserved for IPv6 literals -- anything else
+             * enclosed ([example.com], [127.0.0.1]) is malformed and
+             * must not fall through to getaddrinfo() as a DNS name or
+             * IPv4 address. Validate with inet_pton() before copying. */
+            {
+                char ipbuf[sizeof(out->host)];
+                struct in6_addr addr6;
+
+                memcpy(ipbuf, url + 1, hostlen);
+                ipbuf[hostlen] = '\0';
+                if (inet_pton(AF_INET6, ipbuf, &addr6) != 1) {
+                    fprintf(stderr,
+                            "ac_report: AC_REPORT_URL bracketed host is "
+                            "not a valid IPv6 literal\n");
+                    return -1;
+                }
             }
             memcpy(out->host, url + 1, hostlen);
             out->host[hostlen] = '\0';
