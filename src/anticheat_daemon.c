@@ -1636,6 +1636,25 @@ static void renderhook_mark_warned(int pid, unsigned long long st0,
     }
 }
 
+/* Re-arm on confirmed-clean (status 0 only): a hook that is remediated
+ * and later reintroduced in the same (pid, generation) must alert again
+ * instead of being suppressed by the earlier rising edge. Only the
+ * matching (pid, api) slot is cleared; inconclusive statuses (-1) and
+ * not-loaded (-2) leave warn-once state untouched. The caller has
+ * already confirmed st0 is still the live generation, so statuses belong
+ * to it. */
+static void renderhook_clear_warned(int pid, unsigned int api)
+{
+    unsigned int i;
+
+    for (i = 0; i < AC_MAX_PROTS * AC_RENDER_APIS_COUNT; i++) {
+        if (g_renderhook_warned[i].in_use &&
+            g_renderhook_warned[i].pid == pid &&
+            g_renderhook_warned[i].api == api)
+            g_renderhook_warned[i].in_use = 0;
+    }
+}
+
 static void check_render_hooks_periodic(void)
 {
     struct ac_prot_list pl;
@@ -1662,17 +1681,19 @@ static void check_render_hooks_periodic(void)
             continue;   /* exited/reused mid-check: statuses may be another
                          * generation's -- discard, retry next period */
         for (j = 0; j < AC_RENDER_APIS_COUNT; j++) {
-            if (statuses[j] != 1)
-                continue;
-            if (renderhook_already_warned(pl.items[i].pid, st0, j))
-                continue;   /* rising edge already reported for this
-                             * (pid, generation, api) */
-            logmsg(LOG_CRIT, "pid %d (%s): render hook detected in %s "
-                       "(%s differs from a freshly-loaded reference copy -- "
-                       "possible ESP/overlay/render hijack)",
-                       pl.items[i].pid, pl.items[i].comm, libpaths[j],
-                       AC_RENDER_APIS[j].symbol);
-            renderhook_mark_warned(pl.items[i].pid, st0, j);
+            if (statuses[j] == 1) {
+                if (renderhook_already_warned(pl.items[i].pid, st0, j))
+                    continue;   /* rising edge already reported for this
+                                 * (pid, generation, api) */
+                logmsg(LOG_CRIT, "pid %d (%s): render hook detected in %s "
+                           "(%s differs from a freshly-loaded reference copy -- "
+                           "possible ESP/overlay/render hijack)",
+                           pl.items[i].pid, pl.items[i].comm, libpaths[j],
+                           AC_RENDER_APIS[j].symbol);
+                renderhook_mark_warned(pl.items[i].pid, st0, j);
+            } else if (statuses[j] == 0) {
+                renderhook_clear_warned(pl.items[i].pid, j);
+            }
         }
     }
 }
@@ -3424,6 +3445,28 @@ static void baseline_mismatch_mark_warned(int pid, unsigned long long st0,
     }
 }
 
+/* Re-arm on a confirmed matching hash: a segment that mismatched, was
+ * restored to its baselined content, and later mismatches again must
+ * alert again instead of being suppressed by the first rising edge. Only
+ * the matching (pid, path, inode, offset) slot is cleared; segments with
+ * no compatible baseline, hash failures, or unreadable mem leave
+ * warn-once state untouched. */
+static void baseline_mismatch_clear_warned(int pid, const char *path,
+                                           unsigned long long inode,
+                                           unsigned long long offset)
+{
+    unsigned int i;
+
+    for (i = 0; i < AC_BASELINE_MISMATCH_WARNED_MAX; i++) {
+        if (g_baseline_mismatch_warned[i].in_use &&
+            g_baseline_mismatch_warned[i].pid == pid &&
+            g_baseline_mismatch_warned[i].inode == inode &&
+            g_baseline_mismatch_warned[i].offset == offset &&
+            strcmp(g_baseline_mismatch_warned[i].path, path) == 0)
+            g_baseline_mismatch_warned[i].in_use = 0;
+    }
+}
+
 static int check_baselines_periodic(void)
 {
     struct ac_prot_list pl;
@@ -3539,6 +3582,16 @@ static int check_baselines_periodic(void)
                 baseline_mismatch_mark_warned(pl.items[i].pid, st0,
                                               vi->path, vi->inode,
                                               vi->offset);
+            } else {
+                /* Confirmed-clean for this segment: re-arm so a future
+                 * mismatch alerts again. Guarded by the same generation
+                 * recheck -- the hash above may belong to another
+                 * generation if the pid was recycled mid-scan. */
+                if (!proc_same_generation(pl.items[i].pid, st0)) {
+                    break;
+                }
+                baseline_mismatch_clear_warned(pl.items[i].pid, vi->path,
+                                               vi->inode, vi->offset);
             }
         }
         if (mem_fd >= 0)
