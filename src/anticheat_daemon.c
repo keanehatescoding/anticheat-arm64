@@ -1544,13 +1544,98 @@ static int check_render_hooks(int pid)
     return hooked;
 }
 
+/* Forward-declared here (defined alongside anon_baseline_check()) so the
+ * periodic render-hook check below can use the same generation bracket
+ * as the other periodic checks. */
+static int proc_same_generation(int pid, unsigned long long st0);
+
 /* Periodic daemon-loop counterpart: silent unless a hook is actually
  * found (matching anon_baseline_check()/check_baselines_periodic()'s
  * style -- a clean or skipped check every cycle for every protected
  * process would be log noise, not signal). A detection here flows
  * through logmsg() at LOG_CRIT, which -- via the ban-pipeline reporting
  * hook in logmsg() -- also reports it if AC_REPORT_URL is configured,
- * with no separate wiring needed. */
+ * with no separate wiring needed.
+ *
+ * Rising-edge only (issue #73): a persistent hook must not re-report
+ * every AC_RENDER_HOOK_CHECK_INTERVAL tick -- that would flood the
+ * server's reports table and burn the AC_REPORT_FAIL_THRESHOLD circuit
+ * breaker. Slots are keyed by (pid, starttime, api) so a recycled pid
+ * never inherits the previous occupant's reported state, and a second
+ * API hooking later in the same process still alerts. Same
+ * in_use/pid/starttime slot-tracking pattern as g_preload_warned. */
+struct ac_renderhook_warned {
+    int                pid;
+    unsigned long long starttime;       /* always known: callers bracket, see below */
+    int                have_starttime;  /* 0 (unknown) always treated as a new generation */
+    unsigned int       api;             /* index into AC_RENDER_APIS[] */
+    int                in_use;
+};
+static struct ac_renderhook_warned
+    g_renderhook_warned[AC_MAX_PROTS * AC_RENDER_APIS_COUNT];
+
+static void renderhook_warned_forget_stale(const struct ac_prot_list *pl)
+{
+    unsigned int i, j;
+
+    for (i = 0; i < AC_MAX_PROTS * AC_RENDER_APIS_COUNT; i++) {
+        if (!g_renderhook_warned[i].in_use)
+            continue;
+        for (j = 0; j < pl->count; j++)
+            if (pl->items[j].pid == g_renderhook_warned[i].pid)
+                break;
+        if (j == pl->count)
+            g_renderhook_warned[i].in_use = 0;   /* no longer protected */
+    }
+}
+
+static int renderhook_already_warned(int pid, unsigned long long st0,
+                                     unsigned int api)
+{
+    unsigned int i;
+
+    for (i = 0; i < AC_MAX_PROTS * AC_RENDER_APIS_COUNT; i++) {
+        if (!g_renderhook_warned[i].in_use ||
+            g_renderhook_warned[i].pid != pid ||
+            g_renderhook_warned[i].api != api)
+            continue;
+        if (!g_renderhook_warned[i].have_starttime ||
+            st0 != g_renderhook_warned[i].starttime) {
+            /* New generation: the old occupant's warn-once state must not
+             * silence the new process's warning. Drop the stale slot; the
+             * caller re-checks and re-warns below. */
+            g_renderhook_warned[i].in_use = 0;
+            return 0;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+static void renderhook_mark_warned(int pid, unsigned long long st0,
+                                   unsigned int api)
+{
+    unsigned int i, free_slot = AC_MAX_PROTS * AC_RENDER_APIS_COUNT;
+
+    for (i = 0; i < AC_MAX_PROTS * AC_RENDER_APIS_COUNT; i++) {
+        if (g_renderhook_warned[i].in_use &&
+            g_renderhook_warned[i].pid == pid &&
+            g_renderhook_warned[i].api == api)
+            return;   /* already_warned() cleared stale generations above;
+                       * a match here is this generation, already recorded */
+        if (free_slot == AC_MAX_PROTS * AC_RENDER_APIS_COUNT &&
+            !g_renderhook_warned[i].in_use)
+            free_slot = i;
+    }
+    if (free_slot != AC_MAX_PROTS * AC_RENDER_APIS_COUNT) {
+        g_renderhook_warned[free_slot].pid = pid;
+        g_renderhook_warned[free_slot].starttime = st0;
+        g_renderhook_warned[free_slot].have_starttime = 1;
+        g_renderhook_warned[free_slot].api = api;
+        g_renderhook_warned[free_slot].in_use = 1;
+    }
+}
+
 static void check_render_hooks_periodic(void)
 {
     struct ac_prot_list pl;
@@ -1559,18 +1644,35 @@ static void check_render_hooks_periodic(void)
     memset(&pl, 0, sizeof(pl));
     if (ioctl(dev_fd, AC_IOCTL_LIST_PROTECTED, &pl) < 0)
         return;
+    renderhook_warned_forget_stale(&pl);
     for (i = 0; i < pl.count; i++) {
         int statuses[AC_RENDER_APIS_COUNT];
         char libpaths[AC_RENDER_APIS_COUNT][AC_VMA_PATH];
+        unsigned long long st0 = 0;
 
+        /* Generation bracket (issue #72): snapshot before the multi-ioctl
+         * + /proc/<pid>/mem scan, recheck before reporting, so a pid
+         * recycled mid-check can't attribute the previous occupant's
+         * bytes to an unrelated new process via the LOG_CRIT ban-pipeline
+         * hook. Same pattern as check_ld_preload_periodic(). */
+        if (proc_starttime(pl.items[i].pid, &st0) != 0)
+            continue;   /* gone before the check; retry next period */
         render_hook_statuses_for(pl.items[i].pid, statuses, libpaths);
+        if (!proc_same_generation(pl.items[i].pid, st0))
+            continue;   /* exited/reused mid-check: statuses may be another
+                         * generation's -- discard, retry next period */
         for (j = 0; j < AC_RENDER_APIS_COUNT; j++) {
-            if (statuses[j] == 1)
-                logmsg(LOG_CRIT, "pid %d (%s): render hook detected in %s "
+            if (statuses[j] != 1)
+                continue;
+            if (renderhook_already_warned(pl.items[i].pid, st0, j))
+                continue;   /* rising edge already reported for this
+                             * (pid, generation, api) */
+            logmsg(LOG_CRIT, "pid %d (%s): render hook detected in %s "
                        "(%s differs from a freshly-loaded reference copy -- "
                        "possible ESP/overlay/render hijack)",
                        pl.items[i].pid, pl.items[i].comm, libpaths[j],
                        AC_RENDER_APIS[j].symbol);
+            renderhook_mark_warned(pl.items[i].pid, st0, j);
         }
     }
 }
@@ -3224,7 +3326,104 @@ static int scan_protected_periodic(void)
  * time the daemon happens to see a process would permanently hide a
  * compromise that predates monitoring starting. Baselines only ever come
  * from an explicit, operator-run `--save` on a binary already verified
- * clean -- this only re-checks what someone already vouched for. */
+ * clean -- this only re-checks what someone already vouched for.
+ *
+ * Rising-edge only (issue #73): a genuine mismatch must not re-emit
+ * LOG_CRIT -- and therefore a fresh ban-pipeline HTTP report -- on every
+ * AC_BASELINE_CHECK_INTERVAL tick for as long as the process lives. Slots
+ * are keyed by (pid, starttime, path, inode, offset) so a *different*
+ * mapping starting to mismatch still alerts, while the same segment does
+ * not; a recycled pid never inherits the previous occupant's reported
+ * state. Same in_use/pid/starttime slot-tracking pattern as
+ * g_preload_warned. */
+#define AC_BASELINE_MISMATCH_WARNED_MAX (AC_MAX_PROTS * 4)
+struct ac_baseline_mismatch_warned {
+    int                pid;
+    unsigned long long starttime;       /* always known: callers bracket, see below */
+    int                have_starttime;  /* 0 (unknown) always treated as a new generation */
+    unsigned long long inode;
+    unsigned long long offset;
+    char               path[AC_VMA_PATH];
+    int                in_use;
+};
+static struct ac_baseline_mismatch_warned
+    g_baseline_mismatch_warned[AC_BASELINE_MISMATCH_WARNED_MAX];
+
+static void baseline_mismatch_forget_stale(const struct ac_prot_list *pl)
+{
+    unsigned int i, j;
+
+    for (i = 0; i < AC_BASELINE_MISMATCH_WARNED_MAX; i++) {
+        if (!g_baseline_mismatch_warned[i].in_use)
+            continue;
+        for (j = 0; j < pl->count; j++)
+            if (pl->items[j].pid == g_baseline_mismatch_warned[i].pid)
+                break;
+        if (j == pl->count)
+            g_baseline_mismatch_warned[i].in_use = 0;   /* no longer protected */
+    }
+}
+
+static int baseline_mismatch_already_warned(int pid, unsigned long long st0,
+                                            const char *path,
+                                            unsigned long long inode,
+                                            unsigned long long offset)
+{
+    unsigned int i;
+
+    for (i = 0; i < AC_BASELINE_MISMATCH_WARNED_MAX; i++) {
+        if (!g_baseline_mismatch_warned[i].in_use ||
+            g_baseline_mismatch_warned[i].pid != pid)
+            continue;
+        if (!g_baseline_mismatch_warned[i].have_starttime ||
+            st0 != g_baseline_mismatch_warned[i].starttime) {
+            /* New generation: the old occupant's warn-once state must not
+             * silence the new process's warning. Drop the stale slot and
+             * keep looking -- the caller re-checks and re-warns below. */
+            g_baseline_mismatch_warned[i].in_use = 0;
+            continue;
+        }
+        if (g_baseline_mismatch_warned[i].inode == inode &&
+            g_baseline_mismatch_warned[i].offset == offset &&
+            strcmp(g_baseline_mismatch_warned[i].path, path) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static void baseline_mismatch_mark_warned(int pid, unsigned long long st0,
+                                          const char *path,
+                                          unsigned long long inode,
+                                          unsigned long long offset)
+{
+    unsigned int i, free_slot = AC_BASELINE_MISMATCH_WARNED_MAX;
+
+    for (i = 0; i < AC_BASELINE_MISMATCH_WARNED_MAX; i++) {
+        if (g_baseline_mismatch_warned[i].in_use &&
+            g_baseline_mismatch_warned[i].pid == pid &&
+            g_baseline_mismatch_warned[i].have_starttime &&
+            g_baseline_mismatch_warned[i].starttime == st0 &&
+            g_baseline_mismatch_warned[i].inode == inode &&
+            g_baseline_mismatch_warned[i].offset == offset &&
+            strcmp(g_baseline_mismatch_warned[i].path, path) == 0)
+            return;   /* already recorded for this generation + segment */
+        if (free_slot == AC_BASELINE_MISMATCH_WARNED_MAX &&
+            !g_baseline_mismatch_warned[i].in_use)
+            free_slot = i;
+    }
+    if (free_slot != AC_BASELINE_MISMATCH_WARNED_MAX) {
+        g_baseline_mismatch_warned[free_slot].pid = pid;
+        g_baseline_mismatch_warned[free_slot].starttime = st0;
+        g_baseline_mismatch_warned[free_slot].have_starttime = 1;
+        g_baseline_mismatch_warned[free_slot].inode = inode;
+        g_baseline_mismatch_warned[free_slot].offset = offset;
+        snprintf(g_baseline_mismatch_warned[free_slot].path,
+                 sizeof(g_baseline_mismatch_warned[free_slot].path),
+                 "%s", path);
+        g_baseline_mismatch_warned[free_slot].in_use = 1;
+    }
+}
+
 static int check_baselines_periodic(void)
 {
     struct ac_prot_list pl;
@@ -3233,16 +3432,30 @@ static int check_baselines_periodic(void)
     memset(&pl, 0, sizeof(pl));
     if (ioctl(dev_fd, AC_IOCTL_LIST_PROTECTED, &pl) < 0)
         return -1;
+    baseline_mismatch_forget_stale(&pl);
     for (i = 0; i < pl.count; i++) {
         struct ac_scan_begin b;
         unsigned int v;
         int mem_fd = -1;
         int mem_open_failed = 0;
+        unsigned long long st0 = 0;
 
+        /* Generation bracket (issue #72): snapshot before the scan so the
+         * hashes and the LOG_CRIT below can be attributed to this
+         * generation only. Same pattern as scan_protected_periodic(). */
+        if (proc_starttime(pl.items[i].pid, &st0) != 0)
+            continue;   /* gone before the scan; retry next period */
         memset(&b, 0, sizeof(b));
         b.pid = pl.items[i].pid;
         if (ioctl(dev_fd, AC_IOCTL_SCAN_BEGIN, &b) != 0)
             continue;
+        if (!proc_same_generation(pl.items[i].pid, st0)) {
+            /* Exited/reused between the snapshot and the scan: b describes
+             * another generation. End the kernel scan session, discard,
+             * retry next period. */
+            ioctl(dev_fd, AC_IOCTL_SCAN_END, NULL);
+            continue;
+        }
         for (v = 0; v < b.n_vmas; v++) {
             struct ac_scan_get g;
             struct ac_vma_info *vi;
@@ -3305,10 +3518,28 @@ static int check_baselines_periodic(void)
 
             if (hash_proc_mem(mem_fd, vi->start, size, hex) < 0)
                 continue;
-            if (strcmp(bhex, hex) != 0)
+            if (strcmp(bhex, hex) != 0) {
+                /* Reconfirm the generation immediately before acting on
+                 * the hash (issue #72): the window above spans an ioctl
+                 * per VMA plus mem reads, during which the pid may have
+                 * been recycled. A mismatch against another generation's
+                 * memory must never reach the LOG_CRIT ban-pipeline
+                 * hook. */
+                if (!proc_same_generation(pl.items[i].pid, st0)) {
+                    break;
+                }
+                if (baseline_mismatch_already_warned(pl.items[i].pid, st0,
+                                                     vi->path, vi->inode,
+                                                     vi->offset))
+                    continue;   /* rising edge already reported for this
+                                 * (pid, generation, segment) */
                 logmsg(LOG_CRIT, "pid %d (%s): memory content of %s differs "
                        "from saved baseline (possible runtime patching)",
                        pl.items[i].pid, pl.items[i].comm, vi->path);
+                baseline_mismatch_mark_warned(pl.items[i].pid, st0,
+                                              vi->path, vi->inode,
+                                              vi->offset);
+            }
         }
         if (mem_fd >= 0)
             close(mem_fd);
