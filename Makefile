@@ -386,7 +386,7 @@ ci-aur-check:
 
 clean:
 	@if [ -d "$(KDIR)" ]; then $(MAKE) -C "$(KDIR)" M="$(PWD)" clean; fi
-	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test test/mount_ns_probe test/anon_exec_test test/thread_exit_migration_test test/thread_spawn_after_protect_test test/ioctl_fuzz test/baseline_test test/ac_report_status_test test/ac_report_url_test test/ac_report_cooldown_test
+	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test test/mount_ns_probe test/anon_exec_test test/thread_exit_migration_test test/thread_spawn_after_protect_test test/ioctl_fuzz test/baseline_test test/ac_report_status_test test/ac_report_url_test test/ac_report_cooldown_test test/daemon_limits_test
 
 install: all
 	@if [ -z "$(DESTDIR)" ] && [ "$$(id -u)" -ne 0 ]; then echo "error: 'make install' writes to /usr/local and /lib/modules -- run as root, or set DESTDIR= for a staged/packaging install"; exit 1; fi
