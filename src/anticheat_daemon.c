@@ -358,6 +358,12 @@ static int pid_identifies_as(int pid, const char *comm, char *comm_out,
     return 1;
 }
 
+/* Cap on how many pids one `protect --comm` invocation collects before
+ * acting on them. The fixed array below is deliberate (no unbounded
+ * allocation driven by /proc churn), but hitting the cap used to be
+ * silent -- see pid_of_comm()/cmd_protect() (issues #83). */
+#define AC_PROTECT_COMM_MAX 256
+
 static int pid_of_comm(const char *comm, int *pids, int max)
 {
     DIR *d;
@@ -383,8 +389,15 @@ static int pid_of_comm(const char *comm, int *pids, int max)
          * thread-group leader -- "tgid-stable" per issue #69 -- with no
          * extra lookup needed. */
 
-        if (pid_identifies_as(pid, comm, NULL, 0) && n < max)
-            pids[n++] = pid;
+        /* Count every match even past `max`: silently capping here is
+         * what used to let `protect --comm` partially protect and
+         * still report success (issue #83). The caller compares the
+         * returned total against `max` and says so out loud. */
+        if (pid_identifies_as(pid, comm, NULL, 0)) {
+            if (n < max)
+                pids[n] = pid;
+            n++;
+        }
     }
     closedir(d);
     return n;
@@ -456,15 +469,15 @@ static int cmd_protect(int argc, char **argv)
                             proc_starttime(pid, &protect_st0) == 0);
     ac_open();
     if (comm) {
-        int pids[256];
+        int pids[AC_PROTECT_COMM_MAX];
         int protected_count = 0;
 
-        n = pid_of_comm(comm, pids, 256);
+        n = pid_of_comm(comm, pids, AC_PROTECT_COMM_MAX);
         if (n == 0) {
             fprintf(stderr, "no process with comm '%s'\n", comm);
             return 1;
         }
-        for (i = 0; i < n; i++) {
+        for (i = 0; i < n && i < AC_PROTECT_COMM_MAX; i++) {
             char cur_comm[AC_MAX_COMM + 1];
 
             /* Re-check right before the ioctl, not just at scan time:
@@ -490,6 +503,23 @@ static int cmd_protect(int argc, char **argv)
                 printf("protected pid %d (%s)\n", pids[i], id.comm);
                 protected_count++;
             }
+        }
+        /* pid_of_comm() counts past AC_PROTECT_COMM_MAX instead of
+         * silently capping (issue #83), so say so here: a partial
+         * protect must not look like a complete one to the operator
+         * or to scripts. The first AC_PROTECT_COMM_MAX matches are
+         * protected (same as before); the remainder need an explicit
+         * follow-up via --pid. Nonzero exit so `set -e`/CI callers
+         * notice the coverage hole instead of proceeding as covered. */
+        if (n > AC_PROTECT_COMM_MAX) {
+            fprintf(stderr,
+                    "warning: %d processes match '%s' but only %d were "
+                    "protected (limit %d per invocation) -- protect the "
+                    "remainder explicitly via --pid\n",
+                    n, comm, protected_count, AC_PROTECT_COMM_MAX);
+            printf("%d of %d matching process(es) protected\n",
+                   protected_count, n);
+            return 1;
         }
         printf("%d process(es) protected\n", protected_count);
     } else {
@@ -2246,6 +2276,27 @@ static int cmd_vmcheck(void)
 /* ------------------------------------------------------------------ */
 /* command: events                                                     */
 /* ------------------------------------------------------------------ */
+
+/* Clamp a module-supplied event count to the events[] array we actually
+ * own (issue #85). The kernel bounds it today, but the daemon already
+ * treats a stale/mismatched module as an expected condition (see the
+ * AC_IOCTL_VERSION handshake in cmd_start()), so el.count is a trust
+ * boundary, not a plain field -- and the old `(int)el.count` loop bound
+ * made it worse: a count past INT_MAX cast negative and silently
+ * dropped every event, while 65..INT_MAX read off the end of a stack
+ * object. Returns the usable count; sets *clamped when the clamp bit,
+ * which callers report -- it means the module is not the one the
+ * handshake thinks it is. */
+static unsigned int ac_clamp_event_count(unsigned int count, int *clamped)
+{
+    if (count > AC_MAX_EVENTS) {
+        *clamped = 1;
+        return AC_MAX_EVENTS;
+    }
+    *clamped = 0;
+    return count;
+}
+
 static int cmd_events(int argc, char **argv)
 {
     int watch = 0, i;
@@ -2257,12 +2308,20 @@ static int cmd_events(int argc, char **argv)
     ac_open();
     for (;;) {
         struct ac_event_list el;
+        unsigned int nev, k;
+        int clamped = 0;
 
         memset(&el, 0, sizeof(el));
         if (ioctl_ok(AC_IOCTL_GET_EVENTS, &el) < 0)
             return 1;
-        for (i = 0; i < (int)el.count; i++)
-            print_event(&el.events[i]);
+        nev = ac_clamp_event_count(el.count, &clamped);
+        if (clamped)
+            fprintf(stderr,
+                    "warning: GET_EVENTS count %u exceeds max %u; clamping "
+                    "(module/daemon mismatch?)\n",
+                    el.count, AC_MAX_EVENTS);
+        for (k = 0; k < nev; k++)
+            print_event(&el.events[k]);
         if (el.dropped)
             printf("(ring dropped %u events)\n", el.dropped);
         if (!watch)
@@ -4743,8 +4802,23 @@ static int cmd_start(int argc, char **argv)
             if (got < 0 && g_stop)
                 break;
             if (got == 0) {
-                for (i = 0; i < (int)el.count; i++) {
-                    struct ac_event *e = &el.events[i];
+                unsigned int nev, k;
+                int clamped = 0;
+
+                /* Module-supplied count: clamp to the array we own
+                 * before indexing (issue #85 -- see
+                 * ac_clamp_event_count()). LOG_WARNING, not LOG_CRIT:
+                 * this is an operational mismatch signal, and LOG_CRIT
+                 * would auto-file it into the ban pipeline as a
+                 * detection via logmsg()'s report hook. */
+                nev = ac_clamp_event_count(el.count, &clamped);
+                if (clamped)
+                    logmsg(LOG_WARNING,
+                           "GET_EVENTS count %u exceeds max %u; clamping "
+                           "(module/daemon mismatch?)",
+                           el.count, AC_MAX_EVENTS);
+                for (k = 0; k < nev; k++) {
+                    struct ac_event *e = &el.events[k];
 
                     if (e->type == AC_EV_PTRACE || e->type == AC_EV_PROCESS_VM)
                         logmsg(LOG_ALERT, "%s pid=%d comm=%s %s",

@@ -64,7 +64,7 @@ Most changes don't need root or a VM:
   module load, no root.
 - **Daemon unit tests** — `make baseline-test`,
   `make ac-report-status-test`, `make ac-report-url-test`,
-  `make ac-report-cooldown-test`. Each pulls `anticheat_daemon.c` in
+  `make ac-report-cooldown-test`, `make daemon-limits-test`. Each pulls `anticheat_daemon.c` in
   directly (no kernel/mock scan involved) and proves one specific behavior
   — see the comment above its target in the `Makefile`. Touching
   `ac_report()`? Run the `ac-report-*` ones.
