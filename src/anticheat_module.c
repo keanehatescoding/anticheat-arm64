@@ -992,7 +992,9 @@ struct ac_prot_entry {
      * flight, and claims a second slot: two independent notifier
      * registrations for one address space, inflating ac_prot_count,
      * double-listing the pid, and leaving one still registered after
-     * ac_del_prot_mm() stops at its first (and only known) match. */
+     * ac_del_prot_mm() stops at its first (and only known) match. Cleared
+     * under ac_prot_lock as soon as the claim resolves (success or
+     * failure), so the pointer never outlives the slot's interest in it. */
     struct mm_struct *claiming;
     char comm[AC_MAX_COMM];
 };
@@ -1236,10 +1238,12 @@ static int ac_add_prot_mm(struct mm_struct *mm, pid_t pid, const char *comm,
     spin_lock_irqsave(&ac_prot_lock, flags);
     if (ret) {
         ac_prots[slot].mm = NULL;
+        ac_prots[slot].claiming = NULL;
         spin_unlock_irqrestore(&ac_prot_lock, flags);
         return ret;
     }
     ac_prots[slot].mm = mm;
+    ac_prots[slot].claiming = NULL;
     ac_prots[slot].pid = pid;
     ac_prots[slot].jit_allowed = jit_allowed;
     strscpy(ac_prots[slot].comm, comm, sizeof(ac_prots[slot].comm));
@@ -2541,7 +2545,7 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     }
     case AC_IOCTL_MODS_BEGIN: {
         struct ac_fd_state *st;
-        unsigned int count;
+        unsigned int count = 0;
 
         st = ac_get_fd_state(file);
         if (!st)
