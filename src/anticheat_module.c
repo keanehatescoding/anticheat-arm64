@@ -135,23 +135,40 @@ static void ac_emit(unsigned int type, int pid, const char *comm,
  * too, for the same reason ac_schedule_kill() does. */
 static struct workqueue_struct *ac_wq;
 
-/* Backing pools for the two deferred-work request structs allocated from
+/* Backing pools for the three deferred-work request structs allocated from
  * kprobe/kretprobe (atomic) context: struct ac_prot_add_req (fork-inherit/
- * exec-rekey registration, further down) and struct ac_prot_release_req
+ * exec-rekey registration, further down), struct ac_prot_release_req
  * (mmu_notifier cleanup for an organically-exited mm, in the registry
- * section below). A plain kmalloc(GFP_ATOMIC) there can fail under memory
- * pressure -- silently dropping either request isn't just a missed event:
+ * section below), and struct ac_kill_req (SIGKILL delivery for ptrace /
+ * process_vm offenders, see ac_schedule_kill()). A plain
+ * kmalloc(GFP_ATOMIC) there can fail under memory pressure -- silently
+ * dropping any of these requests isn't just a missed event:
  * dropping an add/rekey leaves a should-be-protected mm unregistered
- * (ptrace/process_vm defenses would let an attacker through), and dropping
- * a release leaks the slot's mmu_notifier registration and its mm_count
- * reference permanently. mempool_alloc() falls back to a small pre-reserved
- * pool instead of returning NULL there, the standard kernel pattern for
- * atomic-context allocations that must not fail. Sized to AC_PROT_MAX: that
- * many concurrent in-flight requests already implies as many address
- * spaces are mid-transition, which is the same order of magnitude the
- * registry itself is bounded to. */
+ * (ptrace/process_vm defenses would let an attacker through), dropping a
+ * release leaks the slot's mmu_notifier registration and its mm_count
+ * reference permanently, and dropping a kill lets the offending process
+ * keep running as though enforcement happened. mempool_alloc() falls back
+ * to a small pre-reserved pool instead of returning NULL there, the
+ * standard kernel pattern for atomic-context allocations that must not
+ * fail. The prot pools are sized to AC_PROT_MAX: that many concurrent
+ * in-flight requests already implies as many address spaces are
+ * mid-transition, which is the same order of magnitude the registry
+ * itself is bounded to. Kill requests are one per concurrent attack, so a
+ * smaller AC_KILL_MAX reserve is plenty -- each entry is just a work item
+ * plus a pid reference. */
 static mempool_t *ac_prot_add_pool;
 static mempool_t *ac_prot_release_pool;
+/* Pre-reserved kill requests in flight at once; see the pool comment above.
+ * Tiny entries (one work_struct + one pid reference each), so even the full
+ * reserve is negligible next to the prot pools. */
+#define AC_KILL_MAX 16
+static mempool_t *ac_kill_pool;
+/* Total SIGKILL deliveries dropped because even the kill reserve was
+ * exhausted. atomic_t: ac_schedule_kill() runs in kprobe (atomic) context,
+ * so no locking -- and every drop is also reported via pr_warn_ratelimited()
+ * (dmesg) and an AC_EV_INFO event (userspace ring), so this counter's job
+ * is just to keep the running total visible in the dmesg line itself. */
+static atomic_t ac_kill_dropped = ATOMIC_INIT(0);
 
 /* ------------------------------------------------------------------ */
 /* safe kernel reads                                                   */
@@ -1605,18 +1622,36 @@ static void ac_kill_worker(struct work_struct *w)
         put_task_struct(t);
     }
     put_pid(r->pid);
-    kfree(r);
+    mempool_free(r, ac_kill_pool);
 }
 
 static void ac_schedule_kill(struct task_struct *victim)
 {
     struct ac_kill_req *r;
+    int nr;
 
     if (!victim)
         return;
-    r = kmalloc(sizeof(*r), GFP_ATOMIC);
-    if (!r)
+    /* mempool_alloc() with GFP_ATOMIC falls back to ac_kill_pool's
+     * pre-reserved elements instead of returning NULL whenever a plain
+     * kmalloc(GFP_ATOMIC) would have -- see the pool's own comment for why
+     * silently dropping this request (letting an attacker survive its
+     * SIGKILL) isn't acceptable here. The NULL check below is defense in
+     * depth, not the expected path: it can in principle still fail if more
+     * than AC_KILL_MAX kills are simultaneously outstanding *and* the
+     * underlying allocator is also failing. That path stays observable:
+     * a ratelimited dmesg line plus an AC_EV_INFO event, so a drop can
+     * never again pass as enforcement that happened. */
+    r = mempool_alloc(ac_kill_pool, GFP_ATOMIC);
+    if (!r) {
+        nr = task_pid_nr(victim);
+        atomic_inc(&ac_kill_dropped);
+        pr_warn_ratelimited("policy: dropped SIGKILL for pid %d (kill reserve exhausted, total drops %d)\n",
+                            nr, atomic_read(&ac_kill_dropped));
+        ac_emit(AC_EV_INFO, nr, "?",
+                "policy: SIGKILL for pid %d dropped (out of memory)", nr);
         return;
+    }
     INIT_WORK(&r->work, ac_kill_worker);
     r->pid = get_task_pid(victim, PIDTYPE_PID);
     queue_work(ac_wq, &r->work);
@@ -2059,6 +2094,10 @@ struct ac_fd_state {
     struct ac_vma_info *vmas;   /* SCAN snapshot */
     int resolved_pid;           /* host-namespace pid of the last SCAN_BEGIN
                                   * target, for ac_scan_begin.resolved_pid */
+    char resolved_comm[AC_MAX_COMM]; /* comm of that target, captured while
+                                  * task is still referenced -- the post-
+                                  * unlock RWX/ANON_EXEC events carry this
+                                  * instead of a hardcoded "?" */
     unsigned int n_vmas;
     unsigned int rwx_count;
     unsigned int exec_count;
@@ -2239,6 +2278,7 @@ static int ac_build_vma_snapshot(struct ac_fd_state *st, int pid,
     st->vmas = NULL;
     st->n_vmas = st->rwx_count = st->exec_count = st->anon_exec_count = st->truncated = 0;
     st->resolved_pid = 0;
+    st->resolved_comm[0] = '\0';
 
     task = ref_pid > 0 ? ac_find_task_in_ns_of(pid, ref_pid)
                         : ac_find_task(pid);
@@ -2252,6 +2292,12 @@ static int ac_build_vma_snapshot(struct ac_fd_state *st, int pid,
      * same reference-liveness reasoning as ac_find_task_in_ns_of()'s own
      * comment. */
     st->resolved_pid = task_pid_nr(task);
+    /* Same liveness window as resolved_pid above: capture comm while `task`
+     * is still referenced. The post-unlock emit loop below runs after
+     * put_task_struct(), so it can't read task->comm there. get_task_comm()
+     * takes task_lock() internally, keeping this consistent even against a
+     * concurrent exec/comm change. */
+    get_task_comm(st->resolved_comm, task);
     mm = get_task_mm(task);
     put_task_struct(task);
     if (!mm)
@@ -2331,7 +2377,11 @@ static int ac_build_vma_snapshot(struct ac_fd_state *st, int pid,
     /* Emit after the unlock: st->vmas[] is this fd's private snapshot (held
      * under st->lock by the SCAN_BEGIN caller), so replaying it here emits
      * the same events in the same VMA order without holding the target's
-     * mmap lock across up to AC_MAX_VMAS ring-buffer critical sections. */
+     * mmap lock across up to AC_MAX_VMAS ring-buffer critical sections.
+     * Attribute to st->resolved_pid, not the caller-supplied `pid`: with
+     * ref_pid > 0 (`--ns-of`), `pid` is namespace-relative and names the
+     * wrong process (or none) on the host side. Native scans are
+     * unaffected -- pid and resolved_pid are equal there. */
     if (emit_events) {
         unsigned int i;
 
@@ -2339,12 +2389,13 @@ static int ac_build_vma_snapshot(struct ac_fd_state *st, int pid,
             struct ac_vma_info *e = &st->vmas[i];
 
             if ((e->flags & (VM_EXEC | VM_WRITE)) == (VM_EXEC | VM_WRITE))
-                ac_emit(AC_EV_RWX, pid, "?",
+                ac_emit(AC_EV_RWX, st->resolved_pid, st->resolved_comm,
                         "RWX mapping [0x%llx-0x%llx] %s",
                         e->start, e->end,
                         e->path[0] ? e->path : "(anonymous)");
             if (!e->is_file && (e->flags & VM_EXEC))
-                ac_emit(AC_EV_ANON_EXEC, pid, "?",
+                ac_emit(AC_EV_ANON_EXEC, st->resolved_pid,
+                        st->resolved_comm,
                         "anonymous executable mapping [0x%llx-0x%llx]",
                         e->start, e->end);
         }
@@ -2793,9 +2844,11 @@ static int __init ac_init(void)
 
     /*
      * ac_schedule_kill() (see below) queues a tiny, non-blocking work item
-     * (get_pid_task/send_sig/put_task_struct/put_pid/kfree — no sleeping,
+     * (get_pid_task/send_sig/put_task_struct/put_pid/mempool_free — no
+     * sleeping,
      * no heavy CPU use) from kprobe context, i.e. atomic context, via
-     * kmalloc(GFP_ATOMIC) + queue_work(). WQ_MEM_RECLAIM preserves
+     * mempool_alloc(ac_kill_pool, GFP_ATOMIC) + queue_work().
+     * WQ_MEM_RECLAIM preserves
      * create_workqueue()'s guarantee of a rescuer thread so kill delivery
      * still makes forward progress under memory pressure. WQ_HIGHPRI gets
      * the kill dispatched ahead of ordinary work, which matters here since
@@ -2829,6 +2882,14 @@ static int __init ac_init(void)
         destroy_workqueue(ac_wq);
         return -ENOMEM;
     }
+    ac_kill_pool = mempool_create_kmalloc_pool(AC_KILL_MAX,
+                                               sizeof(struct ac_kill_req));
+    if (!ac_kill_pool) {
+        mempool_destroy(ac_prot_release_pool);
+        mempool_destroy(ac_prot_add_pool);
+        destroy_workqueue(ac_wq);
+        return -ENOMEM;
+    }
 
     ac_resolve_text_bounds();
     if (ac_verbose)
@@ -2853,6 +2914,7 @@ static int __init ac_init(void)
          * work; drain it before tearing the workqueue down (see the same
          * reasoning in ac_exit() below). */
         flush_workqueue(ac_wq);
+        mempool_destroy(ac_kill_pool);
         mempool_destroy(ac_prot_release_pool);
         mempool_destroy(ac_prot_add_pool);
         destroy_workqueue(ac_wq);
@@ -2887,8 +2949,10 @@ static void __exit ac_exit(void)
     destroy_workqueue(ac_wq);
     /* Safe only now: mempool_destroy() requires every element already
      * returned, and the two flush_workqueue() calls above guarantee every
-     * ac_prot_add_worker()/ac_prot_release_worker() that could still be
-     * holding one has already run to completion and freed it back. */
+     * ac_prot_add_worker()/ac_prot_release_worker()/ac_kill_worker() that
+     * could still be holding one has already run to completion and freed
+     * it back. */
+    mempool_destroy(ac_kill_pool);
     mempool_destroy(ac_prot_add_pool);
     mempool_destroy(ac_prot_release_pool);
     pr_info("unloaded\n");
