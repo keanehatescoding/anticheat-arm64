@@ -2068,33 +2068,87 @@ static int cmd_syscalls(void)
  * periodic monitor.  The name table is static (256 KiB): the daemon is
  * single-threaded, and a stack array that large is fragile under small
  * ulimit -s / LimitSTACK=.  Returns the hidden-module count, or -1 if the
- * kernel-side module list could not be read. */
+ * check could not be completed (kernel-side walk failure, over-cap
+ * MODS_BEGIN count, or the /proc/modules table unreadable/truncated) so
+ * "could not complete the check" stays distinguishable from
+ * "checked, found nothing". */
 #define AC_MAX_PROC_MODS 4096
 static char proc_names[AC_MAX_PROC_MODS][AC_MOD_NAME_LEN];
 
-static unsigned int collect_proc_modules(unsigned int cap)
+static long collect_proc_modules(unsigned int cap)
 {
     FILE *f = fopen("/proc/modules", "r");
     char line[256];
     unsigned int n = 0;
 
     if (!f)
-        return 0;
-    while (fgets(line, sizeof(line), f) && n < cap) {
+        return -1;
+    /* Check the cap *before* reading: with the read first, the iteration
+     * that fills the table would consume (and discard) the first excess
+     * line in the loop condition, so the truncation probe below would see
+     * EOF and mistake "cap + 1 entries" for exactly cap. */
+    while (n < cap && fgets(line, sizeof(line), f)) {
         if (sscanf(line, "%63s", proc_names[n]) == 1)
             n++;
     }
+    if (n == cap) {
+        /* The loop above stops consuming input once the table is full, so
+         * probe for one more line to distinguish "exactly cap entries"
+         * from "cap entries and counting". Entries past the cap would
+         * otherwise be absent from the name table and miscounted as
+         * hidden (false positives). */
+        if (fgets(line, sizeof(line), f) != NULL) {
+            fclose(f);
+            return -1;
+        }
+    }
+    /* A stream error (not EOF) also truncates the table: reporting the
+     * partial names as a complete list would miscount the unread modules
+     * as hidden, so fail inconclusive. */
+    if (ferror(f)) {
+        fclose(f);
+        return -1;
+    }
     fclose(f);
-    return n;
+    return (long)n;
 }
 
 static long crosscheck_modules(int verbose)
 {
     unsigned int count, i, hidden = 0, proc_count;
+    long proc_count_r;
+    int walk_failed = 0;
 
     if (ioctl(dev_fd, AC_IOCTL_MODS_BEGIN, &count) < 0)
         return -1;
-    proc_count = collect_proc_modules(AC_MAX_PROC_MODS);
+    /* Fail inconclusive, not truncated: the walk below can only visit the
+     * first AC_MAX_MODS indices, but MODS_BEGIN reports a bare count with
+     * no truncation flag (ac_build_mod_snapshot() breaks at n >=
+     * AC_MAX_MODS), so count == AC_MAX_MODS is ambiguous -- exactly full
+     * or truncated -- and indistinguishable from here. Treat at-cap as
+     * inconclusive too: a legitimate exactly-at-cap module list is
+     * unrealistic (typical systems load a few hundred modules) and the
+     * failure direction is safe (warning, never a clean verdict). */
+    if (count >= AC_MAX_MODS) {
+        (void)ioctl(dev_fd, AC_IOCTL_MODS_END, NULL);
+        logmsg(LOG_WARNING, "crosscheck_modules: kernel reported %u modules "
+               "(max %u) -- result inconclusive", count, AC_MAX_MODS);
+        return -1;
+    }
+    proc_count_r = collect_proc_modules(AC_MAX_PROC_MODS);
+    if (proc_count_r < 0) {
+        /* Can't rule out "hidden" vs "we just couldn't read the visible
+         * list": proceeding as if the list were empty would flag every
+         * kernel-reported module as hidden, and proceeding as if it were
+         * complete would report clean on a truncated table. Inconclusive. */
+        (void)ioctl(dev_fd, AC_IOCTL_MODS_END, NULL);
+        logmsg(LOG_WARNING, "crosscheck_modules: could not read "
+               "/proc/modules -- result inconclusive");
+        if (verbose)
+            printf("could not read /proc/modules -- result inconclusive\n");
+        return -1;
+    }
+    proc_count = (unsigned int)proc_count_r;
     if (verbose)
         printf("%u modules in kernel list:\n", count);
     for (i = 0; i < count; i++) {
@@ -2104,8 +2158,15 @@ static long crosscheck_modules(int verbose)
 
         memset(&g, 0, sizeof(g));
         g.index = i;
-        if (ioctl(dev_fd, AC_IOCTL_MODS_GET, &g) < 0)
+        /* A transient failure mid-walk would otherwise fall through to
+         * the success return below, letting modules later in the kernel
+         * list go silently unchecked and reporting a truncated walk as a
+         * clean verdict. Flag it so the caller reports inconclusive
+         * instead of clean (same discipline as find_libs_by_basenames). */
+        if (ioctl(dev_fd, AC_IOCTL_MODS_GET, &g) < 0) {
+            walk_failed = 1;
             break;
+        }
         for (j = 0; j < proc_count; j++) {
             if (strcmp(proc_names[j], g.mod.name) == 0) {
                 visible = 1;
@@ -2119,10 +2180,15 @@ static long crosscheck_modules(int verbose)
         if (!visible)
             hidden++;
     }
-    ioctl(dev_fd, AC_IOCTL_MODS_END, NULL);
+    (void)ioctl(dev_fd, AC_IOCTL_MODS_END, NULL);
+    if (walk_failed) {
+        logmsg(LOG_WARNING, "crosscheck_modules: kernel module walk failed "
+               "at index %u/%u -- result inconclusive", i, count);
+        return -1;
+    }
     if (verbose)
         printf("hidden modules: %u\n", hidden);
-    return hidden;
+    return (long)hidden;
 }
 
 static int cmd_modules(void)
