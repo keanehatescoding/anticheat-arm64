@@ -152,10 +152,14 @@ class BoundedThreadingMixIn(socketserver.ThreadingMixIn):
 
     Rejects excess connections with an immediate 503 + close instead of
     queueing: queueing in the accept loop would stall legitimate clients
-    behind attacker-held slots, and the daemon client already retries
-    report POSTs. The semaphore is per-server-instance (created in
-    __init__, before any accept loop runs), so separate test instances
-    in the same process don't share a budget."""
+    behind attacker-held slots. The daemon treats a 429/503 as a failed
+    delivery -- it counts toward the consecutive-failure backoff and
+    honors Retry-After (#110) -- but keeps no retry queue, so under
+    sustained overload reports are eventually dropped, not delivered
+    late (a bounded async-delivery queue is future work, see #95). The
+    semaphore is per-server-instance (created in __init__, before any
+    accept loop runs), so separate test instances in the same process
+    don't share a budget."""
 
     def __init__(self, *args, max_connections=DEFAULT_MAX_CONNECTIONS,
                  **kwargs):

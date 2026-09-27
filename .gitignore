@@ -25,6 +25,7 @@ test/ac_report_status_test
 test/ac_report_url_test
 test/ac_report_cooldown_test
 test/daemon_limits_test
+test/daemon_reporting_test
 
 # runtime state
 *.log

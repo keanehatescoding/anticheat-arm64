@@ -64,6 +64,7 @@ struct mock_state {
 static struct mock_state S;
 static char state_path[PATH_MAX] = "/tmp/ac_mock_state";
 static int drain_count;
+static int flood_done;
 
 static void load_state(void)
 {
@@ -486,6 +487,21 @@ static int do_ioctl(unsigned long req, void *arg)
          * to keep its polling cadence sane -- that fallback path, not a
          * fake blocking wait here, is what mock_test.sh's
          * "start --foreground" tests actually exercise. */
+        /* AC_MOCK_FLOOD=1 overflows the ring once (daemon_reporting
+         * #109 test): pushes past AC_MAX_EVENTS so the excess lands in
+         * events_dropped_total, exactly like a real burst of
+         * FORK/EXEC/EXIT noise pushing a PTRACE event out of the
+         * kernel ring. One-shot per daemon process (flood_done is not
+         * persisted): later drains see a stable counter, so the test
+         * can assert the daemon warns exactly once. */
+        if (getenv("AC_MOCK_FLOOD") && !flood_done) {
+            int i;
+
+            flood_done = 1;
+            for (i = 0; i < AC_MAX_EVENTS + 44; i++)
+                push_event(AC_EV_INFO, getpid(), "mock",
+                           "mock: flood event %d", i);
+        }
         el->count = S.n_evq;
         el->dropped = S.events_dropped_total;
         memcpy(el->events, S.evq, S.n_evq * sizeof(*S.evq));
