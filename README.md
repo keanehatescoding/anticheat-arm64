@@ -130,6 +130,7 @@ anticheat vmcheck                    VM/hypervisor detection (heuristic, not a v
 anticheat events [--watch]           dump security events
 anticheat lock | unlock              pin / unpin the kernel module
 anticheat start [--foreground]       monitoring daemon (events + periodic checks)
+    [--log-file PATH] [--pid-file PATH]   see "Running the daemon" below
 ```
 
 The daemon (`start`) protects its own pid on startup (so it can't just be
@@ -169,8 +170,10 @@ each protected process's *implicit* Vulkan layer manifests
 cycle rather than once per pid (manifest files can change while a session
 is running, unlike environ), but only warns on a *growth* in the
 unrecognized-layer count for a pid, same baseline-delta design as
-anon-exec detection above. Alerts go to syslog (`LOG_AUTH`) and
-`/var/log/anticheat.log`.
+anon-exec detection above. Alerts go to syslog (`LOG_AUTH`) and to the
+daemon's stdout/stderr: the journal under the systemd unit, or
+`/var/log/anticheat.log` when it daemonizes itself (see "Running the
+daemon" below).
 
 Baselines are stored in `/var/lib/anticheat/baselines/` (one file per path,
 named by a SHA-256 of the path; override the directory with the
@@ -847,8 +850,52 @@ sudo ./anticheat scan --pid <pid> --hash --save
 sudo ./anticheat start            # run the monitor
 ```
 
-`sudo make install` installs the binary to `/usr/local/sbin` and the module
-to `/lib/modules/$(uname -r)/extra/`.
+`sudo make install` installs the binary to `/usr/local/sbin`, the module
+to `/lib/modules/$(uname -r)/extra/`, the systemd unit to
+`/usr/local/lib/systemd/system/`, and a logrotate snippet to
+`/etc/logrotate.d/anticheat` (only the first time, so a re-install won't
+overwrite your edits to it).
+
+#### Running the daemon
+
+**Under systemd (recommended).** `packaging/systemd/anticheat.service` is
+installed by `make install` and by all three distro packages, but not
+enabled:
+
+```sh
+sudo systemctl enable --now anticheat
+journalctl -u anticheat -f
+```
+
+It runs `anticheat start --foreground` as `Type=simple` with
+`Restart=on-failure`, so a crashed or killed monitor loop gets restarted
+instead of leaving the module loaded with nothing watching it. After 5
+failed starts within a minute the unit gives up and shows as failed. Its
+`ExecStartPre` runs `modprobe anticheat` and ignores any failure. The
+daemon's output goes to the journal. Report settings (`AC_REPORT_URL`,
+`AC_REPORT_KEY`, other `AC_*` overrides) go in
+`/etc/anticheat/anticheat.env`, which should be root-owned with mode
+`0600`.
+
+**Without systemd,** `sudo anticheat start` daemonizes itself (double
+fork), prints the daemon's pid, and:
+
+- appends its output to `--log-file PATH`, else `$AC_LOG_FILE`, else
+  `/var/log/anticheat.log`. A new log file is created with mode `0640`.
+  If the file can't be opened, `start` fails right away with an error
+  instead of forking. `packaging/logrotate/anticheat` rotates the default
+  path with `copytruncate`.
+- writes its pid to `--pid-file PATH` (default `/run/anticheat.pid`)
+  before `start` returns, and holds an `flock()` on that file for as long
+  as it runs. A second `start` using the same pid file refuses to run and
+  names the running pid. A pid file left behind by a crash isn't locked,
+  so it doesn't block the next `start`. The file is removed on a clean
+  `SIGTERM` shutdown, so `kill $(cat /run/anticheat.pid)` stops the
+  daemon.
+
+`--foreground` writes a pid file only if you pass `--pid-file`, and
+ignores the log file (its output stays on the terminal, or goes to the
+journal under the unit). Both paths must be absolute.
 
 ### Automatic rebuild on kernel updates + Secure Boot (DKMS)
 
@@ -1105,6 +1152,8 @@ LICENSE                  GPL-2.0
 packaging/aur/           AUR PKGBUILD (hypranticheat + hypranticheat-dkms split package)
 packaging/debian/        debian/ control dir for a .deb (same split package)
 packaging/fedora/        rpmbuild .spec for an .rpm (same split package)
+packaging/systemd/       anticheat.service unit for the daemon (see "Running the daemon")
+packaging/logrotate/     logrotate snippet for /var/log/anticheat.log
 .github/workflows/ci.yml CI: userspace build + mock suite, module smoke build
 test.sh                  end-to-end live test (root)
 diag.sh                  root diagnostics (dmesg, discovery, module walk)

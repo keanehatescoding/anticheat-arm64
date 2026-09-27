@@ -4,7 +4,8 @@
 #   make module     build anticheat.ko only
 #   make daemon     build the userspace binary only
 #   make clean
-#   sudo make install         (binary -> /usr/local/sbin, module -> /lib/modules/.../extra)
+#   sudo make install         (binary -> /usr/local/sbin, module -> /lib/modules/.../extra,
+#                              systemd unit -> /usr/local/lib/systemd/system, logrotate -> /etc/logrotate.d)
 #   sudo make uninstall
 #   make DESTDIR=/tmp/stage install   (staged/packaging install -- skips depmod, no root needed)
 #   make install-deck         (SteamOS / immutable distros — see below, run WITHOUT sudo)
@@ -408,14 +409,31 @@ install: all
 	install -D -m 0755 anticheat "$(DESTDIR)/usr/local/sbin/anticheat"
 	install -D -m 0644 anticheat.ko "$(DESTDIR)/lib/modules/$(KVER)/extra/anticheat.ko"
 	install -d -m 0755 "$(DESTDIR)/var/lib/anticheat/baselines"
+	# The packaged unit runs /usr/bin/anticheat; this install puts the
+	# binary in /usr/local/sbin, so rewrite ExecStart to match.
+	install -d -m 0755 "$(DESTDIR)/usr/local/lib/systemd/system"
+	sed 's|^ExecStart=/usr/bin/anticheat |ExecStart=/usr/local/sbin/anticheat |' \
+		packaging/systemd/anticheat.service > "$(DESTDIR)/usr/local/lib/systemd/system/anticheat.service"
+	chmod 0644 "$(DESTDIR)/usr/local/lib/systemd/system/anticheat.service"
+	@grep -q '^ExecStart=/usr/local/sbin/anticheat ' "$(DESTDIR)/usr/local/lib/systemd/system/anticheat.service" || \
+		{ echo "error: ExecStart rewrite in anticheat.service didn't match -- update the sed above"; exit 1; }
+	# Config file: only installed the first time, so re-running
+	# `make install` doesn't clobber local edits.
+	@if [ ! -e "$(DESTDIR)/etc/logrotate.d/anticheat" ]; then \
+		install -D -m 0644 packaging/logrotate/anticheat "$(DESTDIR)/etc/logrotate.d/anticheat"; fi
 	@if [ -z "$(DESTDIR)" ]; then depmod -a; else echo "DESTDIR staged install -- skipping depmod -a (packaging must run depmod in postinst)"; fi
+	@if [ -z "$(DESTDIR)" ] && command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload || true; fi
 	@echo "installed. load with: sudo modprobe anticheat  (or insmod ./anticheat.ko)"
+	@echo "run the daemon under systemd with: sudo systemctl enable --now anticheat"
 
 uninstall:
 	@if [ -z "$(DESTDIR)" ] && [ "$$(id -u)" -ne 0 ]; then echo "error: 'make uninstall' removes from /usr/local and /lib/modules -- run as root, or set DESTDIR= to match the staged install"; exit 1; fi
 	rm -f "$(DESTDIR)/usr/local/sbin/anticheat"
 	rm -f "$(DESTDIR)/lib/modules/$(KVER)/extra/anticheat.ko"
+	rm -f "$(DESTDIR)/usr/local/lib/systemd/system/anticheat.service"
+	rm -f "$(DESTDIR)/etc/logrotate.d/anticheat"
 	@if [ -z "$(DESTDIR)" ]; then depmod -a; fi
+	@if [ -z "$(DESTDIR)" ] && command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload || true; fi
 
 # SteamOS / immutable-distro install: everything lives under $(DECK_PREFIX)
 # (default: ~/.local/share/anticheat), which survives OTA image updates

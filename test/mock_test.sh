@@ -366,6 +366,86 @@ else
     fail "start: expected exactly 1 ring-overflow warning, got $flood_warn_count"
 fi
 
+echo "== daemon log / pid files (#79) =="
+AC_RUNDIR=$(mktemp -d "${TMPDIR:-/tmp}/ac_run.XXXXXX") || exit 1
+
+expect_rc  "start: unknown option rejected" 1 ./anticheat start --bogus
+expect_rc  "start: --log-file without a path rejected" 1 ./anticheat start --log-file
+expect_rc  "start: relative --log-file rejected" 1 \
+    ./anticheat start --log-file rel.log
+expect_rc  "start: relative AC_LOG_FILE rejected" 1 \
+    env AC_LOG_FILE=rel.log ./anticheat start
+expect_rc  "start: relative --pid-file rejected" 1 \
+    ./anticheat start --foreground --pid-file rel.pid
+expect_rc  "start: unwritable log file fails before forking" 1 \
+    ./anticheat start --log-file "$AC_RUNDIR/missing-dir/ac.log" \
+    --pid-file "$AC_RUNDIR/unused.pid"
+
+# Foreground + explicit --pid-file: written with the daemon's own pid,
+# locked against a second daemon, removed on clean SIGTERM shutdown.
+fg_pidfile="$AC_RUNDIR/fg.pid"
+./anticheat start --foreground --pid-file "$fg_pidfile" >/dev/null 2>&1 &
+fg_pid=$!
+for _ in $(seq 50); do [ -s "$fg_pidfile" ] && break; sleep 0.1; done
+if [ "$(cat "$fg_pidfile" 2>/dev/null)" = "$fg_pid" ]; then
+    pass "start --foreground --pid-file: pid file holds the daemon's pid"
+else
+    fail "start --foreground --pid-file: want '$fg_pid', got '$(cat "$fg_pidfile" 2>/dev/null)'"
+fi
+expect_out "start: second daemon on a locked pid file refused" \
+    "already running" ./anticheat start --foreground --pid-file "$fg_pidfile"
+expect_out "start: refusal names the running daemon's pid" \
+    "by pid $fg_pid" ./anticheat start --foreground --pid-file "$fg_pidfile"
+kill -TERM "$fg_pid"; wait "$fg_pid"; rc=$?
+if [ "$rc" -eq 0 ] && [ ! -e "$fg_pidfile" ]; then
+    pass "start: pid file removed on clean shutdown"
+else
+    fail "start: clean shutdown (rc=$rc, pid file exists: $([ -e "$fg_pidfile" ] && echo yes || echo no))"
+fi
+
+# A pid file left behind by a crash is unlocked, so it must not block
+# the next start.
+echo 999999 > "$fg_pidfile"
+out=$(timeout -k 2 --preserve-status 2 ./anticheat start --foreground --pid-file "$fg_pidfile" 2>&1)
+rc=$?
+if [ "$rc" -eq 0 ]; then pass "start: stale unlocked pid file reused"; else fail "start: stale pid file (rc=$rc): $out"; fi
+
+# Background mode: `start` returns only once the pid file already holds
+# the daemon pid it prints, and output goes to the chosen log file
+# (AC_MOCK_ATTACK gives it a PTRACE-DENIED event to write there).
+bg_pidfile="$AC_RUNDIR/bg.pid"
+bg_log="$AC_RUNDIR/bg.log"
+out=$(env AC_MOCK_ATTACK=1 AC_LOG_FILE="$bg_log" ./anticheat start --pid-file "$bg_pidfile" 2>&1)
+rc=$?
+bg_pid=$(printf '%s' "$out" | sed -n 's/.*started (pid \([0-9]*\)).*/\1/p')
+if [ "$rc" -eq 0 ] && [ -n "$bg_pid" ] && [ "$(cat "$bg_pidfile" 2>/dev/null)" = "$bg_pid" ]; then
+    pass "start (background): pid file matches printed pid on return"
+else
+    fail "start (background): rc=$rc out='$out' pidfile='$(cat "$bg_pidfile" 2>/dev/null)'"
+fi
+if [ -f "$bg_log" ] && [ "$(stat -c %a "$bg_log")" = "640" ]; then
+    pass "start (background): AC_LOG_FILE created with mode 0640"
+else
+    fail "start (background): log file missing or wrong mode ($(stat -c %a "$bg_log" 2>/dev/null))"
+fi
+for _ in $(seq 50); do grep -q "PTRACE-DENIED" "$bg_log" 2>/dev/null && break; sleep 0.1; done
+if grep -q "PTRACE-DENIED" "$bg_log" 2>/dev/null; then
+    pass "start (background): daemon output lands in the log file"
+else
+    fail "start (background): no PTRACE-DENIED event in $bg_log"
+fi
+if [ -n "$bg_pid" ]; then
+    kill -TERM "$bg_pid" 2>/dev/null
+    for _ in $(seq 50); do kill -0 "$bg_pid" 2>/dev/null || break; sleep 0.1; done
+fi
+if [ -n "$bg_pid" ] && ! kill -0 "$bg_pid" 2>/dev/null && [ ! -e "$bg_pidfile" ]; then
+    pass "start (background): SIGTERM stops daemon and removes pid file"
+else
+    fail "start (background): daemon still running or pid file left behind"
+    [ -n "$bg_pid" ] && kill -KILL "$bg_pid" 2>/dev/null
+fi
+rm -rf "$AC_RUNDIR"
+
 echo
 if [ "$FAIL" -eq 0 ]; then
     printf '\033[1;32mALL MOCK TESTS PASSED\033[0m\n'

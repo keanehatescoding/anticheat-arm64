@@ -13,6 +13,8 @@ pkgname = hypranticheat
 	pkgdesc = Userspace daemon and CLI for a kernel-mode anticheat -- pairs with the companion DKMS package for the kernel module
 	depends = glibc
 	optdepends = hypranticheat-dkms: kernel-level detection -- required for real use; the daemon alone can only run against its userspace mock
+	optdepends = logrotate: rotation of /var/log/anticheat.log when the daemon is run outside systemd
+	backup = etc/logrotate.d/anticheat
 
 pkgname = hypranticheat-dkms
 	pkgdesc = Kernel module (DKMS) for a kernel-mode anticheat: syscall/module integrity, ptrace denial, RWX/anon-exec detection

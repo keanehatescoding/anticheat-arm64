@@ -8,8 +8,11 @@ AUR. See `RELEASING.md` at the repo root for the update procedure.
 
 ## Split package
 
-- **`hypranticheat`** — the userspace daemon/CLI (`anticheat`), docs, and
-  the `/var/lib/anticheat/baselines` state directory.
+- **`hypranticheat`** — the userspace daemon/CLI (`anticheat`), docs,
+  the `anticheat.service` systemd unit (installed but not enabled: run
+  `systemctl enable --now anticheat` after the module is in place), a
+  logrotate snippet, and the `/var/lib/anticheat/baselines` state
+  directory.
 - **`hypranticheat-dkms`** — the kernel module source, registered with
   DKMS. `hypranticheat-dkms.install` mirrors `scripts/dkms-install.sh`'s
   DKMS-add + Secure-Boot-MOK-signing setup as pacman `post_install`/

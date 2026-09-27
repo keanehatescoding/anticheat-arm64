@@ -54,8 +54,9 @@ before the backtrace.
    `scripts/dkms-install.sh`, or `install-deck`), and the exact command
    that was running or the exact `anticheat` CLI action in flight at the
    time (`protect`, `scan --hash --check`, `start`, etc. — check
-   `/var/log/anticheat.log` for the last daemon-side line logged before
-   the crash).
+   `journalctl -u anticheat -b -1` if the daemon ran under the systemd
+   unit, or `/var/log/anticheat.log` (or your `--log-file`) otherwise,
+   for the last daemon-side line logged before the crash).
 3. **Check `ac_policy`/`ac_verbose`.** If the module was loaded with
    non-default `module_param`s (`ac_policy`, `ac_verbose` — both
    `insmod`-time-settable, mode `0600`), note the values; they change
@@ -63,8 +64,12 @@ before the backtrace.
 
 ## Keeping it from loading again
 
-Nothing in this project auto-*loads* the module on boot, DKMS included —
-worth being precise about, since it's easy to assume otherwise.
+Nothing in this project auto-*loads* the module on boot, DKMS included,
+**unless you enabled the daemon's systemd unit** (`anticheat.service`).
+Its `ExecStartPre` runs `modprobe anticheat` on every start, including at
+boot, so disable it first: `sudo systemctl disable --now anticheat`.
+Otherwise it's worth being precise about, since it's easy to assume
+otherwise.
 `AUTOINSTALL="yes"` in `dkms.conf` only makes DKMS automatically
 *rebuild and install* `anticheat.ko` for each newly-installed kernel (via
 the distro's `/etc/kernel/postinst.d/dkms` hook); it does not `modprobe`
@@ -80,8 +85,10 @@ So in the state this project ships in:
   from a script/cron job you set up yourself) is the only thing that can
   load it again — check for exactly that, since this project provides no
   such mechanism on its own (no `/etc/modules-load.d/` entry, no
-  `systemd` unit for the module itself, no `modprobe_on_install` in
-  DKMS's `framework.conf`).
+  `modprobe_on_install` in DKMS's `framework.conf`, and no systemd unit
+  that loads it apart from the daemon's unit above). A `blacklist` line
+  does **not** stop that unit's `ExecStartPre`: blacklisting only blocks
+  alias-based autoloading, not an explicit `modprobe anticheat`.
 - **Blacklist it anyway, as a hard stop against forgetting:**
 
   ```sh
@@ -172,5 +179,6 @@ Include, at minimum:
 - `ac_policy`/`ac_verbose` values if non-default
 - The full `journalctl -k -b -1` (or crash-dump backtrace) output, not
   just the last few lines
-- The last `anticheat`/daemon action in flight (from `/var/log/anticheat.log`)
+- The last `anticheat`/daemon action in flight (from `journalctl -u anticheat`
+  or `/var/log/anticheat.log`)
 - Whether any kernel live-patching mechanism is in use

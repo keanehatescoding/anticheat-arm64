@@ -24,8 +24,22 @@ override_dh_auto_test:
 	# already runs the mock suite on every push; nothing to duplicate
 	# here.
 
+# --no-enable: don't enable (and so don't start) the daemon on install --
+# the kernel module ships in the separate hypranticheat-dkms package and
+# may not be built/loaded yet. An already-enabled unit is still
+# restarted on upgrade so it picks up the new binary.
+override_dh_installsystemd:
+	dh_installsystemd --no-enable
+
 override_dh_auto_install:
 	install -Dm755 anticheat debian/hypranticheat/usr/bin/anticheat
+	# lib/, not usr/lib/: the unit directory every debhelper 13 release's
+	# dh_installsystemd scans, so it generates the maintscripts for it.
+	install -Dm644 packaging/systemd/anticheat.service \
+	        debian/hypranticheat/lib/systemd/system/anticheat.service
+	# Under /etc, so dh_installdeb marks it as a conffile automatically.
+	install -Dm644 packaging/logrotate/anticheat \
+	        debian/hypranticheat/etc/logrotate.d/anticheat
 	install -dm755 debian/hypranticheat/var/lib/anticheat/baselines
 
 	install -Dm644 Makefile \

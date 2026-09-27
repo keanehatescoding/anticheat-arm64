@@ -13,6 +13,7 @@ Source0:        %{url}/archive/refs/tags/v%{version}.tar.gz
 
 BuildRequires:  gcc
 BuildRequires:  make
+BuildRequires:  systemd-rpm-macros
 Requires:       glibc
 
 # ARM64 only: the kernel module hooks the __arm64_sys_*/
@@ -74,6 +75,8 @@ load.
 
 %install
 install -Dm755 anticheat %{buildroot}%{_bindir}/anticheat
+install -Dm644 packaging/systemd/anticheat.service %{buildroot}%{_unitdir}/anticheat.service
+install -Dm644 packaging/logrotate/anticheat %{buildroot}%{_sysconfdir}/logrotate.d/anticheat
 install -dm755 %{buildroot}%{_localstatedir}/lib/anticheat/baselines
 
 _dkmsdir=%{buildroot}%{_usrsrc}/anticheat-%{version}
@@ -96,8 +99,23 @@ install -dm700 %{buildroot}%{_localstatedir}/lib/anticheat/mok
 %license LICENSE
 %doc README.md THREAT_MODEL.md TROUBLESHOOTING.md
 %{_bindir}/anticheat
+%{_unitdir}/anticheat.service
+%config(noreplace) %{_sysconfdir}/logrotate.d/anticheat
 %dir %attr(0755,root,root) %{_localstatedir}/lib/anticheat
 %dir %{_localstatedir}/lib/anticheat/baselines
+
+# %%systemd_post only enables the unit when a preset says so, and there's
+# no preset for it, so installing doesn't start the daemon -- see
+# packaging/systemd/anticheat.service. An already-running daemon is
+# restarted on upgrade so it picks up the new binary.
+%post
+%systemd_post anticheat.service
+
+%preun
+%systemd_preun anticheat.service
+
+%postun
+%systemd_postun_with_restart anticheat.service
 
 %files dkms
 %license LICENSE

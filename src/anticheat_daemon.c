@@ -43,6 +43,11 @@
  *   events [--watch]       dump pending security events (--watch: poll)
  *   lock | unlock          pin / unpin the kernel module
  *   start [--foreground]   monitoring daemon (poll events + periodic checks)
+ *   start [--log-file PATH] [--pid-file PATH]
+ *                           background mode's log file (default
+ *                           $AC_LOG_FILE, else /var/log/anticheat.log)
+ *                           and pid file (default /run/anticheat.pid;
+ *                           none under --foreground unless given)
  *
  * Requires root (the kernel device only opens for CAP_SYS_ADMIN).
  */
@@ -4935,14 +4940,83 @@ static void ac_report(const char *event_type, const char *detail)
  * of how much of block_ms is left. */
 #define AC_MONITOR_BLOCK_MS 1000
 
+#define AC_DEFAULT_LOG_FILE "/var/log/anticheat.log"
+#define AC_DEFAULT_PID_FILE "/run/anticheat.pid"
+
+/* Opens and flock()s the daemon's pid file (#79), dying if another
+ * daemon already holds it. The lock, not the file's existence, is what
+ * marks a live daemon: a pid file left behind by a crash or SIGKILL is
+ * unlocked and simply reused, so there's no stale-pid guessing. flock()
+ * locks belong to the open file description, so the fd returned here
+ * keeps the lock held across both daemonizing fork()s for as long as the
+ * final daemon process lives -- and drops it the instant that process
+ * dies, however it dies. The pid itself is written later by
+ * pidfile_write(), once the final daemon pid is known. */
+static int pidfile_lock(const char *path)
+{
+    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+
+    if (fd < 0)
+        die("cannot open pid file %s: %s", path, strerror(errno));
+    if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
+        char buf[32] = "";
+        ssize_t r;
+
+        if (errno != EWOULDBLOCK)
+            die("cannot lock pid file %s: %s", path, strerror(errno));
+        r = pread(fd, buf, sizeof(buf) - 1, 0);
+        buf[r > 0 ? r : 0] = '\0';
+        buf[strcspn(buf, "\n")] = '\0';
+        die("another anticheat daemon is already running (pid file %s is "
+            "locked%s%s) -- refusing to start a second one",
+            path, buf[0] ? " by pid " : "", buf);
+    }
+    return fd;
+}
+
+/* Best-effort: a failed pid write leaves the lock (the part that stops a
+ * second daemon) intact, so it's reported rather than fatal. */
+static void pidfile_write(int fd, const char *path, pid_t pid)
+{
+    if (ftruncate(fd, 0) < 0 || dprintf(fd, "%d\n", (int)pid) < 0)
+        fprintf(stderr, "anticheat: cannot write pid file %s: %s\n",
+                path, strerror(errno));
+}
+
 static int cmd_start(int argc, char **argv)
 {
-    int foreground = 0, i;
+    int foreground = 0, i, log_fd = -1, pid_fd = -1;
+    const char *log_file = NULL, *pid_file = NULL;
     pid_t pid;
 
-    for (i = 0; i < argc; i++)
+    for (i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--foreground") == 0)
             foreground = 1;
+        else if (strcmp(argv[i], "--log-file") == 0 && i + 1 < argc)
+            log_file = argv[++i];
+        else if (strcmp(argv[i], "--pid-file") == 0 && i + 1 < argc)
+            pid_file = argv[++i];
+        else
+            die("start: unknown or incomplete option '%s' (usage: start "
+                "[--foreground] [--log-file PATH] [--pid-file PATH])",
+                argv[i]);
+    }
+    if (!log_file) {
+        const char *e = getenv("AC_LOG_FILE");
+
+        log_file = (e && *e) ? e : AC_DEFAULT_LOG_FILE;
+    }
+    /* Under --foreground (e.g. the systemd unit) the supervisor already
+     * tracks the pid, so only write one when explicitly asked to. */
+    if (!pid_file && !foreground)
+        pid_file = AC_DEFAULT_PID_FILE;
+    /* The daemon chdir("/")s before using log_file, and a relative
+     * pid-file path in a script is almost always a mistake -- reject
+     * both up front instead of writing somewhere surprising. */
+    if (log_file[0] != '/')
+        die("log file '%s' must be an absolute path", log_file);
+    if (pid_file && pid_file[0] != '/')
+        die("pid file '%s' must be an absolute path", pid_file);
 
     if (geteuid() != 0)
         die("anticheat start must run as root");
@@ -4965,6 +5039,20 @@ static int cmd_start(int argc, char **argv)
                 "version=%llu -- refusing to start. Rebuild/reload a "
                 "matching daemon and module pair.",
                 AC_IOCTL_VERSION, st.version);
+    }
+
+    /* Both of these are opened here, still attached to the terminal, so
+     * an unwritable log path or an already-running daemon fails the
+     * `start` command itself with a visible error -- rather than, as
+     * before #79, a grandchild whose failed freopen() message went to a
+     * stderr nobody could see any more. */
+    if (pid_file)
+        pid_fd = pidfile_lock(pid_file);
+    if (!foreground) {
+        log_fd = open(log_file, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC,
+                      0640);
+        if (log_fd < 0)
+            die("cannot open log file %s: %s", log_file, strerror(errno));
     }
 
     if (!foreground) {
@@ -5013,6 +5101,11 @@ static int cmd_start(int argc, char **argv)
         if (pid > 0) {
             pid_t final_pid = pid;
 
+            /* Written here, before the pid goes back up the pipe, so the
+             * pid file already exists by the time `start` returns to its
+             * caller -- a script can read it straight away. */
+            pidfile_write(pid_fd, pid_file, final_pid);
+
             /* A single write() of a pid_t-sized buffer is well under
              * PIPE_BUF, so it's atomic -- the parent's read() above gets
              * it whole in one call. Best-effort: if this write somehow
@@ -5030,10 +5123,16 @@ static int cmd_start(int argc, char **argv)
             fprintf(stderr, "daemon: chdir failed: %s\n", strerror(errno));
         if (!freopen("/dev/null", "r", stdin))
             fprintf(stderr, "daemon: stdin redirect failed\n");
-        if (!freopen("/var/log/anticheat.log", "a", stdout))
-            fprintf(stderr, "daemon: stdout redirect failed\n");
-        if (!freopen("/var/log/anticheat.log", "a", stderr))
-            fprintf(stderr, "daemon: stderr redirect failed\n");
+        /* O_APPEND (set on log_fd above) matters beyond ordering: it's
+         * what lets logrotate's copytruncate work, since every write
+         * lands at the file's current end rather than at a stale offset
+         * past the truncation point. */
+        if (dup2(log_fd, STDOUT_FILENO) < 0 || dup2(log_fd, STDERR_FILENO) < 0)
+            fprintf(stderr, "daemon: log redirect failed: %s\n",
+                    strerror(errno));
+        close(log_fd);
+    } else if (pid_fd >= 0) {
+        pidfile_write(pid_fd, pid_file, getpid());
     }
 
     openlog("anticheat", LOG_PID | LOG_NDELAY, LOG_AUTH);
@@ -5227,6 +5326,12 @@ static int cmd_start(int argc, char **argv)
     }
     logmsg(LOG_INFO, "anticheat daemon stopped");
     ac_close();
+    /* Clean shutdown only -- after a crash the file stays behind, but
+     * unlocked, which pidfile_lock() already treats as "not running". */
+    if (pid_fd >= 0) {
+        unlink(pid_file);
+        close(pid_fd);
+    }
     closelog();
     return 0;
 }
@@ -5248,7 +5353,8 @@ static void usage(const char *prog)
            "  vmcheck                    VM/hypervisor detection (heuristic)\n"
            "  events [--watch]           dump security events\n"
            "  lock | unlock              pin / unpin the kernel module\n"
-           "  start [--foreground]       run the monitoring daemon\n"
+           "  start [--foreground] [--log-file PATH] [--pid-file PATH]\n"
+           "                             run the monitoring daemon\n"
            "\n"
            "All commands except 'start' may also require root.\n",
            prog);
