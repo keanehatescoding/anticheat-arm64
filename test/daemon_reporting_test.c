@@ -98,8 +98,13 @@ static int run_report_exchange(const char *response)
         cs = accept(ls, NULL, NULL);
         if (cs >= 0) {
             /* Best-effort request drain: the daemon sends first and
-             * reads second, so one blocking read can't deadlock. */
-            (void)read(cs, tmp, sizeof(tmp));
+             * reads second, so one blocking read can't deadlock.
+             * The content is irrelevant; the assignment (not a void
+             * cast, which warn_unused_result ignores) consumes the
+             * result for -Werror builds. */
+            ssize_t nr = read(cs, tmp, sizeof(tmp));
+
+            (void)nr;
             while (sent < len) {
                 ssize_t w = send(cs, response + sent, len - sent,
                                  MSG_NOSIGNAL);
