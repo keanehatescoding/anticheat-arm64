@@ -1054,6 +1054,13 @@ design).
   other host-resolvable pid known to be in that same namespace as a
   reference point. Prefer `--comm` when a comm name is available; reach
   for `--ns-of` only when it isn't.
+- `protect --comm NAME` matches the untruncated `/proc/<pid>/exe` basename
+  first. When exe names a loader instead of the game (FEX/box64 via
+  binfmt_misc, Wine/Proton's `wine64-preloader`, a `#!` interpreter), it
+  falls back to an exact `/proc/<pid>/comm` match, but only for names
+  under 15 characters, because the kernel truncates comm at 15 and a longer
+  name can't be told apart from an unrelated one that shares its prefix.
+  For a longer name under a loader, use `--pid`.
 - kprobes require `CONFIG_KPROBES` / `CONFIG_KALLSYMS_ALL` (both enabled on
   this kernel). If a probe cannot be registered the module still loads and
   logs the limitation.

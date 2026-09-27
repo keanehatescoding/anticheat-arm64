@@ -126,6 +126,42 @@ wait "$AC_DELPID" 2>/dev/null
 
 rm -rf "$AC_TESTBIN_DIR"
 
+echo "== protect --comm: loader/interpreter exe (issue #107) =="
+# Under FEX/box64, Wine/Proton or a #! launcher, /proc/<pid>/exe names the
+# loader (FEXInterpreter, wine64-preloader, bash) while comm carries the
+# game's name. A bash that renames its own comm and then sits in `wait`
+# reproduces that: exe=.../bash, comm=NAME. A short NAME must still match;
+# a 15-char NAME (possibly a truncated prefix) must not match via comm.
+ac_comm_proc() {
+    bash -c 'printf %s "$1" > /proc/$$/comm; sleep 30 & wait' _ "$1" &
+    AC_COMMPID=$!
+    for _ in $(seq 1 50); do
+        [ "$(cat "/proc/$AC_COMMPID/comm" 2>/dev/null)" = "$1" ] && break
+        sleep 0.1
+    done
+}
+ac_comm_proc_kill() {
+    pkill -P "$AC_COMMPID" 2>/dev/null
+    kill "$AC_COMMPID" 2>/dev/null
+    wait "$AC_COMMPID" 2>/dev/null
+}
+
+AC_LOADERNAME="ac107g$$"
+AC_LOADERNAME="${AC_LOADERNAME:0:14}"
+ac_comm_proc "$AC_LOADERNAME"
+expect_rc  "protect --comm matches comm when exe is a loader" 0 \
+    ./anticheat protect --comm "$AC_LOADERNAME"
+expect_out "list shows loader-exe comm-matched pid" "$AC_COMMPID" ./anticheat list
+./anticheat unprotect --pid "$AC_COMMPID" >/dev/null 2>&1
+ac_comm_proc_kill
+
+AC_TRUNCNAME="ac107-trunc-$$-xxxxxx"
+AC_TRUNCNAME="${AC_TRUNCNAME:0:15}"
+ac_comm_proc "$AC_TRUNCNAME"
+expect_rc  "protect --comm rejects 15-char comm when exe mismatches" 1 \
+    ./anticheat protect --comm "$AC_TRUNCNAME"
+ac_comm_proc_kill
+
 echo "== protect: kernel-thread rejection (issue #69) =="
 # The real module now rejects PF_KTHREAD tasks in ac_add_prot_task(); the
 # mock mirrors that with a userspace analog (empty /proc/<pid>/cmdline --
