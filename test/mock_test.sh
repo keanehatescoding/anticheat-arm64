@@ -194,6 +194,11 @@ expect_out "vmcheck header"            "VM/hypervisor check:" ./anticheat vmchec
 expect_out "vmcheck DMI line"          "DMI/SMBIOS strings"   ./anticheat vmcheck
 
 echo "== events =="
+# Drain the queue first: protect/scan/syscalls sections above queue dozens
+# of events into the mock's 64-slot ring, so without this the ATTACK
+# open's own PTRACE is dropped at push time (ring full) and the grep
+# below fails on stale state rather than on daemon behavior.
+./anticheat events >/dev/null 2>&1
 expect_out "events: ptrace denied"     "PTRACE-DENIED"  env AC_MOCK_ATTACK=1 ./anticheat events
 expect_out "events: info"              "INFO"           ./anticheat events
 
@@ -296,6 +301,33 @@ if [ "$checksum_crit_count" -eq 1 ]; then
     pass "start: checksum-only mismatch alert logged exactly once"
 else
     fail "start: expected exactly 1 checksum mismatch log line, got $checksum_crit_count"
+fi
+
+# Same rising-edge proof for the hidden-module check (#108): the mock
+# always injects one module hidden from /proc/modules, so without dedup
+# the 10s poll would re-report at LOG_CRIT on every tick. A 12s run
+# crosses the second poll with margin -- exactly 1 line proves the
+# persistent module is reported once, then stays suppressed.
+hidden_out=$(timeout -k 2 --preserve-status 12 \
+    ./anticheat start --foreground 2>&1)
+hidden_crit_count=$(printf '%s' "$hidden_out" | grep -c "hidden from /proc/modules")
+if [ "$hidden_crit_count" -eq 1 ]; then
+    pass "start: hidden-module alert logged exactly once across polls"
+else
+    fail "start: expected exactly 1 hidden-module log line, got $hidden_crit_count"
+fi
+
+# Ring-overflow visibility (#109): AC_MOCK_FLOOD overflows the mock ring
+# once, so the first drain carries a nonzero el.dropped. The monitor
+# loop must log that loss at WARNING (never CRIT -- it must not
+# auto-file into the ban pipeline), exactly once for the one overflow.
+flood_out=$(timeout -k 2 --preserve-status 4 \
+    env AC_MOCK_FLOOD=1 ./anticheat start --foreground 2>&1)
+flood_warn_count=$(printf '%s' "$flood_out" | grep -c "event ring dropped")
+if [ "$flood_warn_count" -eq 1 ]; then
+    pass "start: ring-overflow warning logged exactly once"
+else
+    fail "start: expected exactly 1 ring-overflow warning, got $flood_warn_count"
 fi
 
 echo

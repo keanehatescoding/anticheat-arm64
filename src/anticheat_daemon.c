@@ -2363,6 +2363,24 @@ static unsigned int ac_clamp_event_count(unsigned int count, int *clamped)
     return count;
 }
 
+/* Drop-delta gate for the monitor loop's ring-overflow signal (issue
+ * #109). el.dropped is the kernel's cumulative count of events lost to
+ * ring overflow; the loop must notice when it grows between drains, or
+ * a burst of FORK/EXEC/EXIT noise can push the one PTRACE/SYSCALL_HOOK
+ * event that matters out of the ring with nobody seeing the daemon go
+ * blind. Pure (no ioctl), so it's unit-testable -- see
+ * test/daemon_reporting_test.c. Returns the number of newly-dropped
+ * events since the last call and updates *last. A counter reset
+ * (cur < *last, e.g. module reload) treats the current value itself as
+ * the delta rather than wrapping around the unsigned range. */
+static unsigned int ring_drop_delta(unsigned int cur, unsigned int *last)
+{
+    unsigned int delta = (cur >= *last) ? cur - *last : cur;
+
+    *last = cur;
+    return delta;
+}
+
 static int cmd_events(int argc, char **argv)
 {
     int watch = 0, i;
@@ -2458,11 +2476,55 @@ static int check_syscalls_periodic(void)
     return c.hooked;
 }
 
+/* Rising-edge gate for the periodic hidden-module check (issue #108).
+ * check_modules_periodic() runs every 10s, and without dedup one
+ * persistent hidden module re-reports at LOG_CRIT on every tick -- 6
+ * reports/min against one client_id, filling --max-reports-per-client
+ * and eating the server's rate-limit budget (see also #110). Same
+ * discipline as the baseline/render-hook dedup (#73): report the
+ * transition, not the state.
+ *
+ * Pure (no ioctl), so it's unit-testable -- see
+ * test/daemon_reporting_test.c. Returns 1 when the caller should
+ * log+report this walk. *last_reported tracks the last reported hidden
+ * count, 0 meaning nothing outstanding (re-armed). An inconclusive walk
+ * (hidden < 0, see #76) reports nothing and leaves *last_reported
+ * untouched, the same as the render-hook re-arm logic. Only growth
+ * re-reports: a shrinking-but-nonzero count lowers the watermark
+ * silently, so a later regrowth alerts again. (Set-level "changed but
+ * same size" detection would need crosscheck_modules() to return the
+ * hidden names, not just a count -- a swap that keeps the count flat
+ * stays silent; the count is the actionable signal available here.) */
+static int hidden_modules_rising_edge(long hidden, long *last_reported)
+{
+    if (hidden < 0)
+        return 0;
+    if (hidden == 0) {
+        *last_reported = 0;   /* confirmed clean: re-arm */
+        return 0;
+    }
+    if (hidden > *last_reported) {
+        *last_reported = hidden;
+        return 1;
+    }
+    *last_reported = hidden;
+    return 0;
+}
+
 static int check_modules_periodic(void)
 {
+    /* Rising-edge state for the hidden-module verdict -- same discipline
+     * as the baseline/render-hook dedup (#73) and the checksum-only edge
+     * above. Without it, one persistent hidden module re-reports at
+     * LOG_CRIT on every 10s tick (6 reports/min against one client_id,
+     * filling --max-reports-per-client and eating the server's
+     * rate-limit budget -- see #110). */
+    static long last_reported_hidden;
     long hidden = crosscheck_modules(0);
 
-    if (hidden > 0)
+    if (hidden < 0)
+        return -1;   /* inconclusive (#76): leave the edge untouched */
+    if (hidden_modules_rising_edge(hidden, &last_reported_hidden))
         logmsg(LOG_CRIT, "%ld module(s) hidden from /proc/modules", hidden);
     return (int)hidden;
 }
@@ -4365,35 +4427,151 @@ static int ac_report_backoff_active(unsigned consec_fail,
     return ac_report_remaining_ms(until, now) > 0;
 }
 
-/* Record a failed delivery. Arming (and re-arming) the cooldown is logged
- * here -- once per arming, not once per skipped event, so the logs don't
- * pile up either. A failure after an expired cooldown re-arms a fresh one
- * instead of leaving every later report to attempt a doomed synchronous
- * delivery. */
-static void ac_report_note_failure(void)
-{
-    struct timespec now;
+/* Record a failed delivery without any server backoff hint; see
+ * ac_report_note_failure_with_retry_after() below. */
+static void ac_report_note_failure(void);
 
-    if (ac_report_consec_fail < UINT_MAX)
-        ac_report_consec_fail++;
-    if (ac_report_consec_fail < AC_REPORT_FAIL_THRESHOLD)
-        return;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    ac_report_cooldown_until.tv_sec = now.tv_sec + AC_REPORT_COOLDOWN_SEC;
-    ac_report_cooldown_until.tv_nsec = now.tv_nsec;
-    fprintf(stderr,
-            "ac_report: %u consecutive failures, suppressing reports for "
-            "%d seconds\n",
-            ac_report_consec_fail, AC_REPORT_COOLDOWN_SEC);
-}
-
-/* Record a delivery the server actually answered (any HTTP status -- a
- * response at all proves the endpoint is reachable again). */
+/* Record a delivery the server actually accepted: HTTP 2xx. Anything
+ * else -- 429/503 backpressure, 4xx client errors, 5xx failures, or no
+ * parseable status at all -- counts as a failure (issue #110). The old
+ * code treated any response bytes as success, so a rate-limited (429)
+ * or overloaded (503) report reset the circuit breaker and was dropped
+ * permanently with only a stderr line. */
 static void ac_report_note_success(void)
 {
     ac_report_consec_fail = 0;
     ac_report_cooldown_until.tv_sec = 0;
     ac_report_cooldown_until.tv_nsec = 0;
+}
+
+/* Upper bound for a server-supplied Retry-After backoff (issue #110):
+ * a rogue or compromised endpoint must not be able to suppress
+ * reporting indefinitely with a huge value. */
+#define AC_REPORT_RETRY_AFTER_MAX_SEC 3600
+
+/* Record a failed delivery, optionally honoring the server's
+ * Retry-After hint (delta-seconds form, -1 when absent -- see
+ * ac_parse_retry_after()). A present hint arms the cooldown even
+ * below the consecutive-failure threshold: the server explicitly
+ * asked for backoff, so one more immediate attempt would just be
+ * another 429/503. The armed duration is the longer of the default
+ * cooldown and the hint -- waiting out at least what was asked for,
+ * never less. */
+static void ac_report_note_failure_with_retry_after(long retry_after_sec)
+{
+    struct timespec now;
+    long cooldown_sec = AC_REPORT_COOLDOWN_SEC;
+
+    if (ac_report_consec_fail < UINT_MAX)
+        ac_report_consec_fail++;
+    if (retry_after_sec > 0) {
+        long hint = retry_after_sec;
+
+        if (hint > AC_REPORT_RETRY_AFTER_MAX_SEC)
+            hint = AC_REPORT_RETRY_AFTER_MAX_SEC;
+        if (hint > cooldown_sec)
+            cooldown_sec = hint;
+        /* The hint arms the cooldown below the failure threshold, but
+         * ac_report_backoff_active() trips on the count -- raise it to
+         * the threshold so the armed cooldown actually suppresses.
+         * (The count still resets on the next 2xx via
+         * ac_report_note_success().) */
+        if (ac_report_consec_fail < AC_REPORT_FAIL_THRESHOLD)
+            ac_report_consec_fail = AC_REPORT_FAIL_THRESHOLD;
+    } else if (ac_report_consec_fail < AC_REPORT_FAIL_THRESHOLD) {
+        return;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    ac_report_cooldown_until.tv_sec = now.tv_sec + cooldown_sec;
+    ac_report_cooldown_until.tv_nsec = now.tv_nsec;
+    if (retry_after_sec > 0)
+        fprintf(stderr,
+                "ac_report: server asked to back off (Retry-After %ld), "
+                "suppressing reports for %ld seconds\n",
+                retry_after_sec, cooldown_sec);
+    else
+        fprintf(stderr,
+                "ac_report: %u consecutive failures, suppressing reports for "
+                "%ld seconds\n",
+                ac_report_consec_fail, cooldown_sec);
+}
+
+/* Arming (and re-arming) the cooldown is logged in
+ * ac_report_note_failure_with_retry_after() -- once per arming, not
+ * once per skipped event, so the logs don't pile up either. A failure
+ * after an expired cooldown re-arms a fresh one instead of leaving
+ * every later report to attempt a doomed synchronous delivery. */
+static void ac_report_note_failure(void)
+{
+    ac_report_note_failure_with_retry_after(-1);
+}
+
+/* Parses the Retry-After response header (delta-seconds form) out of a
+ * raw HTTP response -- issue #110's backoff hint. Header names are
+ * case-insensitive (RFC 9110 section 5.1); only the numeric form is
+ * understood, an HTTP-date falls back to -1 (absent) and the default
+ * cooldown, which is the safe direction. Returns the seconds value
+ * clamped to 1..AC_REPORT_RETRY_AFTER_MAX_SEC, or -1 when the header
+ * is absent or unparseable. Pure, so it's unit-testable -- see
+ * test/daemon_reporting_test.c. */
+static long ac_parse_retry_after(const char *resp)
+{
+    static const char name[] = "retry-after:";
+    const char *p;
+    long val = 0;
+    int digits = 0;
+
+    if (!resp)
+        return -1;
+    /* Case-insensitive header-name scan: the response is small (one
+     * bounded read, see ac_report()), so a portable manual match
+     * avoids pulling in strings.h for a single strncasecmp. Only a
+     * line-start match counts -- otherwise "X-Retry-After: 5" (or any
+     * other suffixed name) would be misread as the real header. */
+    for (p = resp; *p; p++) {
+        size_t k;
+
+        if (p != resp && *(p - 1) != '\n')
+            continue;
+        for (k = 0; k < sizeof(name) - 1; k++) {
+            char c = p[k];
+
+            if (c >= 'A' && c <= 'Z')
+                c += (char)('a' - 'A');
+            if (c != name[k])
+                break;
+        }
+        if (k == sizeof(name) - 1)
+            break;
+    }
+    if (!*p)
+        return -1;
+    p += sizeof(name) - 1;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    while (*p >= '0' && *p <= '9') {
+        /* Accumulate saturating: a 20-digit value must clamp, not
+         * wrap into something small or negative. */
+        if (val < LONG_MAX / 10)
+            val = val * 10 + (*p - '0');
+        digits++;
+        p++;
+    }
+    if (!digits)
+        return -1;
+    if (val < 1)
+        return -1;
+    if (val > AC_REPORT_RETRY_AFTER_MAX_SEC)
+        return AC_REPORT_RETRY_AFTER_MAX_SEC;
+    return val;
+}
+
+/* Delivery verdict for an HTTP response (issue #110): only a completed
+ * read (n > 0) with a 2xx status counts as delivered. Kept separate so
+ * the boundary is unit-testable -- see test/daemon_reporting_test.c. */
+static int ac_report_delivered(ssize_t n, int code)
+{
+    return n > 0 && code >= 200 && code < 300;
 }
 
 /* Formats the HTTP Host: header value for a parsed destination. Bare
@@ -4426,7 +4604,7 @@ static void ac_report(const char *event_type, const char *detail)
     const char *url = getenv("AC_REPORT_URL");
     const char *key = getenv("AC_REPORT_KEY");
     char client_id[128], client_id_esc[256], et_esc[64], detail_esc[600];
-    char body[1024], req[2048], resp[64];
+    char body[1024], req[2048], resp[1024];
     struct ac_report_dest dest;
     struct ac_resolved_addr addrs[AC_RESOLVE_MAX];
     int fd = -1, naddrs, ai;
@@ -4629,7 +4807,46 @@ static void ac_report(const char *event_type, const char *detail)
             return;
         }
     }
-    n = read(fd, resp, sizeof(resp) - 1);
+    n = 0;
+    {
+        /* Read far enough to cover the status line plus the response
+         * headers: the status code decides delivered vs. failed (#57),
+         * and Retry-After decides how long a 429/503 backs off (#110).
+         * One read() usually returns the whole small response, but TCP
+         * gives no such guarantee -- loop until the header terminator,
+         * the buffer fills, EOF, or an error. Bounded by one absolute
+         * deadline shared across iterations (same technique as
+         * ac_resolve_timeout()), so a trickling peer can't stall the
+         * monitor loop one SO_RCVTIMEO per byte. */
+        struct timespec deadline, cnow;
+        size_t have = 0;
+
+        clock_gettime(CLOCK_MONOTONIC, &deadline);
+        deadline.tv_sec += AC_REPORT_TIMEOUT_SEC;
+        for (;;) {
+            struct pollfd p = { .fd = fd, .events = POLLIN };
+            long remain_ms;
+            ssize_t r;
+
+            clock_gettime(CLOCK_MONOTONIC, &cnow);
+            remain_ms = ac_report_remaining_ms(&deadline, &cnow);
+            if (remain_ms <= 0)
+                break;   /* response budget exhausted */
+            if (poll(&p, 1, (int)remain_ms) <= 0)
+                break;   /* timed out waiting, or poll error */
+            r = read(fd, resp + have, sizeof(resp) - 1 - have);
+            if (r <= 0)
+                break;   /* EOF (server closed) or read error */
+            have += (size_t)r;
+            resp[have] = '\0';
+            if (strstr(resp, "\r\n\r\n"))
+                break;   /* full headers, body not needed */
+            if (have >= sizeof(resp) - 1)
+                break;   /* buffer full: status + Retry-After
+                          * parsed best-effort below */
+        }
+        n = (ssize_t)have;
+    }
     {
         int code = -1;
         char body[64];
@@ -4642,7 +4859,6 @@ static void ac_report(const char *event_type, const char *detail)
          * silently falling through with no operator-visible indication
          * that the report never landed. */
         if (n > 0) {
-            resp[n] = '\0';
             /* Parse the numeric status code from the status line only
              * -- scanning the whole raw response for " 200"/" 201" as
              * substrings would also match those digits inside a header
@@ -4656,15 +4872,20 @@ static void ac_report(const char *event_type, const char *detail)
             snprintf(body, sizeof(body), "(read failed: %s)",
                      strerror(errno));
         }
-        /* A response -- any status -- proves the endpoint is reachable
-         * again; silence (close/timeout) counts as another failure. */
-        if (n > 0)
+        /* Issue #110: only 2xx counts as delivered. A 429/503 (or any
+         * other non-2xx) is a failed delivery: it arms the backoff via
+         * ac_report_note_failure(), honoring Retry-After when the
+         * server sent one, instead of resetting the breaker and
+         * dropping the report as the old any-bytes-means-success
+         * logic did. */
+        if (ac_report_delivered(n, code)) {
             ac_report_note_success();
-        else
-            ac_report_note_failure();
-        if (code < 200 || code >= 300)
+        } else {
+            ac_report_note_failure_with_retry_after(
+                n > 0 ? ac_parse_retry_after(resp) : -1);
             fprintf(stderr, "ac_report: server response status %d: %s\n",
                     code, body);
+        }
     }
     close(fd);
 }
@@ -4841,6 +5062,7 @@ static int cmd_start(int argc, char **argv)
         time_t next_sys = 0, next_mod = 0, next_scan = 0, next_baseline = 0;
         time_t next_render = 0, next_preload = 0, next_vklayer = 0;
         time_t next_implicit = 0;
+        unsigned int last_dropped = 0;
 
         while (!g_stop) {
             struct ac_event_list el;
@@ -4870,6 +5092,22 @@ static int cmd_start(int argc, char **argv)
             if (got == 0) {
                 unsigned int nev, k;
                 int clamped = 0;
+                unsigned int dropped_delta;
+
+                /* Issue #109: el.dropped is the only signal that the
+                 * event ring overflowed between drains, silently
+                 * losing PTRACE/SYSCALL_HOOK events. LOG_WARNING, not
+                 * LOG_CRIT: the loss itself is an operational signal,
+                 * and LOG_CRIT would auto-file it into the ban
+                 * pipeline as a detection via logmsg()'s report
+                 * hook. */
+                dropped_delta = ring_drop_delta(el.dropped, &last_dropped);
+                if (dropped_delta)
+                    logmsg(LOG_WARNING,
+                           "event ring dropped %u event(s) since last drain "
+                           "-- PTRACE/SYSCALL_HOOK detections may have been "
+                           "lost",
+                           dropped_delta);
 
                 /* Module-supplied count: clamp to the array we own
                  * before indexing (issue #85 -- see

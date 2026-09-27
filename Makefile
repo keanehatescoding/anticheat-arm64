@@ -235,6 +235,21 @@ test/ac_report_cooldown_test: test/ac_report_cooldown_test.c src/anticheat_daemo
 # spawns real sleeper processes against the real /proc, like
 # mock_test.sh's issue-#69 block; the #85 half is pure function calls.
 # See test/daemon_limits_test.c.
+# daemon event/report-reliability unit test (#108 + #109 + #110): pulls
+# anticheat_daemon.c in directly (no kernel/mock scan involved) and
+# proves hidden_modules_rising_edge() reports a hidden-module
+# transition once (re-arms on clean, ignores inconclusive walks),
+# ring_drop_delta() reports newly-dropped ring events across drains
+# (including a counter reset), ac_report_delivered() counts only 2xx as
+# delivered, ac_parse_retry_after() honors the delta-seconds hint, and
+# the real ac_report() increments the breaker on a loopback 429 and
+# resets it on a 200. See test/daemon_reporting_test.c.
+daemon-reporting-test: test/daemon_reporting_test
+	./test/daemon_reporting_test
+
+test/daemon_reporting_test: test/daemon_reporting_test.c src/anticheat_daemon.c src/sha256.c src/sha256.h src/anticheat.h
+	$(CC) $(CFLAGS) -o $@ test/daemon_reporting_test.c src/sha256.c $(LDFLAGS)
+
 daemon-limits-test: test/daemon_limits_test
 	./test/daemon_limits_test
 
@@ -272,7 +287,7 @@ ci:
 	else \
 		echo "warning: aarch64-linux-gnu-gcc not installed -- skipping aarch64 cross-build (CI enforces it)"; \
 	fi
-	$(MAKE) CFLAGS="-O2 -Wall -Wextra -Werror" daemon mock baseline-test ac-report-status-test ac-report-url-test ac-report-cooldown-test daemon-limits-test
+	$(MAKE) CFLAGS="-O2 -Wall -Wextra -Werror" daemon mock baseline-test ac-report-status-test ac-report-url-test ac-report-cooldown-test daemon-limits-test daemon-reporting-test
 	./test/mock_test.sh
 	$(MAKE) CFLAGS="-O2 -Wall -Wextra -Werror" priv-drop-test render-hook-test mount-ns-test ioctl-fuzz
 # Dry run only -- against the mock, not a real kernel module: proves the
@@ -386,7 +401,7 @@ ci-aur-check:
 
 clean:
 	@if [ -d "$(KDIR)" ]; then $(MAKE) -C "$(KDIR)" M="$(PWD)" clean; fi
-	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test test/mount_ns_probe test/anon_exec_test test/thread_exit_migration_test test/thread_spawn_after_protect_test test/ioctl_fuzz test/baseline_test test/ac_report_status_test test/ac_report_url_test test/ac_report_cooldown_test test/daemon_limits_test
+	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test test/mount_ns_probe test/anon_exec_test test/thread_exit_migration_test test/thread_spawn_after_protect_test test/ioctl_fuzz test/baseline_test test/ac_report_status_test test/ac_report_url_test test/ac_report_cooldown_test test/daemon_limits_test test/daemon_reporting_test
 
 install: all
 	@if [ -z "$(DESTDIR)" ] && [ "$$(id -u)" -ne 0 ]; then echo "error: 'make install' writes to /usr/local and /lib/modules -- run as root, or set DESTDIR= for a staged/packaging install"; exit 1; fi
@@ -421,4 +436,4 @@ install-deck: all
 uninstall-deck:
 	rm -rf "$(DECK_PREFIX)"
 
-.PHONY: all module daemon mock test-mock priv-drop-test render-hook-test mount-ns-test thread-exit-migration-test thread-spawn-after-protect-test ioctl-fuzz baseline-test ac-report-status-test ac-report-url-test ac-report-cooldown-test daemon-limits-test ci ci-aur-check clean install uninstall install-deck uninstall-deck
+.PHONY: all module daemon mock test-mock priv-drop-test render-hook-test mount-ns-test thread-exit-migration-test thread-spawn-after-protect-test ioctl-fuzz baseline-test ac-report-status-test ac-report-url-test ac-report-cooldown-test daemon-limits-test daemon-reporting-test ci ci-aur-check clean install uninstall install-deck uninstall-deck
