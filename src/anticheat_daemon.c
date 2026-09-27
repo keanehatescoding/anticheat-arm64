@@ -21,7 +21,9 @@
  *                           an exact /proc/<pid>/exe basename match
  *                           (untruncated), falling back to the raw,
  *                           15-char-truncated /proc/<pid>/comm string
- *                           when /proc/<pid>/exe isn't usable
+ *                           when /proc/<pid>/exe isn't usable, or names
+ *                           a loader (FEX/box64, Wine, #!) and NAME is
+ *                           under 15 chars
  *   unprotect --pid N      remove protection
  *   unprotect --pid N --ns-of REFPID   remove protection from a pid as
  *                           seen inside the pid namespace that host-pid
@@ -326,6 +328,10 @@ static int exe_path_matches(int pid, const char *comm)
  * reject every pid the exe-based match found (since that match exists
  * precisely for names whose truncated comm does *not* equal `comm`).
  *
+ * An exe mismatch doesn't veto a short (< 15 char) exact comm match, so
+ * games run through FEX/box64, Wine/Proton or a script launcher are
+ * still found (issue #107).
+ *
  * Returns 1 on a match (and, if comm_out is non-NULL, copies pid's current
  * /proc/<pid>/comm string into it -- the same value that's always been
  * stored in the kernel registry's informational comm field, even when the
@@ -336,10 +342,20 @@ static int pid_identifies_as(int pid, const char *comm, char *comm_out,
     int exe_match = exe_path_matches(pid, comm);
     char buf[AC_MAX_COMM + 1];
 
-    if (exe_match == 0)
-        return 0;   /* exe readable and definitively not this target */
-
-    if (exe_match < 0) {
+    if (exe_match == 0) {
+        /* exe readable but names something else. That's often an
+         * interpreter/loader rather than the game itself (issue #107):
+         * FEXInterpreter/box64 via binfmt_misc, wine64-preloader under
+         * Wine/Proton, bash/python for a #! launcher -- while comm still
+         * carries the game's name. comm is only trustworthy when the
+         * target is short enough that the kernel can't have truncated
+         * it (< TASK_COMM_LEN-1 chars); a 15+ char target could be a
+         * truncated prefix of an unrelated name, which is exactly the
+         * collision the exe match exists to avoid (issue #69). */
+        if (strlen(comm) >= AC_MAX_COMM - 1 ||
+            read_comm(pid, buf, sizeof(buf)) < 0 || strcmp(buf, comm) != 0)
+            return 0;
+    } else if (exe_match < 0) {
         /* exe unusable (gone, permission denied on another user's
          * process, or a deleted/replaced binary) -- fall back to the
          * original comm-string match so this doesn't regress any case
