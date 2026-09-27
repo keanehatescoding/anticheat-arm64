@@ -17,8 +17,9 @@
  *        ac_report_delivered(), ac_parse_retry_after(), and the
  *        failure/backoff wiring -- including end to end, driving the
  *        real ac_report() against a loopback server that answers 429
- *        (then 200), so the old "any response bytes mean success"
- *        behavior would fail the assertions.
+ *        (then 200, then a truncated 200), so the old
+ *        "any response bytes mean success" behavior would fail the
+ *        assertions.
  *
  * Pulls anticheat_daemon.c in as-is (renaming its main() out of the way)
  * to test the real helpers, not duplicated copies.
@@ -182,24 +183,29 @@ int main(void)
               "current value, not a wrapped-around huge delta");
     }
 
-    /* #110: delivery verdict boundary */
-    CHECK(ac_report_delivered(12, 200),
+    /* #110: delivery verdict boundary (have_headers = 1: the header
+     * terminator arrived; 0: the peer closed or stalled after the
+     * status line) */
+    CHECK(ac_report_delivered(12, 200, 1),
           "#110: 200 with a body counts as delivered");
-    CHECK(ac_report_delivered(12, 201),
+    CHECK(ac_report_delivered(12, 201, 1),
           "#110: 201 counts as delivered");
-    CHECK(!ac_report_delivered(12, 429),
+    CHECK(!ac_report_delivered(12, 200, 0),
+          "#110: a 2xx whose headers never fully arrived counts as "
+          "failed, not delivered");
+    CHECK(!ac_report_delivered(12, 429, 1),
           "#110: 429 counts as failed, not delivered");
-    CHECK(!ac_report_delivered(12, 503),
+    CHECK(!ac_report_delivered(12, 503, 1),
           "#110: 503 counts as failed, not delivered");
-    CHECK(!ac_report_delivered(12, 500),
+    CHECK(!ac_report_delivered(12, 500, 1),
           "#110: 500 counts as failed, not delivered");
-    CHECK(!ac_report_delivered(12, 400),
+    CHECK(!ac_report_delivered(12, 400, 1),
           "#110: 400 counts as failed, not delivered");
-    CHECK(!ac_report_delivered(12, -1),
+    CHECK(!ac_report_delivered(12, -1, 1),
           "#110: an unparseable status counts as failed");
-    CHECK(!ac_report_delivered(0, 200),
+    CHECK(!ac_report_delivered(0, 200, 0),
           "#110: an empty read counts as failed even with a 2xx code");
-    CHECK(!ac_report_delivered(-1, 200),
+    CHECK(!ac_report_delivered(-1, 200, 0),
           "#110: a failed read counts as failed even with a 2xx code");
 
     /* #110: Retry-After parsing (delta-seconds only) */
@@ -318,6 +324,15 @@ int main(void)
               "#110: a 200 response still resets consecutive failures");
         CHECK(ac_report_cooldown_until.tv_sec == 0,
               "#110: a 200 response clears the cooldown deadline");
+
+        /* Review follow-up: a 2xx status line followed by EOF before
+         * the header terminator must not count as delivered (the old
+         * any-bytes-means-success logic reset the breaker here too). */
+        CHECK(run_report_exchange("HTTP/1.1 200 OK\r\n") == 0,
+              "#110: the truncated-200 exchange itself ran");
+        CHECK(ac_report_consec_fail == 1,
+              "#110: a 200 with truncated headers increments "
+              "consecutive failures instead of resetting them");
     }
 
     if (failures) {

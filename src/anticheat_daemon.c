@@ -4567,11 +4567,15 @@ static long ac_parse_retry_after(const char *resp)
 }
 
 /* Delivery verdict for an HTTP response (issue #110): only a completed
- * read (n > 0) with a 2xx status counts as delivered. Kept separate so
- * the boundary is unit-testable -- see test/daemon_reporting_test.c. */
-static int ac_report_delivered(ssize_t n, int code)
+ * read (n > 0) with complete headers and a 2xx status counts as
+ * delivered. The status line alone is not enough: a peer that sends a
+ * 2xx line and then closes or stalls before the header terminator may
+ * never have produced a real verdict at all, and recording success
+ * would drop the report without retry. Kept separate so the boundary
+ * is unit-testable -- see test/daemon_reporting_test.c. */
+static int ac_report_delivered(ssize_t n, int code, int have_headers)
 {
-    return n > 0 && code >= 200 && code < 300;
+    return have_headers && n > 0 && code >= 200 && code < 300;
 }
 
 /* Formats the HTTP Host: header value for a parsed destination. Bare
@@ -4611,6 +4615,7 @@ static void ac_report(const char *event_type, const char *detail)
     struct timeval tv;
     struct timespec now;
     ssize_t n;
+    int have_headers = 0;
 
     if (!url || !*url || !key || !*key)
         return;   /* not configured -- silently a no-op, by design */
@@ -4821,6 +4826,7 @@ static void ac_report(const char *event_type, const char *detail)
         struct timespec deadline, cnow;
         size_t have = 0;
 
+        have_headers = 0;
         clock_gettime(CLOCK_MONOTONIC, &deadline);
         deadline.tv_sec += AC_REPORT_TIMEOUT_SEC;
         for (;;) {
@@ -4839,11 +4845,20 @@ static void ac_report(const char *event_type, const char *detail)
                 break;   /* EOF (server closed) or read error */
             have += (size_t)r;
             resp[have] = '\0';
-            if (strstr(resp, "\r\n\r\n"))
+            if (strstr(resp, "\r\n\r\n")) {
+                have_headers = 1;
                 break;   /* full headers, body not needed */
-            if (have >= sizeof(resp) - 1)
-                break;   /* buffer full: status + Retry-After
-                          * parsed best-effort below */
+            }
+            if (have >= sizeof(resp) - 1) {
+                /* Buffer full: the status line and ~1KB of headers
+                 * arrived, which is all the verdict and Retry-After
+                 * need -- treat as complete rather than failing a
+                 * legitimate (if header-heavy, e.g. proxied) response.
+                 * A close/stall before this point leaves
+                 * have_headers at 0 and the delivery below fails. */
+                have_headers = 1;
+                break;
+            }
         }
         n = (ssize_t)have;
     }
@@ -4872,13 +4887,16 @@ static void ac_report(const char *event_type, const char *detail)
             snprintf(body, sizeof(body), "(read failed: %s)",
                      strerror(errno));
         }
-        /* Issue #110: only 2xx counts as delivered. A 429/503 (or any
-         * other non-2xx) is a failed delivery: it arms the backoff via
-         * ac_report_note_failure(), honoring Retry-After when the
+        /* Issue #110: only a complete 2xx response counts as delivered.
+         * A 429/503 (or any other non-2xx -- or a 2xx whose headers
+         * never fully arrived, e.g. the peer closed or stalled after
+         * the status line) is a failed delivery: it arms the backoff
+         * via ac_report_note_failure(), honoring Retry-After when the
          * server sent one, instead of resetting the breaker and
          * dropping the report as the old any-bytes-means-success
-         * logic did. */
-        if (ac_report_delivered(n, code)) {
+         * logic did. The parsed status is still logged best-effort
+         * below even when the headers are incomplete. */
+        if (ac_report_delivered(n, code, have_headers)) {
             ac_report_note_success();
         } else {
             ac_report_note_failure_with_retry_after(
