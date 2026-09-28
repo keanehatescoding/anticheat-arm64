@@ -144,6 +144,12 @@ make -C "$KDIR" defconfig
 # frame sizes past the default warning threshold; that's expected
 # instrumentation overhead, not a bug in this module's own code.
 #
+# KPROBES/KRETPROBES: arm64 defconfig leaves them off, and without them
+# every probe (ptrace/process_vm/prctl/exec/fork) and the kallsyms-based
+# syscall-table lookup fail with -EOPNOTSUPP. The module still loads, so
+# earlier runs "passed" with enforcement entirely inert (found via the
+# #116 ptracer check). The gate after boot also rejects a 0-kprobe load.
+#
 # scripts/config, not scripts/kconfig/merge_config.sh: the same tool
 # ci.yml's own module job already uses (for MODULE_SIG/MODULE_SIG_SHA256)
 # and has a real, verified-working track record in this exact CI
@@ -157,6 +163,8 @@ make -C "$KDIR" defconfig
     --enable LOCKDEP \
     --enable PROVE_LOCKING \
     --enable DEBUG_ATOMIC_SLEEP \
+    --enable KPROBES \
+    --enable KRETPROBES \
     --set-val FRAME_WARN 0
 make -C "$KDIR" olddefconfig
 
@@ -164,7 +172,8 @@ make -C "$KDIR" olddefconfig
 # silently didn't stick (e.g. a missing dependency) -- verify explicitly
 # rather than discovering a plain, uninstrumented boot later via absence
 # of any KASAN output at all.
-for sym in CONFIG_KASAN CONFIG_KASAN_GENERIC CONFIG_LOCKDEP CONFIG_PROVE_LOCKING; do
+for sym in CONFIG_KASAN CONFIG_KASAN_GENERIC CONFIG_LOCKDEP CONFIG_PROVE_LOCKING \
+           CONFIG_KPROBES CONFIG_KRETPROBES; do
     grep -qx "${sym}=y" "$KDIR/.config" || {
         echo "FATAL: $sym did not stick after olddefconfig -- see $KDIR/.config" >&2
         exit 1
@@ -482,6 +491,14 @@ if ! grep -q 'AC_KASAN_BOOT: POSITIVE CONTROL OK' "$CONSOLE_LOG"; then
     echo "FAIL: positive-control marker absent from the console log. The payload" >&2
     echo "      did not reach the module-walk assertion, so a clean sanitizer" >&2
     echo "      grep above proves nothing. See the console log above." >&2
+    exit 1
+fi
+
+# The module loads (and the checks above can pass) even when no probe
+# registered; that's a run that exercised none of the enforcement paths.
+if grep -qE 'anticheat: loaded \(.*, 0 kprobes' "$CONSOLE_LOG"; then
+    echo "FAIL: anticheat.ko loaded with 0 kprobes -- enforcement was inert for" >&2
+    echo "      this whole run (kernel built without CONFIG_KPROBES?)." >&2
     exit 1
 fi
 
