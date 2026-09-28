@@ -74,6 +74,23 @@ userspace daemon/CLI that talks to it over a small ioctl interface
    cleanly with `-ESRCH` before touching a single byte of the protected
    process's memory, and the same kill policy applies.
 
+   **Crash reporters.** A protected process can exempt one tracer with
+   `prctl(PR_SET_PTRACER, pid)`, the same opt-in Yama's
+   `ptrace_scope=1` uses (tracked by a kprobe on `__arm64_sys_prctl`).
+   The nominated thread group may then `ptrace` and `process_vm_*` that
+   process. This covers in-process crash reporters: Breakpad's
+   `clone()`d dump helper and a spawned `crashpad_handler` both
+   nominate themselves this way. Without the exemption, every crash
+   would produce a false `AC_EV_PTRACE` alert, a SIGKILLed reporter,
+   and no minidump. The nomination is bound to that exact process (a
+   recycled pid number doesn't inherit it). Passing 0 clears it, and it
+   is dropped on exec and never inherited by children.
+   `PR_SET_PTRACER_ANY` is **not** honoured: it would let any process
+   on the system attach, so it clears the nomination instead. Each
+   nomination is logged as an `AC_EV_INFO` event. Only the protected
+   process itself can nominate, so a cheat that could make it call
+   `prctl` already has code execution inside it.
+
 5. **Fork / exec / exit tracing.** kretprobe on `kernel_clone` (inheritance +
    events), kprobe pre-handlers on `do_exit` and `__arm64_sys_execve[at]`/
    `__arm64_compat_sys_execve[at]` (execve/execveat have distinct compat

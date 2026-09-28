@@ -16,6 +16,7 @@ DAEMON_PID=""
 REPORT_SERVER_PID=""
 MIGTEST_PID=""
 SPAWNTEST_PID=""
+PTRACERTEST_PID=""
 CHILD_PIDFILE=""
 FAILED=0
 
@@ -31,6 +32,7 @@ cleanup() {
     [ -n "$REPORT_SERVER_PID" ] && kill "$REPORT_SERVER_PID" 2>/dev/null
     [ -n "$MIGTEST_PID" ] && kill -9 "$MIGTEST_PID" 2>/dev/null
     [ -n "$SPAWNTEST_PID" ] && kill -9 "$SPAWNTEST_PID" 2>/dev/null
+    [ -n "$PTRACERTEST_PID" ] && kill -9 "$PTRACERTEST_PID" 2>/dev/null
     [ -n "$CHILD_PIDFILE" ] && rm -f "$CHILD_PIDFILE"
     [ -n "${AC_TMPDIR:-}" ] && rm -rf "$AC_TMPDIR"
     sleep 0.2
@@ -46,6 +48,7 @@ make >/dev/null 2>&1 || { echo "build failed"; exit 1; }
 make priv-drop-test >/dev/null 2>&1 || { echo "priv-drop-test build failed"; exit 1; }
 make thread-exit-migration-test >/dev/null 2>&1 || { echo "thread-exit-migration-test build failed"; exit 1; }
 make thread-spawn-after-protect-test >/dev/null 2>&1 || { echo "thread-spawn-after-protect-test build failed"; exit 1; }
+make ptracer-nominate-test >/dev/null 2>&1 || { echo "ptracer-nominate-test build failed"; exit 1; }
 
 say "loading anticheat.ko"
 rmmod anticheat 2>/dev/null
@@ -250,6 +253,42 @@ sleep 0.5
 EVENTS=$(./anticheat events)
 if printf '%s' "$EVENTS" | grep -q "PTRACE-DENIED"; then ok "PTRACE-DENIED event logged"; else bad "no ptrace event"; fi
 if printf '%s' "$EVENTS" | grep -q "FORK"; then ok "FORK event logged"; else bad "no fork event"; fi
+
+say "crash-reporter exemption: PR_SET_PTRACER nominee may ptrace its protected parent (#116)"
+coproc PTRACERTEST { ./test/ptracer_nominate_test; }
+read -r -t 5 _ PTRACER_PID <&"${PTRACERTEST[0]}" || PTRACER_PID=""
+if [ -n "$PTRACER_PID" ] && ./anticheat protect --pid "$PTRACER_PID" >/dev/null; then
+    echo go >&"${PTRACERTEST[1]}"
+    PTRACER_SKIPPED=0
+    # expected verdict per case; see the helper's header comment
+    while read -r -t 10 tag name verdict <&"${PTRACERTEST[0]}"; do
+        case "$tag" in
+            SKIP) say "skipped: $name $verdict"; PTRACER_SKIPPED=1; break ;;
+            DONE) break ;;
+            RESULT) ;;
+            *) continue ;;
+        esac
+        want=denied
+        [ "$name" = nominated ] && want=allowed
+        if [ "$verdict" = "$want" ]; then
+            ok "$name: $verdict"
+        else
+            bad "$name: got $verdict, want $want"
+        fi
+    done
+    if [ "$PTRACER_SKIPPED" -eq 1 ]; then
+        :
+    elif ./anticheat events | grep -q "PR_SET_PTRACER_ANY ignored"; then
+        ok "PR_SET_PTRACER_ANY logged as ignored"
+    else
+        bad "no event for ignored PR_SET_PTRACER_ANY"
+    fi
+else
+    bad "ptracer_nominate_test did not report PID or could not be protected"
+fi
+kill -9 "$PTRACERTEST_PID" 2>/dev/null
+wait "$PTRACERTEST_PID" 2>/dev/null
+PTRACERTEST_PID=""
 
 say "pid-namespace resolution: protect --pid inside another namespace via --ns-of"
 # --comm already works across pid namespaces for free (it walks /proc from
