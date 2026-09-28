@@ -326,9 +326,13 @@ kill "\$V" 2>/dev/null
 # children that ptrace it, so this also drives ac_prctl_pre() and the
 # nomination refcounting under KASAN/lockdep. It blocks on stdin until
 # protected; a FIFO stands in for bash's coproc (this payload runs under
-# /bin/sh).
-PT_DIR=\$(mktemp -d)
-mkfifo "\$PT_DIR/in"
+# /bin/sh). The guest's root (and so /tmp) is a read-only 9p mount;
+# virtme mounts a tmpfs on /run, so the FIFO lives there.
+PT_DIR=\$(mktemp -d /run/ac_ptracer.XXXXXX) && mkfifo "\$PT_DIR/in" || {
+    echo "AC_KASAN_BOOT: PTRACER CHECK FAILED (no writable dir for the FIFO)"
+    PT_DIR=
+}
+if [ -n "\$PT_DIR" ]; then
 ./test/ptracer_nominate_test <"\$PT_DIR/in" >"\$PT_DIR/out" 2>&1 &
 PT_PID=\$!
 exec 9>"\$PT_DIR/in"
@@ -352,6 +356,7 @@ else
     echo "AC_KASAN_BOOT: PTRACER CHECK FAILED (see RESULT lines above)"
 fi
 rm -rf "\$PT_DIR"
+fi
 
 echo "AC_KASAN_BOOT: running the real ioctl fuzz harness (full pointer-corruption fuzzing, no safe-pointers-only)"
 ./test/ioctl_fuzz $IOCTL_FUZZ_ITERATIONS $IOCTL_FUZZ_SEED
