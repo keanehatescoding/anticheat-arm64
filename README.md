@@ -854,7 +854,8 @@ sudo ./anticheat start            # run the monitor
 to `/lib/modules/$(uname -r)/extra/`, the systemd unit to
 `/usr/local/lib/systemd/system/`, and a logrotate snippet to
 `/etc/logrotate.d/anticheat` (only the first time, so a re-install won't
-overwrite your edits to it).
+overwrite your edits to it; `make uninstall` likewise removes it only if
+it's unchanged).
 
 #### Running the daemon
 
@@ -895,7 +896,11 @@ fork), prints the daemon's pid, and:
 
 `--foreground` writes a pid file only if you pass `--pid-file`, and
 ignores the log file (its output stays on the terminal, or goes to the
-journal under the unit). Both paths must be absolute.
+journal under the unit). Both paths must be absolute, and a symlink at
+either one is refused rather than followed (the daemon is root, so
+following one in a writable directory would let it truncate or append to
+an arbitrary file). If the pid file can't be written, `start` fails and
+the new daemon is killed.
 
 ### Automatic rebuild on kernel updates + Secure Boot (DKMS)
 

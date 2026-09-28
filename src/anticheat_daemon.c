@@ -4952,12 +4952,26 @@ static void ac_report(const char *event_type, const char *detail)
  * final daemon process lives -- and drops it the instant that process
  * dies, however it dies. The pid itself is written later by
  * pidfile_write(), once the final daemon pid is known. */
+/* O_NOFOLLOW on both the pid file and the log file: --pid-file /
+ * --log-file / AC_LOG_FILE can point anywhere, and in a directory
+ * someone else can write to, following a planted symlink would have
+ * this root process truncate (pid file) or append to (log) whatever
+ * file it points at. This only checks the last path component, but
+ * that's the part a user who can write to the directory controls. */
+static void die_open(const char *what, const char *path)
+{
+    if (errno == ELOOP)
+        die("refusing to open %s %s: it is a symlink -- pass the real "
+            "path instead", what, path);
+    die("cannot open %s %s: %s", what, path, strerror(errno));
+}
+
 static int pidfile_lock(const char *path)
 {
-    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
 
     if (fd < 0)
-        die("cannot open pid file %s: %s", path, strerror(errno));
+        die_open("pid file", path);
     if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
         char buf[32] = "";
         ssize_t r;
@@ -4974,13 +4988,17 @@ static int pidfile_lock(const char *path)
     return fd;
 }
 
-/* Best-effort: a failed pid write leaves the lock (the part that stops a
- * second daemon) intact, so it's reported rather than fatal. */
-static void pidfile_write(int fd, const char *path, pid_t pid)
+/* Returns 0, or -1 after printing why. The caller fails `start` on -1:
+ * a start that reports success while the pid file it was asked for is
+ * empty or stale would leave a script reading the wrong pid. */
+static int pidfile_write(int fd, const char *path, pid_t pid)
 {
-    if (ftruncate(fd, 0) < 0 || dprintf(fd, "%d\n", (int)pid) < 0)
+    if (ftruncate(fd, 0) < 0 || dprintf(fd, "%d\n", (int)pid) < 0) {
         fprintf(stderr, "anticheat: cannot write pid file %s: %s\n",
                 path, strerror(errno));
+        return -1;
+    }
+    return 0;
 }
 
 static int cmd_start(int argc, char **argv)
@@ -5049,10 +5067,11 @@ static int cmd_start(int argc, char **argv)
     if (pid_file)
         pid_fd = pidfile_lock(pid_file);
     if (!foreground) {
-        log_fd = open(log_file, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC,
+        log_fd = open(log_file,
+                      O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC | O_NOFOLLOW,
                       0640);
         if (log_fd < 0)
-            die("cannot open log file %s: %s", log_file, strerror(errno));
+            die_open("log file", log_file);
     }
 
     if (!foreground) {
@@ -5103,8 +5122,14 @@ static int cmd_start(int argc, char **argv)
 
             /* Written here, before the pid goes back up the pipe, so the
              * pid file already exists by the time `start` returns to its
-             * caller -- a script can read it straight away. */
-            pidfile_write(pid_fd, pid_file, final_pid);
+             * caller -- a script can read it straight away. If it can't
+             * be written, kill the new daemon and send -1 up the pipe
+             * instead, so `start` fails rather than leaving a daemon
+             * running that the pid file doesn't point to. */
+            if (pidfile_write(pid_fd, pid_file, final_pid) < 0) {
+                kill(final_pid, SIGKILL);
+                final_pid = -1;
+            }
 
             /* A single write() of a pid_t-sized buffer is well under
              * PIPE_BUF, so it's atomic -- the parent's read() above gets
@@ -5132,7 +5157,8 @@ static int cmd_start(int argc, char **argv)
                     strerror(errno));
         close(log_fd);
     } else if (pid_fd >= 0) {
-        pidfile_write(pid_fd, pid_file, getpid());
+        if (pidfile_write(pid_fd, pid_file, getpid()) < 0)
+            exit(1);
     }
 
     openlog("anticheat", LOG_PID | LOG_NDELAY, LOG_AUTH);

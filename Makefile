@@ -431,7 +431,14 @@ uninstall:
 	rm -f "$(DESTDIR)/usr/local/sbin/anticheat"
 	rm -f "$(DESTDIR)/lib/modules/$(KVER)/extra/anticheat.ko"
 	rm -f "$(DESTDIR)/usr/local/lib/systemd/system/anticheat.service"
-	rm -f "$(DESTDIR)/etc/logrotate.d/anticheat"
+	# Only remove the logrotate config if it's still exactly what
+	# `make install` ships -- install never overwrites an existing one,
+	# so a locally edited (or pre-existing) file isn't ours to delete.
+	@f="$(DESTDIR)/etc/logrotate.d/anticheat"; \
+	if [ -e "$$f" ]; then \
+		if cmp -s packaging/logrotate/anticheat "$$f"; then rm -f "$$f"; \
+		else echo "leaving locally modified $$f in place -- remove it by hand if you no longer want it"; fi; \
+	fi
 	@if [ -z "$(DESTDIR)" ]; then depmod -a; fi
 	@if [ -z "$(DESTDIR)" ] && command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload || true; fi
 

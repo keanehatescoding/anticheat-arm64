@@ -381,6 +381,31 @@ expect_rc  "start: unwritable log file fails before forking" 1 \
     ./anticheat start --log-file "$AC_RUNDIR/missing-dir/ac.log" \
     --pid-file "$AC_RUNDIR/unused.pid"
 
+# O_NOFOLLOW: a symlink at either path is refused instead of followed.
+ln -s "$AC_RUNDIR/target" "$AC_RUNDIR/link"
+expect_out "start: symlinked --pid-file refused" "is a symlink" \
+    ./anticheat start --foreground --pid-file "$AC_RUNDIR/link"
+expect_out "start: symlinked --log-file refused" "is a symlink" \
+    ./anticheat start --log-file "$AC_RUNDIR/link" --pid-file "$AC_RUNDIR/unused.pid"
+if [ ! -e "$AC_RUNDIR/target" ]; then
+    pass "start: symlink target left untouched"
+else
+    fail "start: symlink target was created through the link"
+fi
+
+# A pid file that can't be written (ftruncate() fails on a char device)
+# must fail `start` in both modes rather than report a usable pid.
+expect_rc  "start --foreground: unwritable pid file fails start" 1 \
+    ./anticheat start --foreground --pid-file /dev/full
+out=$(./anticheat start --log-file "$AC_RUNDIR/full.log" --pid-file /dev/full 2>&1)
+rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "cannot write pid file" \
+   && ! printf '%s' "$out" | grep -q "daemon started"; then
+    pass "start (background): unwritable pid file fails start"
+else
+    fail "start (background): unwritable pid file (rc=$rc): $out"
+fi
+
 # Foreground + explicit --pid-file: written with the daemon's own pid,
 # locked against a second daemon, removed on clean SIGTERM shutdown.
 fg_pidfile="$AC_RUNDIR/fg.pid"
@@ -434,11 +459,19 @@ if grep -q "PTRACE-DENIED" "$bg_log" 2>/dev/null; then
 else
     fail "start (background): no PTRACE-DENIED event in $bg_log"
 fi
+# The daemon isn't our child (double fork), so once it exits it can sit
+# as a zombie until whatever adopted it reaps it -- and kill -0 still
+# succeeds on a zombie. Count a zombie as stopped.
+proc_running() {
+    local st
+    st=$(sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f1)
+    [ -n "$st" ] && [ "$st" != Z ]
+}
 if [ -n "$bg_pid" ]; then
     kill -TERM "$bg_pid" 2>/dev/null
-    for _ in $(seq 50); do kill -0 "$bg_pid" 2>/dev/null || break; sleep 0.1; done
+    for _ in $(seq 50); do proc_running "$bg_pid" || break; sleep 0.1; done
 fi
-if [ -n "$bg_pid" ] && ! kill -0 "$bg_pid" 2>/dev/null && [ ! -e "$bg_pidfile" ]; then
+if [ -n "$bg_pid" ] && ! proc_running "$bg_pid" && [ ! -e "$bg_pidfile" ]; then
     pass "start (background): SIGTERM stops daemon and removes pid file"
 else
     fail "start (background): daemon still running or pid file left behind"
