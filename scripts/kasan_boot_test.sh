@@ -237,8 +237,8 @@ echo "== building userspace (daemon + ioctl_fuzz) =="
 # arch would otherwise survive and die in the guest with "cannot execute
 # binary file" -- seen in a real run, where an x86_64 ioctl_fuzz from an
 # earlier host build was reused. Both are gitignored build artifacts.
-rm -f "$REPO_ROOT/anticheat" "$REPO_ROOT/test/ioctl_fuzz"
-make -C "$REPO_ROOT" CC="${CROSS_COMPILE}gcc" CFLAGS="-O2 -Wall -Wextra -Werror" daemon ioctl-fuzz
+rm -f "$REPO_ROOT/anticheat" "$REPO_ROOT/test/ioctl_fuzz" "$REPO_ROOT/test/ptracer_nominate_test"
+make -C "$REPO_ROOT" CC="${CROSS_COMPILE}gcc" CFLAGS="-O2 -Wall -Wextra -Werror" daemon ioctl-fuzz ptracer-nominate-test
 
 # Guest-side paths and rootfs (see the vng invocation below for why):
 # with a --root chroot the guest cannot see host paths, so the repo and
@@ -321,6 +321,37 @@ echo "AC_KASAN_BOOT: vmcheck exited \$?"
 ./anticheat unprotect --pid "\$V"
 echo "AC_KASAN_BOOT: unprotect exited \$?"
 kill "\$V" 2>/dev/null
+
+# PR_SET_PTRACER crash-reporter exemption (#116): the helper forks
+# children that ptrace it, so this also drives ac_prctl_pre() and the
+# nomination refcounting under KASAN/lockdep. It blocks on stdin until
+# protected; a FIFO stands in for bash's coproc (this payload runs under
+# /bin/sh).
+PT_DIR=\$(mktemp -d)
+mkfifo "\$PT_DIR/in"
+./test/ptracer_nominate_test <"\$PT_DIR/in" >"\$PT_DIR/out" 2>&1 &
+PT_PID=\$!
+exec 9>"\$PT_DIR/in"
+for _ in \$(seq 50); do grep -q '^PID ' "\$PT_DIR/out" && break; sleep 0.1; done
+PT_TARGET=\$(awk '/^PID /{print \$2}' "\$PT_DIR/out")
+./anticheat protect --pid "\$PT_TARGET"
+echo "AC_KASAN_BOOT: ptracer protect exited \$?"
+echo go >&9
+exec 9>&-
+wait "\$PT_PID"
+cat "\$PT_DIR/out"
+PT_EVENTS=\$(./anticheat events 2>&1)
+if awk '/^RESULT/{want = (\$2 == "nominated") ? "allowed" : "denied"; n++; if (\$3 != want) bad++}
+        END {exit !(n == 4 && !bad)}' "\$PT_DIR/out" &&
+   grep -q '^DONE' "\$PT_DIR/out" &&
+   echo "\$PT_EVENTS" | grep -q 'PR_SET_PTRACER_ANY ignored'; then
+    echo "AC_KASAN_BOOT: PTRACER CHECK OK"
+elif grep -q '^SKIP' "\$PT_DIR/out"; then
+    echo "AC_KASAN_BOOT: PTRACER CHECK FAILED (skipped: yama ptrace_scope=3 in the guest)"
+else
+    echo "AC_KASAN_BOOT: PTRACER CHECK FAILED (see RESULT lines above)"
+fi
+rm -rf "\$PT_DIR"
 
 echo "AC_KASAN_BOOT: running the real ioctl fuzz harness (full pointer-corruption fuzzing, no safe-pointers-only)"
 ./test/ioctl_fuzz $IOCTL_FUZZ_ITERATIONS $IOCTL_FUZZ_SEED
@@ -449,5 +480,14 @@ if ! grep -q 'AC_KASAN_BOOT: POSITIVE CONTROL OK' "$CONSOLE_LOG"; then
     exit 1
 fi
 
+if ! grep -q 'AC_KASAN_BOOT: PTRACER CHECK OK' "$CONSOLE_LOG"; then
+    echo "FAIL: PR_SET_PTRACER exemption check (#116) did not pass: the nominated" >&2
+    echo "      child must be allowed to ptrace/process_vm its protected parent, and" >&2
+    echo "      un-nominated, PR_SET_PTRACER_ANY and cleared cases denied. See the" >&2
+    echo "      RESULT lines in the console log above." >&2
+    exit 1
+fi
+
 echo "PASS: kernel survived the real ioctl fuzz harness + CLI exercise under KASAN+lockdep with no findings"
-echo "      (module walk verified against a live positive control)"
+echo "      (module walk verified against a live positive control;"
+echo "       PR_SET_PTRACER exemption allowed/denied as expected)"
