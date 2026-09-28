@@ -1,0 +1,21 @@
+# logrotate config for /var/log/anticheat.log, the file the daemon
+# writes to when started directly as `anticheat start` (without
+# --foreground). The systemd unit (packaging/systemd/anticheat.service)
+# logs to the journal and never touches this file.
+#
+# copytruncate: the daemon keeps its log fd open and doesn't reopen it
+# on a signal. It opens the file O_APPEND, so after the truncate its
+# writes go to the new end of the file instead of leaving a gap of
+# zeros. The tradeoff is that lines written between the copy and the
+# truncate can be lost. If you point --log-file / AC_LOG_FILE somewhere
+# else, add that path here too.
+/var/log/anticheat.log {
+    weekly
+    maxsize 10M
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

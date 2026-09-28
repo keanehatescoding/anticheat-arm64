@@ -1,0 +1,60 @@
+# systemd unit for the monitoring daemon (`anticheat start`).
+#
+# Installed by all three packages (AUR, Debian, Fedora) to the distro's
+# system unit directory, and by `make install` to
+# /usr/local/lib/systemd/system with ExecStart pointing at
+# /usr/local/sbin/anticheat. None of them enable it for you -- the
+# daemon needs the kernel module, which ships in a separate package, so
+# turn it on yourself once that's in place:
+#
+#   sudo systemctl enable --now anticheat
+#
+# Reporting to a ban server: put AC_REPORT_URL= / AC_REPORT_KEY= (and
+# any other AC_* overrides from the README) in /etc/anticheat/anticheat.env,
+# root-owned and mode 0600 since it holds the bearer key, then
+# `systemctl restart anticheat`.
+#
+# Logs: --foreground keeps stdout/stderr attached, so systemd sends them
+# to the journal (`journalctl -u anticheat`) and nothing is written to
+# /var/log/anticheat.log -- that file is only for the self-daemonizing
+# `anticheat start` path. Warnings and alerts show up twice in
+# `journalctl -u anticheat`, once through syslog() and once through
+# stderr; this is expected.
+
+[Unit]
+Description=hypranticheat monitoring daemon
+Documentation=https://github.com/keanehatescoding/anticheat-arm64#readme
+After=systemd-modules-load.service
+# Bounded restart loop: a daemon that dies straight away (e.g. the module
+# failed to load, or a daemon/module ABI mismatch) gives up and shows as
+# failed after 5 tries within a minute, instead of retrying forever.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/anticheat/anticheat.env
+# Load the module if nothing else has. The leading "-" makes a modprobe
+# failure non-fatal on purpose: if the module is already loaded some
+# other way (insmod, install-deck), that's fine, and if it truly isn't
+# available the daemon itself fails with a clearer error ("cannot open
+# /dev/anticheat ... is the module loaded?").
+ExecStartPre=-modprobe anticheat
+ExecStart=/usr/bin/anticheat start --foreground
+# on-failure also covers death by signal (SIGKILL, SIGSEGV, ...), which
+# is the crash case #79 is about: without a supervisor, a dead monitor
+# loop leaves the module loaded with nothing watching it. A clean exit
+# (SIGTERM from `systemctl stop`) is not restarted.
+Restart=on-failure
+RestartSec=2s
+
+# Light sandboxing only. The daemon runs as root and must read every
+# protected process's /proc/<pid>/{mem,maps,environ,root/...}, hold
+# /dev/anticheat open, write baselines under /var/lib/anticheat, and
+# reach the report server. Settings like ProtectHome=, PrivateDevices=,
+# ProtectKernelModules= or a restricted CapabilityBoundingSet= would
+# break one of those, or the modprobe above.
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

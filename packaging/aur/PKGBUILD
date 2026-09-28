@@ -41,10 +41,16 @@ build() {
 package_hypranticheat() {
     pkgdesc="Userspace daemon and CLI for a kernel-mode anticheat -- pairs with the companion DKMS package for the kernel module"
     depends=('glibc')
-    optdepends=('hypranticheat-dkms: kernel-level detection -- required for real use; the daemon alone can only run against its userspace mock')
+    optdepends=('hypranticheat-dkms: kernel-level detection -- required for real use; the daemon alone can only run against its userspace mock'
+                'logrotate: rotation of /var/log/anticheat.log when the daemon is run outside systemd')
+    backup=('etc/logrotate.d/anticheat')
 
     cd "$_reponame-$pkgver"
     install -Dm755 anticheat "$pkgdir/usr/bin/anticheat"
+    # Not enabled by the package -- see the unit's own header comment.
+    install -Dm644 packaging/systemd/anticheat.service \
+        "$pkgdir/usr/lib/systemd/system/anticheat.service"
+    install -Dm644 packaging/logrotate/anticheat "$pkgdir/etc/logrotate.d/anticheat"
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
     install -Dm644 THREAT_MODEL.md "$pkgdir/usr/share/doc/$pkgname/THREAT_MODEL.md"
     install -Dm644 TROUBLESHOOTING.md "$pkgdir/usr/share/doc/$pkgname/TROUBLESHOOTING.md"

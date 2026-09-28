@@ -24,8 +24,11 @@ accident.
 Same split as the AUR package (`packaging/aur/`) and for the same reason
 — either half can be reinstalled or rebuilt independently:
 
-- **`hypranticheat`** — the userspace daemon/CLI (`anticheat`), docs, and
-  the `/var/lib/anticheat/baselines` state directory.
+- **`hypranticheat`** — the userspace daemon/CLI (`anticheat`), docs,
+  the `anticheat.service` systemd unit (installed but not enabled:
+  `dh_installsystemd --no-enable`; run `systemctl enable --now anticheat`
+  after the module is in place), a logrotate snippet, and the
+  `/var/lib/anticheat/baselines` state directory.
 - **`hypranticheat-dkms`** — the kernel module source, registered with
   DKMS. `hypranticheat-dkms.postinst`/`.prerm` do the same
   dkms-add/build/install + Secure Boot MOK-signing setup as
