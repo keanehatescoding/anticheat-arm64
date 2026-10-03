@@ -292,7 +292,24 @@ cd "$GUEST_REPO" || exit 1
 # when the walk runs, and stays loaded across the fuzz run below.
 insmod $GUEST_WORK/dummy/ac_dummy.ko || { echo "AC_KASAN_BOOT: insmod ac_dummy failed"; exit 1; }
 
-insmod ./anticheat.ko ac_verbose=1 || { echo "AC_KASAN_BOOT: insmod failed"; exit 1; }
+# KASAN_INLINE makes .text far larger than usual, so the scan's default
+# 32MB window doesn't reach sys_call_table from the read handler here.
+# Size ac_scan_window from the real distance in /proc/kallsyms. The module
+# still has to find the table by its own scan, starting from a read
+# handler that is only 4-byte aligned (#113). The last 12 hex digits keep
+# the arithmetic inside a signed 64-bit shell integer.
+SCT=\$(awk '\$3 == "sys_call_table" { print \$1; exit }' /proc/kallsyms)
+RH=\$(awk '\$3 == "__arm64_sys_read" { print \$1; exit }' /proc/kallsyms)
+WIN=33554432
+if [ -n "\$SCT" ] && [ -n "\$RH" ]; then
+    D=\$(( 0x\${SCT#????} - 0x\${RH#????} ))
+    [ "\$D" -lt 0 ] && D=\$(( -D ))
+    WIN=\$(( (D / 1048576 + 2) * 1048576 ))
+    [ "\$WIN" -lt 33554432 ] && WIN=33554432
+fi
+echo "AC_KASAN_BOOT: sys_call_table=\$SCT __arm64_sys_read=\$RH ac_scan_window=\$WIN"
+
+insmod ./anticheat.ko ac_verbose=1 ac_scan_window=\$WIN || { echo "AC_KASAN_BOOT: insmod failed"; exit 1; }
 sleep 0.3
 
 ./anticheat status
