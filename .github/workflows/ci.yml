@@ -228,6 +228,8 @@ jobs:
               - 'src/sha256.c'
               - 'src/sha256.h'
               - 'test/ioctl_fuzz.c'
+              # Run inside the VM by the harness's ptracer check (#116).
+              - 'test/ptracer_nominate_test.c'
               # The harness itself. Without this entry a change to the
               # KASAN script skips the only job that runs it, so harness
               # edits land unexercised and are first run by nightly on

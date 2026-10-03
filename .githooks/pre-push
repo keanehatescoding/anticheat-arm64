@@ -1,0 +1,73 @@
+#!/bin/bash
+# pre-push: `make ci` for every pushed commit, plus the real-module test
+# when a pushed commit changes the module or its harness (the same files
+# CI's KASAN fuzz-seed job filters on, plus the helpers the VM runs).
+# The module test runs natively on aarch64 and under an arm64 QEMU VM on
+# x86_64 -- see scripts/test-local.sh.
+#
+# Each pushed commit is checked out into a temporary worktree and tested
+# there, so uncommitted edits in your working tree can't make a push pass
+# (or fail). On x86_64 the VM run is skipped with a notice until the
+# kernel cache has been built once (scripts/test-local.sh --module).
+#
+# Skip the module test with AC_SKIP_VM=1; skip everything with
+# `git push --no-verify` or AC_SKIP_HOOKS=1.
+set -euo pipefail
+[ "${AC_SKIP_HOOKS:-0}" = 1 ] && exit 0
+
+MODULE_PATHS=(
+    src/anticheat_module.c src/anticheat.h src/sha256.c src/sha256.h
+    test/ioctl_fuzz.c test/ptracer_nominate_test.c
+    scripts/kasan_boot_test.sh scripts/test-local.sh
+)
+ZERO=0000000000000000000000000000000000000000
+
+all_shas=()
+module_shas=()
+while read -r _lref lsha _rref rsha; do
+    [ "$lsha" = "$ZERO" ] && continue                # branch deletion
+    all_shas+=("$lsha")
+    if [ "$rsha" = "$ZERO" ]; then                    # new remote branch
+        base=$(git merge-base "$lsha" origin/master 2>/dev/null || true)
+    else
+        base=$rsha
+    fi
+    if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+        module_shas+=("$lsha")                        # unknown base: test it
+    elif [ -n "$(git diff --name-only "$base" "$lsha" -- "${MODULE_PATHS[@]}")" ]; then
+        module_shas+=("$lsha")
+    fi
+done
+[ ${#all_shas[@]} -eq 0 ] && exit 0
+
+top=$(git rev-parse --show-toplevel)
+for sha in $(printf '%s\n' "${all_shas[@]}" | sort -u); do
+    run_module=0
+    if printf '%s\n' "${module_shas[@]}" | grep -qx "$sha"; then
+        if [ "${AC_SKIP_VM:-0}" = 1 ]; then
+            echo "[pre-push] AC_SKIP_VM=1: skipping the module test" >&2
+        else
+            run_module=1
+        fi
+    else
+        echo "[pre-push] no module/harness changes; skipping the module test" >&2
+    fi
+
+    wt=$(mktemp -d "${TMPDIR:-/tmp}/ac-prepush.XXXXXX")
+    git worktree add -q --detach "$wt" "$sha"
+    echo "[pre-push] testing $(git log -1 --format='%h %s' "$sha")" >&2
+    rc=0
+    (cd "$wt" && ./scripts/test-local.sh --quick) || rc=$?
+    if [ "$rc" -eq 0 ] && [ "$run_module" = 1 ]; then
+        (cd "$wt" && AC_REQUIRE_WARM_CACHE=1 ./scripts/test-local.sh --module) || rc=$?
+        # the VM console log lands in the worktree; keep it past removal
+        cp "$wt"/kasan-console-*.log "$top/" 2>/dev/null || true
+    fi
+    git worktree remove --force "$wt"
+    if [ "$rc" -ne 0 ]; then
+        echo "[pre-push] tests FAILED for $sha (exit $rc); push aborted." >&2
+        echo "[pre-push] any VM console log was copied to kasan-console-*.log in $top." >&2
+        echo "[pre-push] bypass: AC_SKIP_VM=1 (module test only) or git push --no-verify." >&2
+        exit "$rc"
+    fi
+done

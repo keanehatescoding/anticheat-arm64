@@ -37,6 +37,12 @@
 # prepared Ubuntu arm64 tree instead of downloading a fresh cloud image
 # every run (vng uses the dir as-is when it already exists). Needed on
 # hosts without passwordless sudo, which vng's own provisioning requires.
+# Persistent kernel build: AC_KASAN_CACHE=/path keeps the configured
+# linux-$KVER tree there across runs instead of under the throwaway
+# $WORKDIR, so after the first ~30 min build each run is an incremental
+# `make` plus the boot. The tree is reconfigured from scratch whenever the
+# config fragment below changes. scripts/test-local.sh (and the git hooks
+# that call it) use this; CI doesn't set it and keeps building fresh.
 set -euo pipefail
 
 cd "$(dirname "$0")/.." || exit 1
@@ -58,6 +64,18 @@ KVER=6.12
 # this script; CI's disk-backed /tmp is unaffected either way.
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/ac_kasan_boot.XXXXXXXX")"
 KDIR="$WORKDIR/linux-$KVER"
+if [ -n "${AC_KASAN_CACHE:-}" ]; then
+    mkdir -p "$AC_KASAN_CACHE"
+    AC_KASAN_CACHE="$(cd "$AC_KASAN_CACHE" && pwd)"
+    KDIR="$AC_KASAN_CACHE/linux-$KVER"
+    # One run at a time per cache: two concurrent `make`s in the same
+    # tree (e.g. a push hook and a manual run) corrupt each other's build.
+    exec 8>"$AC_KASAN_CACHE/.lock"
+    if ! flock -n 8; then
+        echo "== waiting for another run holding $AC_KASAN_CACHE =="
+        flock 8
+    fi
+fi
 # Written directly here, not under $WORKDIR: the EXIT trap below deletes
 # $WORKDIR on every exit path, including a mid-run cancellation (CI's
 # timeout-minutes, or a local Ctrl-C) -- a log that only reached its
@@ -108,6 +126,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# .ac_extracted is written only after tar finishes, so an extract cut
+# short (Ctrl-C, full disk) is redone rather than reused half-populated.
+if [ -f "$KDIR/.ac_extracted" ]; then
+    echo "== reusing cached linux-$KVER at $KDIR =="
+else
 echo "== fetching linux-$KVER =="
 # Download to a file with retries rather than piping straight into tar:
 # a real HTTP/2 PROTOCOL_ERROR from cdn.kernel.org has been observed
@@ -120,8 +143,11 @@ echo "== fetching linux-$KVER =="
 curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors \
     -o "$WORKDIR/linux-$KVER.tar.xz" \
     "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$KVER.tar.xz"
-tar -xJf "$WORKDIR/linux-$KVER.tar.xz" -C "$WORKDIR"
+rm -rf "$KDIR"
+tar -xJf "$WORKDIR/linux-$KVER.tar.xz" -C "$(dirname "$KDIR")"
 rm -f "$WORKDIR/linux-$KVER.tar.xz"
+touch "$KDIR/.ac_extracted"
+fi
 
 echo "== configuring: defconfig + KASAN/lockdep debug fragment =="
 # ARM64-only project (x86-64 lives in the sibling anticheat_x86-64
@@ -136,7 +162,6 @@ case "$(uname -m)" in
     *)             CROSS_COMPILE=aarch64-linux-gnu- ;;
 esac
 export ARCH="$KARCH" CROSS_COMPILE
-make -C "$KDIR" defconfig
 
 # Generic KASAN (not SW/HW tags -- this targets a plain QEMU guest with
 # no MTE/tag-capable hardware involved) + full lockdep validation.
@@ -156,17 +181,28 @@ make -C "$KDIR" defconfig
 # environment. merge_config.sh's own internal `make ... alldefconfig`
 # step failed here ("No rule to make target 'alldefconfig'") on a real
 # run -- not worth chasing when there's already a proven alternative.
-"$KDIR/scripts/config" --file "$KDIR/.config" \
-    --enable KASAN \
-    --enable KASAN_GENERIC \
-    --enable KASAN_INLINE \
-    --enable LOCKDEP \
-    --enable PROVE_LOCKING \
-    --enable DEBUG_ATOMIC_SLEEP \
-    --enable KPROBES \
-    --enable KRETPROBES \
+CONFIG_FRAGMENT=(
+    --enable KASAN
+    --enable KASAN_GENERIC
+    --enable KASAN_INLINE
+    --enable LOCKDEP
+    --enable PROVE_LOCKING
+    --enable DEBUG_ATOMIC_SLEEP
+    --enable KPROBES
+    --enable KRETPROBES
     --set-val FRAME_WARN 0
-make -C "$KDIR" olddefconfig
+)
+# A cached tree is reconfigured only when the fragment (or KARCH) changed
+# since it was last configured; a fresh tree has no stamp and always is.
+CONFIG_STAMP="$(printf '%s\n' "$KARCH" "${CONFIG_FRAGMENT[@]}" | sha256sum | cut -d' ' -f1)"
+if [ -f "$KDIR/.config" ] && [ "$(cat "$KDIR/.ac_config_stamp" 2>/dev/null)" = "$CONFIG_STAMP" ]; then
+    echo "== config fragment unchanged; keeping $KDIR/.config =="
+else
+    make -C "$KDIR" defconfig
+    "$KDIR/scripts/config" --file "$KDIR/.config" "${CONFIG_FRAGMENT[@]}"
+    make -C "$KDIR" olddefconfig
+    echo "$CONFIG_STAMP" > "$KDIR/.ac_config_stamp"
+fi
 
 # scripts/config --enable doesn't fail the build if a requested symbol
 # silently didn't stick (e.g. a missing dependency) -- verify explicitly
@@ -180,7 +216,7 @@ for sym in CONFIG_KASAN CONFIG_KASAN_GENERIC CONFIG_LOCKDEP CONFIG_PROVE_LOCKING
     }
 done
 
-echo "== building the kernel (full build, not modules_prepare -- this is slow) =="
+echo "== building the kernel (full build, not modules_prepare -- slow unless cached) =="
 make -C "$KDIR" -j"$(nproc)" all
 
 echo "== building anticheat.ko against this tree =="
