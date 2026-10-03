@@ -503,6 +503,15 @@ if grep -qE 'anticheat: loaded \(.*, 0 kprobes' "$CONSOLE_LOG"; then
     exit 1
 fi
 
+# The syscall-table integrity check is silently disabled when the scan
+# misses (#113 was exactly that: a 4-mod-8 start that could never match).
+if ! grep -q 'AC_KASAN_BOOT: syscalls exited 0' "$CONSOLE_LOG"; then
+    echo "FAIL: 'anticheat syscalls' did not exit 0 -- the syscall table was" >&2
+    echo "      not located, so the integrity check was off. See the" >&2
+    echo "      'syscall table not found' line in $CONSOLE_LOG." >&2
+    exit 1
+fi
+
 if ! grep -q 'AC_KASAN_BOOT: PTRACER CHECK OK' "$CONSOLE_LOG"; then
     echo "FAIL: PR_SET_PTRACER exemption check (#116) did not pass: the nominated" >&2
     echo "      child must be allowed to ptrace/process_vm its protected parent, and" >&2
