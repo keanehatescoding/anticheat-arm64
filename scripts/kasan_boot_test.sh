@@ -144,6 +144,12 @@ make -C "$KDIR" defconfig
 # frame sizes past the default warning threshold; that's expected
 # instrumentation overhead, not a bug in this module's own code.
 #
+# KPROBES/KRETPROBES: arm64 defconfig leaves them off, and without them
+# every probe (ptrace/process_vm/prctl/exec/fork) and the kallsyms-based
+# syscall-table lookup fail with -EOPNOTSUPP. The module still loads, so
+# earlier runs "passed" with enforcement entirely inert (found via the
+# #116 ptracer check). The gate after boot also rejects a 0-kprobe load.
+#
 # scripts/config, not scripts/kconfig/merge_config.sh: the same tool
 # ci.yml's own module job already uses (for MODULE_SIG/MODULE_SIG_SHA256)
 # and has a real, verified-working track record in this exact CI
@@ -157,6 +163,8 @@ make -C "$KDIR" defconfig
     --enable LOCKDEP \
     --enable PROVE_LOCKING \
     --enable DEBUG_ATOMIC_SLEEP \
+    --enable KPROBES \
+    --enable KRETPROBES \
     --set-val FRAME_WARN 0
 make -C "$KDIR" olddefconfig
 
@@ -164,7 +172,8 @@ make -C "$KDIR" olddefconfig
 # silently didn't stick (e.g. a missing dependency) -- verify explicitly
 # rather than discovering a plain, uninstrumented boot later via absence
 # of any KASAN output at all.
-for sym in CONFIG_KASAN CONFIG_KASAN_GENERIC CONFIG_LOCKDEP CONFIG_PROVE_LOCKING; do
+for sym in CONFIG_KASAN CONFIG_KASAN_GENERIC CONFIG_LOCKDEP CONFIG_PROVE_LOCKING \
+           CONFIG_KPROBES CONFIG_KRETPROBES; do
     grep -qx "${sym}=y" "$KDIR/.config" || {
         echo "FATAL: $sym did not stick after olddefconfig -- see $KDIR/.config" >&2
         exit 1
@@ -237,8 +246,8 @@ echo "== building userspace (daemon + ioctl_fuzz) =="
 # arch would otherwise survive and die in the guest with "cannot execute
 # binary file" -- seen in a real run, where an x86_64 ioctl_fuzz from an
 # earlier host build was reused. Both are gitignored build artifacts.
-rm -f "$REPO_ROOT/anticheat" "$REPO_ROOT/test/ioctl_fuzz"
-make -C "$REPO_ROOT" CC="${CROSS_COMPILE}gcc" CFLAGS="-O2 -Wall -Wextra -Werror" daemon ioctl-fuzz
+rm -f "$REPO_ROOT/anticheat" "$REPO_ROOT/test/ioctl_fuzz" "$REPO_ROOT/test/ptracer_nominate_test"
+make -C "$REPO_ROOT" CC="${CROSS_COMPILE}gcc" CFLAGS="-O2 -Wall -Wextra -Werror" daemon ioctl-fuzz ptracer-nominate-test
 
 # Guest-side paths and rootfs (see the vng invocation below for why):
 # with a --root chroot the guest cannot see host paths, so the repo and
@@ -321,6 +330,43 @@ echo "AC_KASAN_BOOT: vmcheck exited \$?"
 ./anticheat unprotect --pid "\$V"
 echo "AC_KASAN_BOOT: unprotect exited \$?"
 kill "\$V" 2>/dev/null
+
+# PR_SET_PTRACER crash-reporter exemption (#116): the helper forks
+# children that ptrace it, so this also drives ac_prctl_pre() and the
+# nomination refcounting under KASAN/lockdep. It blocks on stdin until
+# protected; a FIFO stands in for bash's coproc (this payload runs under
+# /bin/sh). The guest's root (and so /tmp) is a read-only 9p mount;
+# virtme mounts a tmpfs on /run, so the FIFO lives there.
+PT_DIR=\$(mktemp -d /run/ac_ptracer.XXXXXX) && mkfifo "\$PT_DIR/in" || {
+    echo "AC_KASAN_BOOT: PTRACER CHECK FAILED (no writable dir for the FIFO)"
+    PT_DIR=
+}
+if [ -n "\$PT_DIR" ]; then
+./test/ptracer_nominate_test <"\$PT_DIR/in" >"\$PT_DIR/out" 2>&1 &
+PT_PID=\$!
+exec 9>"\$PT_DIR/in"
+for _ in \$(seq 50); do grep -q '^PID ' "\$PT_DIR/out" && break; sleep 0.1; done
+PT_TARGET=\$(awk '/^PID /{print \$2}' "\$PT_DIR/out")
+./anticheat protect --pid "\$PT_TARGET"
+echo "AC_KASAN_BOOT: ptracer protect exited \$?"
+echo go >&9
+exec 9>&-
+wait "\$PT_PID"
+cat "\$PT_DIR/out"
+PT_EVENTS=\$(./anticheat events 2>&1)
+if awk '/^RESULT/{want = (\$2 == "nominated") ? "allowed" : "denied"; n++; if (\$3 != want) bad++; names[\$2]++}
+        END {exit !(n == 4 && !bad && names["nominated"] == 1 && names["none"] == 1 &&
+                    names["any"] == 1 && names["cleared"] == 1)}' "\$PT_DIR/out" &&
+   grep -q '^DONE' "\$PT_DIR/out" &&
+   echo "\$PT_EVENTS" | grep -q 'PR_SET_PTRACER_ANY ignored'; then
+    echo "AC_KASAN_BOOT: PTRACER CHECK OK"
+elif grep -q '^SKIP' "\$PT_DIR/out"; then
+    echo "AC_KASAN_BOOT: PTRACER CHECK FAILED (skipped: yama ptrace_scope=3 in the guest)"
+else
+    echo "AC_KASAN_BOOT: PTRACER CHECK FAILED (see RESULT lines above)"
+fi
+rm -rf "\$PT_DIR"
+fi
 
 echo "AC_KASAN_BOOT: running the real ioctl fuzz harness (full pointer-corruption fuzzing, no safe-pointers-only)"
 ./test/ioctl_fuzz $IOCTL_FUZZ_ITERATIONS $IOCTL_FUZZ_SEED
@@ -449,5 +495,22 @@ if ! grep -q 'AC_KASAN_BOOT: POSITIVE CONTROL OK' "$CONSOLE_LOG"; then
     exit 1
 fi
 
+# The module loads (and the checks above can pass) even when no probe
+# registered; that's a run that exercised none of the enforcement paths.
+if grep -qE 'anticheat: loaded \(.*, 0 kprobes' "$CONSOLE_LOG"; then
+    echo "FAIL: anticheat.ko loaded with 0 kprobes -- enforcement was inert for" >&2
+    echo "      this whole run (kernel built without CONFIG_KPROBES?)." >&2
+    exit 1
+fi
+
+if ! grep -q 'AC_KASAN_BOOT: PTRACER CHECK OK' "$CONSOLE_LOG"; then
+    echo "FAIL: PR_SET_PTRACER exemption check (#116) did not pass: the nominated" >&2
+    echo "      child must be allowed to ptrace/process_vm its protected parent, and" >&2
+    echo "      un-nominated, PR_SET_PTRACER_ANY and cleared cases denied. See the" >&2
+    echo "      RESULT lines in the console log above." >&2
+    exit 1
+fi
+
 echo "PASS: kernel survived the real ioctl fuzz harness + CLI exercise under KASAN+lockdep with no findings"
-echo "      (module walk verified against a live positive control)"
+echo "      (module walk verified against a live positive control;"
+echo "       PR_SET_PTRACER exemption allowed/denied as expected)"

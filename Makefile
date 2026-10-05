@@ -168,6 +168,16 @@ thread-spawn-after-protect-test: test/thread_spawn_after_protect_test
 test/thread_spawn_after_protect_test: test/thread_spawn_after_protect_test.c src/anticheat.h
 	$(CC) $(CFLAGS) -pthread -o $@ $< $(LDFLAGS)
 
+# ptracer-nominate live test helper: a protected process's
+# prctl(PR_SET_PTRACER, child) must let that child ptrace/process_vm it
+# (crash reporters, issue #116), while an un-nominated child,
+# PR_SET_PTRACER_ANY, and a cleared nomination stay denied. Needs root
+# and the module loaded -- see test.sh.
+ptracer-nominate-test: test/ptracer_nominate_test
+
+test/ptracer_nominate_test: test/ptracer_nominate_test.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
 # ioctl fuzz harness: hammers every AC_IOCTL_* with malformed sizes,
 # boundary values, and null/wild/unmapped pointers -- the actual attack
 # surface any local process holding an open fd can reach. Against the
@@ -402,7 +412,7 @@ ci-aur-check:
 
 clean:
 	@if [ -d "$(KDIR)" ]; then $(MAKE) -C "$(KDIR)" M="$(PWD)" clean; fi
-	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test test/mount_ns_probe test/anon_exec_test test/thread_exit_migration_test test/thread_spawn_after_protect_test test/ioctl_fuzz test/baseline_test test/ac_report_status_test test/ac_report_url_test test/ac_report_cooldown_test test/daemon_limits_test test/daemon_reporting_test
+	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test test/mount_ns_probe test/anon_exec_test test/thread_exit_migration_test test/thread_spawn_after_protect_test test/ptracer_nominate_test test/ioctl_fuzz test/baseline_test test/ac_report_status_test test/ac_report_url_test test/ac_report_cooldown_test test/daemon_limits_test test/daemon_reporting_test
 
 install: all
 	@if [ -z "$(DESTDIR)" ] && [ "$$(id -u)" -ne 0 ]; then echo "error: 'make install' writes to /usr/local and /lib/modules -- run as root, or set DESTDIR= for a staged/packaging install"; exit 1; fi
@@ -461,4 +471,4 @@ install-deck: all
 uninstall-deck:
 	rm -rf "$(DECK_PREFIX)"
 
-.PHONY: all module daemon mock test-mock priv-drop-test render-hook-test mount-ns-test thread-exit-migration-test thread-spawn-after-protect-test ioctl-fuzz baseline-test ac-report-status-test ac-report-url-test ac-report-cooldown-test daemon-limits-test daemon-reporting-test ci ci-aur-check clean install uninstall install-deck uninstall-deck
+.PHONY: all module daemon mock test-mock priv-drop-test render-hook-test mount-ns-test thread-exit-migration-test thread-spawn-after-protect-test ptracer-nominate-test ioctl-fuzz baseline-test ac-report-status-test ac-report-url-test ac-report-cooldown-test daemon-limits-test daemon-reporting-test ci ci-aur-check clean install uninstall install-deck uninstall-deck

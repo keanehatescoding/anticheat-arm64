@@ -34,6 +34,8 @@ before the backtrace.
 
 - `ac_ptrace_pre` — the native/compat `ptrace` kprobe
   (`__arm64_sys_ptrace`/`__arm64_compat_sys_ptrace`)
+- `ac_prctl_pre` — the `prctl` kprobe (`__arm64_sys_prctl`) that records
+  a protected process's `PR_SET_PTRACER` crash-reporter nomination
 - `ac_exit_pre` — the `do_exit` kprobe
 - `ac_exec_pre` — the native/compat `execve`/`execveat` kprobes
   (`__arm64_sys_execve`/`__arm64_sys_execveat` and their compat twins)

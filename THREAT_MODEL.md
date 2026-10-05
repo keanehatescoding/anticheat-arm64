@@ -137,6 +137,14 @@ where the relevant code lives:
   actual in-scope adversary (ordinary user-to-root-userspace, or a cheat
   module installing the redirect *after* this module has already
   snapshotted the table) — also visually detectable by other means.
+- **A protected process nominating a malicious ptracer.**
+  `prctl(PR_SET_PTRACER, pid)` from a protected process exempts that
+  one thread group from ptrace/process_vm denial (#116, so crash
+  reporters work). Anything that can make the game issue that `prctl`
+  already runs code inside the game, which is past the point this
+  exemption guards. `PR_SET_PTRACER_ANY` is not honoured, and the
+  nomination is bound to a `struct pid`, so pid reuse can't inherit it.
+  Every nomination is logged (`AC_EV_INFO`) so it can be correlated.
 - **`SIGKILL` of the daemon by a root-privileged attacker.** Daemon
   self-protection only stops ptrace-based attacks via the same kprobe
   everything else uses; nothing here hides or hardens the daemon process

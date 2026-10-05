@@ -63,6 +63,7 @@
 #include <linux/cred.h>
 #include <linux/capability.h>
 #include <linux/ptrace.h>
+#include <linux/prctl.h>
 #include <linux/err.h>
 #include <linux/bitops.h>
 #include <asm/unistd.h>
@@ -102,6 +103,9 @@
 # define AC_SYM_EXECVEAT         "__arm64_sys_execveat"
 # define AC_SYM_EXECVE32         "__arm64_compat_sys_execve"
 # define AC_SYM_EXECVEAT32       "__arm64_compat_sys_execveat"
+/* prctl(2) has no compat variant: the arm64 compat syscall table points
+ * at the native wrapper too, so this one probe covers both ABIs. */
+# define AC_SYM_PRCTL            "__arm64_sys_prctl"
 
 /*
  * Unpack syscall arguments inside the ptrace/process_vm kprobe
@@ -1013,6 +1017,14 @@ struct ac_prot_entry {
      * under ac_prot_lock as soon as the claim resolves (success or
      * failure), so the pointer never outlives the slot's interest in it. */
     struct mm_struct *claiming;
+    /* Thread group this process nominated with prctl(PR_SET_PTRACER, pid)
+     * (issue #116), or NULL. Holds its own get_pid() reference, taken and
+     * swapped only under ac_prot_lock, and dropped in ac_mmu_release()
+     * when the slot is cleared. A struct pid, not a pid number: the
+     * nominee dying and its number being recycled by some other process
+     * can't inherit the exemption, since the new process gets a new
+     * struct pid. See ac_prctl_ret(). */
+    struct pid *ptracer;
     char comm[AC_MAX_COMM];
 };
 
@@ -1140,6 +1152,7 @@ static void ac_mmu_release(struct mmu_notifier *subscription,
     bool removed = false;
     bool caller_initiated = false;
     struct ac_prot_release_req *r;
+    struct pid *ptracer = NULL;
 
     spin_lock_irqsave(&ac_prot_lock, flags);
     if (e->mm == mm) {
@@ -1147,6 +1160,8 @@ static void ac_mmu_release(struct mmu_notifier *subscription,
         strscpy(comm, e->comm, sizeof(comm));
         caller_initiated = e->removing;
         e->mm = NULL;
+        ptracer = e->ptracer;
+        e->ptracer = NULL;
         if (!caller_initiated)
             e->removing = true;   /* pins the slot against ac_add_prot_mm()
                                     * reuse until the deferred worker's
@@ -1155,6 +1170,7 @@ static void ac_mmu_release(struct mmu_notifier *subscription,
         removed = true;
     }
     spin_unlock_irqrestore(&ac_prot_lock, flags);
+    put_pid(ptracer);   /* NULL-safe; no sleeping, fine in any context */
     if (!removed)
         return;
 
@@ -1401,40 +1417,48 @@ static bool ac_is_protected_current(void)
     return ac_is_protected_mm(current->mm);
 }
 
-/* Like ac_is_protected_mm(), but for an arbitrary target task_struct
- * rather than current -- process_vm_readv(2)/writev(2) and ptrace(2)
- * accept any thread ID in a process, not just its tgid, and every thread
- * shares the same mm_struct, so a target-permission check must resolve
- * the target's mm rather than compare task/thread-group identity. Safe
- * from kprobe context: get_task_mm() only takes task_lock() (a spinlock)
- * and bumps mm_users, it doesn't sleep -- but the matching drop uses
+/* Should current's access to task t be denied? True iff t's mm is
+ * protected and current's thread group isn't the ptracer that process
+ * nominated via prctl(PR_SET_PTRACER) (issue #116: in-process crash
+ * reporters -- Breakpad's clone()d dump helper, a spawned
+ * crashpad_handler -- ptrace their protected parent by exactly that
+ * opt-in). The nomination can only come from the protected process
+ * itself (see ac_prctl_entry()), so an outside cheat can't grant itself
+ * this.
+ *
+ * AND-reduces across duplicate entries for one mm, same as
+ * ac_prot_jit_allowed_mm(): during the transient double-registration
+ * window a fresh entry carries no nomination, and that fails toward
+ * denial.
+ *
+ * Keyed by t's mm rather than task/thread-group identity:
+ * process_vm_readv(2)/writev(2) and ptrace(2) accept any thread ID in a
+ * process, not just its tgid, and every thread shares the mm. Safe from
+ * kprobe context: get_task_mm() only takes task_lock() (a spinlock) and
+ * bumps mm_users, it doesn't sleep -- but the matching drop uses
  * mmput_async() rather than plain mmput(), since *that* call can run the
  * real teardown (sleeps) if it happens to be the last reference, which a
  * kprobe pre-handler must never risk. */
-static bool ac_is_protected_task_mm(struct task_struct *t)
+static bool ac_denies_access_to(struct task_struct *t)
 {
     struct mm_struct *mm = get_task_mm(t);
-    bool prot;
+    struct pid *me = task_tgid(current);
+    unsigned long flags;
+    bool prot = false, nominated = true;
+    int i;
 
     if (!mm)
         return false;
-    prot = ac_is_protected_mm(mm);
+    spin_lock_irqsave(&ac_prot_lock, flags);
+    for (i = 0; i < AC_PROT_MAX; i++) {
+        if (ac_prots[i].mm == mm) {
+            prot = true;
+            nominated = nominated && ac_prots[i].ptracer == me;
+        }
+    }
+    spin_unlock_irqrestore(&ac_prot_lock, flags);
     mmput_async(mm);
-    return prot;
-}
-
-static bool ac_is_protected_pid(pid_t pid, char *comm_out)
-{
-    struct task_struct *t = ac_find_task(pid);
-    bool prot = false;
-
-    if (!t)
-        return false;
-    prot = ac_is_protected_task_mm(t);
-    if (prot && comm_out)
-        strscpy(comm_out, t->comm, AC_MAX_COMM);
-    put_task_struct(t);
-    return prot;
+    return prot && !nominated;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1688,9 +1712,15 @@ static int ac_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
             deny = true;
         }
     } else if (target > 0) {
-        if (ac_is_protected_pid((pid_t)target, tcomm)) {
-            deny = true;
-            kill = true;
+        struct task_struct *t = ac_find_task((pid_t)target);
+
+        if (t) {
+            if (ac_denies_access_to(t)) {
+                strscpy(tcomm, t->comm, sizeof(tcomm));
+                deny = true;
+                kill = true;
+            }
+            put_task_struct(t);
         }
     }
     if (!deny)
@@ -1752,7 +1782,10 @@ static int ac_process_vm_pre(struct kprobe *p, struct pt_regs *regs)
         put_task_struct(t);
         return 0;
     }
-    protected_target = ac_is_protected_task_mm(t);
+    /* A nominated ptracer (see ac_denies_access_to()) is exempt here too:
+     * crash reporters read the dumped process's memory this way, and
+     * Yama gates process_vm_* behind the same ptrace-attach check. */
+    protected_target = ac_denies_access_to(t);
     if (protected_target)
         strscpy(tcomm, t->comm, sizeof(tcomm));
     put_task_struct(t);
@@ -1774,6 +1807,112 @@ static int ac_process_vm_pre(struct kprobe *p, struct pt_regs *regs)
      * cleanly with -ESRCH and never copies a single byte to/from the
      * protected process. */
     ac_frame_set_arg(args, 0, (unsigned long)-1);
+    return 0;
+}
+
+/* prctl(PR_SET_PTRACER, pid) from a protected process nominates pid's
+ * thread group as its ptracer, and ac_denies_access_to() then lets that
+ * thread group through (issue #116). This is the standard opt-in crash
+ * reporters use under Yama ptrace_scope=1: Breakpad nominates the helper
+ * it clone()s to write the minidump, Crashpad the crashpad_handler it
+ * spawned.
+ *
+ * Mirrors Yama's semantics where they're safe: pid 0 clears the
+ * nomination, a pid that doesn't resolve leaves it unchanged, and it is
+ * per process (not inherited by children; an exec re-registers under a
+ * fresh entry without one). PR_SET_PTRACER_ANY is deliberately NOT
+ * honoured -- that would open the game to every process on the system,
+ * cheats included -- so it clears any earlier nomination instead, and
+ * the event says so. The pid resolves in the caller's own namespace
+ * (find_get_pid()), as prctl itself would.
+ *
+ * A kretprobe, not a plain pre-handler, so a nomination is committed
+ * only once the real prctl's outcome is known: the entry handler
+ * resolves the candidate into ri->data and the ret handler stores it.
+ * Two outcomes commit it:
+ *   0        Yama (or another LSM) accepted the nomination.
+ *   -EINVAL  no LSM handles PR_SET_PTRACER, so prctl's default case
+ *            rejects it. The intent is the same and Breakpad/Crashpad
+ *            ignore the result, so the nomination still stands. (With
+ *            Yama, -EINVAL for a pid the entry handler did resolve only
+ *            means that thread group exited in between; its struct pid
+ *            is never reused, so recording it grants nothing.)
+ * Anything else -- -ENOMEM when Yama can't allocate the relation, or an
+ * LSM refusing it -- is a genuine rejection and nothing is recorded.
+ * Clearing (pid 0, or the ignored PR_SET_PTRACER_ANY) only ever narrows
+ * access, so it applies whatever prctl returned. */
+struct ac_prctl_data {
+    struct pid *tracer;     /* referenced candidate; NULL clears */
+    bool any;
+};
+
+static int ac_prctl_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct ac_prctl_data *d = (struct ac_prctl_data *)ri->data;
+    struct pt_regs *args = ac_frame_regs(regs);
+    /* int/pid_t truncation also normalises a compat caller's
+     * zero-extended 32-bit PR_SET_PTRACER_ANY (0xffffffff) to -1 */
+    int option = (int)ac_frame_arg(args, 0);
+    pid_t nr = (pid_t)ac_frame_arg(args, 1);
+
+    d->tracer = NULL;
+    d->any = false;
+    /* nonzero return: skip the ret handler for this call entirely */
+    if (option != PR_SET_PTRACER || !ac_is_protected_mm(current->mm))
+        return 1;
+    if (nr == (pid_t)PR_SET_PTRACER_ANY) {
+        d->any = true;
+    } else if (nr < 0) {
+        return 1;
+    } else if (nr > 0) {
+        struct task_struct *t = ac_find_task(nr);
+
+        if (!t)
+            return 1;
+        d->tracer = get_pid(task_tgid(t));
+        put_task_struct(t);
+    }
+    return 0;
+}
+
+static int ac_prctl_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct ac_prctl_data *d = (struct ac_prctl_data *)ri->data;
+    long rc = (long)regs_return_value(regs);
+    struct mm_struct *mm = current->mm;
+    unsigned long flags;
+    int i;
+
+    if (d->tracer && rc != 0 && rc != -EINVAL) {
+        ac_emit(AC_EV_INFO, current->tgid, current->comm,
+                "PR_SET_PTRACER of pid %d failed (%ld); nomination not recorded",
+                pid_nr(d->tracer), rc);
+        put_pid(d->tracer);
+        return 0;
+    }
+
+    spin_lock_irqsave(&ac_prot_lock, flags);
+    for (i = 0; i < AC_PROT_MAX; i++) {
+        if (ac_prots[i].mm == mm) {
+            /* put_pid() never sleeps, so dropping the old reference
+             * under the spinlock is fine */
+            put_pid(ac_prots[i].ptracer);
+            ac_prots[i].ptracer = get_pid(d->tracer);
+        }
+    }
+    spin_unlock_irqrestore(&ac_prot_lock, flags);
+
+    if (d->any)
+        ac_emit(AC_EV_INFO, current->tgid, current->comm,
+                "PR_SET_PTRACER_ANY ignored: protected processes accept only a specific ptracer pid");
+    else if (d->tracer)
+        ac_emit(AC_EV_INFO, current->tgid, current->comm,
+                "nominated pid %d as ptracer (PR_SET_PTRACER); its ptrace/process_vm access is allowed",
+                pid_nr(d->tracer));
+    else
+        ac_emit(AC_EV_INFO, current->tgid, current->comm,
+                "cleared ptracer nomination (PR_SET_PTRACER 0)");
+    put_pid(d->tracer);
     return 0;
 }
 
@@ -1997,9 +2136,17 @@ static struct kretprobe ac_kp_execveat32 = {
     .maxactive = 64,
 };
 
+static struct kretprobe ac_kp_prctl = {
+    .kp = { .symbol_name = AC_SYM_PRCTL },
+    .entry_handler = ac_prctl_entry,
+    .handler = ac_prctl_ret,
+    .data_size = sizeof(struct ac_prctl_data),
+    .maxactive = 64,
+};
+
 static struct kretprobe *ac_kretprobes[] = {
     &ac_kp_clone, &ac_kp_execve, &ac_kp_execveat,
-    &ac_kp_execve32, &ac_kp_execveat32,
+    &ac_kp_execve32, &ac_kp_execveat32, &ac_kp_prctl,
 };
 static bool ac_kretp_ok[ARRAY_SIZE(ac_kretprobes)];
 static unsigned int ac_kretprobes_registered;
