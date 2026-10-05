@@ -260,14 +260,19 @@ read -r -t 5 _ PTRACER_PID <&"${PTRACERTEST[0]}" || PTRACER_PID=""
 if [ -n "$PTRACER_PID" ] && ./anticheat protect --pid "$PTRACER_PID" >/dev/null; then
     echo go >&"${PTRACERTEST[1]}"
     PTRACER_SKIPPED=0
-    # expected verdict per case; see the helper's header comment
+    PTRACER_DONE=0
+    declare -A PTRACER_SEEN=()
+    # expected verdict per case; see the helper's header comment. The
+    # loop also ends on a read timeout or EOF (helper died), so the
+    # protocol is checked to have completed afterwards.
     while read -r -t 10 tag name verdict <&"${PTRACERTEST[0]}"; do
         case "$tag" in
             SKIP) say "skipped: $name $verdict"; PTRACER_SKIPPED=1; break ;;
-            DONE) break ;;
+            DONE) PTRACER_DONE=1; break ;;
             RESULT) ;;
             *) continue ;;
         esac
+        PTRACER_SEEN[$name]=$(( ${PTRACER_SEEN[$name]:-0} + 1 ))
         want=denied
         [ "$name" = nominated ] && want=allowed
         if [ "$verdict" = "$want" ]; then
@@ -276,6 +281,14 @@ if [ -n "$PTRACER_PID" ] && ./anticheat protect --pid "$PTRACER_PID" >/dev/null;
             bad "$name: got $verdict, want $want"
         fi
     done
+    if [ "$PTRACER_SKIPPED" -eq 0 ]; then
+        for c in nominated none any cleared; do
+            [ "${PTRACER_SEEN[$c]:-0}" -eq 1 ] ||
+                bad "ptracer_nominate_test: expected one RESULT for $c, got ${PTRACER_SEEN[$c]:-0}"
+        done
+        [ "$PTRACER_DONE" -eq 1 ] ||
+            bad "ptracer_nominate_test exited or timed out before DONE"
+    fi
     if [ "$PTRACER_SKIPPED" -eq 1 ]; then
         :
     elif ./anticheat events | grep -q "PR_SET_PTRACER_ANY ignored"; then

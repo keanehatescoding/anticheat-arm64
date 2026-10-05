@@ -354,8 +354,9 @@ exec 9>&-
 wait "\$PT_PID"
 cat "\$PT_DIR/out"
 PT_EVENTS=\$(./anticheat events 2>&1)
-if awk '/^RESULT/{want = (\$2 == "nominated") ? "allowed" : "denied"; n++; if (\$3 != want) bad++}
-        END {exit !(n == 4 && !bad)}' "\$PT_DIR/out" &&
+if awk '/^RESULT/{want = (\$2 == "nominated") ? "allowed" : "denied"; n++; if (\$3 != want) bad++; names[\$2]++}
+        END {exit !(n == 4 && !bad && names["nominated"] == 1 && names["none"] == 1 &&
+                    names["any"] == 1 && names["cleared"] == 1)}' "\$PT_DIR/out" &&
    grep -q '^DONE' "\$PT_DIR/out" &&
    echo "\$PT_EVENTS" | grep -q 'PR_SET_PTRACER_ANY ignored'; then
     echo "AC_KASAN_BOOT: PTRACER CHECK OK"
