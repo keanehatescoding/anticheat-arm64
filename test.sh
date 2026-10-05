@@ -16,7 +16,7 @@ DAEMON_PID=""
 REPORT_SERVER_PID=""
 MIGTEST_PID=""
 SPAWNTEST_PID=""
-PTRACERTEST_PID=""
+PTRACERTEST_COPROC_PID=""
 CHILD_PIDFILE=""
 FAILED=0
 
@@ -32,7 +32,7 @@ cleanup() {
     [ -n "$REPORT_SERVER_PID" ] && kill "$REPORT_SERVER_PID" 2>/dev/null
     [ -n "$MIGTEST_PID" ] && kill -9 "$MIGTEST_PID" 2>/dev/null
     [ -n "$SPAWNTEST_PID" ] && kill -9 "$SPAWNTEST_PID" 2>/dev/null
-    [ -n "$PTRACERTEST_PID" ] && kill -9 "$PTRACERTEST_PID" 2>/dev/null
+    [ -n "$PTRACERTEST_COPROC_PID" ] && kill -9 "$PTRACERTEST_COPROC_PID" 2>/dev/null
     [ -n "$CHILD_PIDFILE" ] && rm -f "$CHILD_PIDFILE"
     [ -n "${AC_TMPDIR:-}" ] && rm -rf "$AC_TMPDIR"
     sleep 0.2
@@ -256,16 +256,23 @@ if printf '%s' "$EVENTS" | grep -q "FORK"; then ok "FORK event logged"; else bad
 
 say "crash-reporter exemption: PR_SET_PTRACER nominee may ptrace its protected parent (#116)"
 coproc PTRACERTEST { ./test/ptracer_nominate_test; }
-read -r -t 5 _ PTRACER_PID <&"${PTRACERTEST[0]}" || PTRACER_PID=""
+# This helper exits on its own after DONE (or SKIP), and bash unsets
+# PTRACERTEST_PID and the PTRACERTEST fd array once it reaps a coproc --
+# which under set -u would abort the reads and kill/wait below, or the
+# EXIT trap. Keep private copies, taken while the helper is still blocked
+# on stdin and so can't have exited yet.
+PTRACERTEST_COPROC_PID="$PTRACERTEST_PID"
+exec {PTRACER_RD}<&"${PTRACERTEST[0]}" {PTRACER_WR}>&"${PTRACERTEST[1]}"
+read -r -t 5 _ PTRACER_PID <&"$PTRACER_RD" || PTRACER_PID=""
 if [ -n "$PTRACER_PID" ] && ./anticheat protect --pid "$PTRACER_PID" >/dev/null; then
-    echo go >&"${PTRACERTEST[1]}"
+    echo go >&"$PTRACER_WR"
     PTRACER_SKIPPED=0
     PTRACER_DONE=0
     declare -A PTRACER_SEEN=()
     # expected verdict per case; see the helper's header comment. The
     # loop also ends on a read timeout or EOF (helper died), so the
     # protocol is checked to have completed afterwards.
-    while read -r -t 10 tag name verdict <&"${PTRACERTEST[0]}"; do
+    while read -r -t 10 tag name verdict <&"$PTRACER_RD"; do
         case "$tag" in
             SKIP) say "skipped: $name $verdict"; PTRACER_SKIPPED=1; break ;;
             DONE) PTRACER_DONE=1; break ;;
@@ -299,9 +306,12 @@ if [ -n "$PTRACER_PID" ] && ./anticheat protect --pid "$PTRACER_PID" >/dev/null;
 else
     bad "ptracer_nominate_test did not report PID or could not be protected"
 fi
-kill -9 "$PTRACERTEST_PID" 2>/dev/null
-wait "$PTRACERTEST_PID" 2>/dev/null
-PTRACERTEST_PID=""
+exec {PTRACER_RD}<&- {PTRACER_WR}>&-
+if [ -n "$PTRACERTEST_COPROC_PID" ]; then
+    kill -9 "$PTRACERTEST_COPROC_PID" 2>/dev/null
+    wait "$PTRACERTEST_COPROC_PID" 2>/dev/null
+fi
+PTRACERTEST_COPROC_PID=""
 
 say "pid-namespace resolution: protect --pid inside another namespace via --ns-of"
 # --comm already works across pid namespaces for free (it walks /proc from
