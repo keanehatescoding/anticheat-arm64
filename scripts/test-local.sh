@@ -88,10 +88,11 @@ run_module_native() {
 # Same rootfs vng would provision itself (virtme_ng/run.py create_root():
 # Ubuntu's <release>-server-cloudimg-<arch>-root.tar.xz), but extracted
 # through pkexec rather than vng's hardcoded sudo. Downloaded as the user
-# first, so only the extract needs root.
+# first, so only the extract needs root. The marker is written only after
+# tar succeeds, so an interrupted extract is redone rather than reused.
 ensure_arm64_root() {
-    local root="$1" release=noble tarball
-    [ -d "$root/etc" ] && return 0
+    local root="$1" release=noble tarball marker="$1/.ac-rootfs-complete"
+    [ -f "$marker" ] && return 0
     tarball="$AC_KASAN_CACHE/$release-server-cloudimg-arm64-root.tar.xz"
     if [ ! -s "$tarball" ]; then
         say "downloading the Ubuntu $release arm64 rootfs (one-time)"
@@ -100,15 +101,15 @@ ensure_arm64_root() {
         mv "$tarball.part" "$tarball"
     fi
     say "extracting the arm64 rootfs to $root as root (pkexec, one-time)"
-    # shellcheck disable=SC2016  # $1/$2 are expanded by the root shell
-    pkexec /bin/sh -c 'mkdir -p "$1" && tar -xJf "$2" -C "$1"' sh "$root" "$tarball" ||
+    # shellcheck disable=SC2016  # $1..$3 are expanded by the root shell
+    pkexec /bin/sh -c 'mkdir -p "$1" && tar -xJf "$2" -C "$1" && touch "$3"' \
+        sh "$root" "$tarball" "$marker" ||
         die "rootfs extract failed"
-    [ -d "$root/etc" ] || die "rootfs extract left no $root/etc"
+    [ -f "$marker" ] || die "rootfs extract left no $marker"
     rm -f "$tarball"
 }
 
 run_module_vm() {
-    need qemu-system-aarch64 vng aarch64-linux-gnu-gcc curl flock make
     AC_KASAN_CACHE="${AC_KASAN_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/anticheat-kasan}"
     mkdir -p "$AC_KASAN_CACHE"
     if [ "${AC_REQUIRE_WARM_CACHE:-0}" = 1 ] && [ ! -f "$AC_KASAN_CACHE/linux-6.12/vmlinux" ]; then
@@ -116,6 +117,7 @@ run_module_vm() {
         say "  Build it once (~30 min): scripts/test-local.sh --module"
         return 0
     fi
+    need qemu-system-aarch64 vng aarch64-linux-gnu-gcc curl flock make
     ensure_arm64_root "$AC_KASAN_CACHE/arm64-root"
     say "x86_64 host: booting the arm64 KASAN VM under QEMU (cache: $AC_KASAN_CACHE)"
     export AC_KASAN_CACHE AC_ARM64_ROOT="$AC_KASAN_CACHE/arm64-root"
