@@ -526,6 +526,10 @@ static unsigned long ac_find_syscall_table(void)
     /* Primary window: from the end of .text forward.  The table
      * lives in .rodata right after .text. */
     lo = ac_etext ? ac_etext : (ac_stext ? ac_stext : rh);
+    /* The table's slots are 8-byte aligned, but a function (rh) need only
+     * be 4-byte aligned on arm64; stepping 8 bytes from a 4-mod-8 start
+     * would straddle every slot and never match (#113). */
+    lo &= ~(sizeof(unsigned long) - 1);
     hi = lo + win;
     if (ac_verbose)
         pr_info("table scan window [0x%lx, 0x%lx) (win=0x%lx)\n",
@@ -560,7 +564,9 @@ static unsigned long ac_find_syscall_table(void)
     {
         unsigned long lo_b = rh > win ? rh - win : sizeof(unsigned long);
 
-        for (addr = rh; ; addr -= sizeof(unsigned long)) {
+        /* aligned down for the same reason as lo above (#113) */
+        for (addr = rh & ~(sizeof(unsigned long) - 1); ;
+             addr -= sizeof(unsigned long)) {
             if (ac_kread(&v1, (void *)addr, sizeof(v1)) == 0 &&
                 v1 == rh) {
                 if (!first_partial)

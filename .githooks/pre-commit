@@ -1,0 +1,7 @@
+#!/bin/bash
+# pre-commit: seconds-fast checks -- shellcheck and a -Werror daemon build
+# for both arm64 and the host. The full `make ci` runs in pre-push.
+# Runs against the working tree, not just the staged content.
+# Skip once with `git commit --no-verify`, or set AC_SKIP_HOOKS=1.
+[ "${AC_SKIP_HOOKS:-0}" = 1 ] && exit 0
+exec "$(git rev-parse --show-toplevel)/scripts/test-local.sh" --lint

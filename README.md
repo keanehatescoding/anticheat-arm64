@@ -857,6 +857,30 @@ distros mark the system Python as externally-managed), `qemu-system-aarch64`,
 and the same kernel build deps the `module` CI job uses (`bc flex bison
 libelf-dev libssl-dev dwarves`).
 
+### Local test runner and git hooks
+
+`scripts/test-local.sh` runs the right tests for the machine you're on:
+
+| Mode | What it runs |
+|---|---|
+| `--lint` | shellcheck plus a `-Werror` daemon build, native and aarch64 (seconds) |
+| `--quick` | `make ci` |
+| `--module` | **aarch64 host:** builds `anticheat.ko` for the running kernel and runs `./test.sh` as root via `pkexec`.<br>**x86_64 host:** boots the arm64 KASAN VM above under QEMU (`kasan_boot_test.sh`). |
+| `--all` (default) | `--quick`, then `--module` |
+
+On x86_64 the kernel tree and the arm64 rootfs are cached in
+`${AC_KASAN_CACHE:-~/.cache/anticheat-kasan}` (about 20 GB).
+The first `--module` run builds the KASAN kernel, which takes about 30 minutes, and extracts Ubuntu's arm64 cloud image as root through `pkexec`, once.
+Later runs rebuild only what changed, then boot the VM, which takes a few minutes.
+
+`make hooks` points git at the tracked hooks in `.githooks/`:
+
+- **pre-commit** runs `--lint`.
+- **pre-push** runs `make ci`, plus `--module` when the push touches the module, its harness or the helpers the VM runs.
+  - Each pushed commit is tested in a temporary worktree, so uncommitted edits don't affect the result.
+  - On x86_64 the VM run is skipped with a notice until the kernel cache has been built once (`scripts/test-local.sh --module`).
+  - To bypass, set `AC_SKIP_VM=1` to skip only the module test, or use `git push --no-verify` to skip everything.
+
 ### Load / use
 
 ```sh
@@ -1200,6 +1224,9 @@ test/ioctl_fuzz.c        fuzzes every AC_IOCTL_* (malformed sizes, bad
 scripts/kasan_boot_test.sh  boots a KASAN+lockdep kernel in a VM, insmods
                          the real module, runs the real ioctl_fuzz above
                          against it -- nightly + on-demand, see README
+scripts/test-local.sh    arch-aware local runner (lint / make ci / real
+                         module natively on aarch64, arm64 VM on x86_64);
+                         called by the .githooks/ hooks (`make hooks`)
 src/anticheat.h          shared ioctl ABI
 src/anticheat_module.c   the kernel module
 src/anticheat_daemon.c   userspace daemon + CLI

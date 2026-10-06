@@ -271,6 +271,13 @@ test/daemon_limits_test: test/daemon_limits_test.c src/anticheat_daemon.c src/sh
 test-mock: mock daemon
 	./test/mock_test.sh
 
+# Point git at the tracked hooks in .githooks/: pre-commit runs `make ci`,
+# pre-push runs the real-module test when module/harness files changed
+# (native on aarch64, an arm64 QEMU VM on x86_64). See scripts/test-local.sh.
+hooks:
+	git config core.hooksPath .githooks
+	@echo "hooks enabled (.githooks/); disable with: git config --unset core.hooksPath"
+
 # CI entry point: the full no-root userspace gate -- the same gate CI's
 # `userspace` job runs (that job is a thin wrapper: toolchain installs, then
 # `make ci`). Keep them in sync: NEVER add a CI userspace step the `ci`
@@ -316,7 +323,7 @@ ci:
 # to exec the script next.
 	@set -eu; \
 	if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then \
-		git ls-files '*.sh' | { fail=0; \
+		git ls-files '*.sh' '.githooks/*' | { fail=0; \
 			while IFS= read -r f; do \
 				if [ ! -x "$$f" ]; then \
 					echo "error: executable bit missing on $$f (mode $$(stat -c%a "$$f"))"; \
@@ -325,7 +332,7 @@ ci:
 			done; \
 			exit $$fail; }; \
 		if command -v shellcheck >/dev/null 2>&1; then \
-			git ls-files '*.sh' | xargs shellcheck; \
+			git ls-files '*.sh' '.githooks/*' | xargs shellcheck; \
 		else \
 			echo "warning: shellcheck not installed -- skipping shell checks (CI enforces them)"; \
 		fi; \
@@ -471,4 +478,4 @@ install-deck: all
 uninstall-deck:
 	rm -rf "$(DECK_PREFIX)"
 
-.PHONY: all module daemon mock test-mock priv-drop-test render-hook-test mount-ns-test thread-exit-migration-test thread-spawn-after-protect-test ptracer-nominate-test ioctl-fuzz baseline-test ac-report-status-test ac-report-url-test ac-report-cooldown-test daemon-limits-test daemon-reporting-test ci ci-aur-check clean install uninstall install-deck uninstall-deck
+.PHONY: all module daemon hooks mock test-mock priv-drop-test render-hook-test mount-ns-test thread-exit-migration-test thread-spawn-after-protect-test ptracer-nominate-test ioctl-fuzz baseline-test ac-report-status-test ac-report-url-test ac-report-cooldown-test daemon-limits-test daemon-reporting-test ci ci-aur-check clean install uninstall install-deck uninstall-deck
