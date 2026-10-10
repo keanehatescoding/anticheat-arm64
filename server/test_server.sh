@@ -1428,10 +1428,15 @@ badlk_case() {
     badlk_desc=$1
     badlk_want=$2
     shift 2
-    if env AC_SERVER_REPORT_KEY=r AC_SERVER_ADMIN_KEY=a "$@" \
+    # bounded: a server that wrongly accepts the config would otherwise
+    # serve forever in the foreground and hang the suite here.
+    badlk_rc=0
+    env AC_SERVER_REPORT_KEY=r AC_SERVER_ADMIN_KEY=a "$@" \
+        timeout -k 2 10 \
         python3 ./ac_server.py --port 18813 --db "$BADLK_TESTDIR/ac_server.db" \
-        >"$BADLK_TESTDIR/server.log" 2>&1; then
-        fail "server should refuse to start when $badlk_desc"
+        >"$BADLK_TESTDIR/server.log" 2>&1 || badlk_rc=$?
+    if [ "$badlk_rc" -eq 0 ] || [ "$badlk_rc" -eq 124 ] || [ "$badlk_rc" -eq 137 ]; then
+        fail "server should refuse to start when $badlk_desc (exit $badlk_rc)"
     elif grep -q "$badlk_want" "$BADLK_TESTDIR/server.log"; then
         pass "server refuses to start when $badlk_desc"
     else
