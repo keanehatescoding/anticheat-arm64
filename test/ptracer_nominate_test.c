@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: GPL-2.0
+ * SPDX-License-Identifier: MIT
  *
  * test/ptracer_nominate_test.c -- live test helper for the
  * prctl(PR_SET_PTRACER) crash-reporter exemption (issue #116).

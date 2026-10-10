@@ -91,8 +91,10 @@ Most changes don't need root or a VM:
 
 ## Code conventions
 
-- New C files: `SPDX-License-Identifier: GPL-2.0` plus a short comment
+- New C files: `SPDX-License-Identifier: MIT` plus a short comment
   describing the file's purpose, matching the existing files in `src/`.
+  Kernel module sources use `GPL-2.0 OR MIT` instead, since the module
+  must declare a GPL-compatible `MODULE_LICENSE` to use GPL-only symbols.
 - Kernel-side changes should stay sparse-clean — `make module` currently
   has zero sparse warnings; keep it that way.
 - Shell scripts must pass `shellcheck` and keep their executable bit (a
@@ -133,5 +135,6 @@ That determines whether `AC_IOCTL_VERSION` needs to bump — see
 
 ## License
 
-GPL-2.0, same as the rest of the project (see `LICENSE`). By submitting a
-PR you agree your contribution is under the same license.
+MIT, same as the rest of the project (see `LICENSE`); the kernel module
+(`src/anticheat_module.c`) is dual-licensed `GPL-2.0 OR MIT`. By submitting
+a PR you agree your contribution is under the same license.

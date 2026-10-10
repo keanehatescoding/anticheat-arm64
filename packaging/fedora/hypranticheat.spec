@@ -3,7 +3,7 @@ Version:        1.0.0
 Release:        1%{?dist}
 Summary:        Kernel-mode anticheat: syscall/module integrity, ptrace denial, RWX/anon-exec detection
 
-License:        GPL-2.0-only
+License:        MIT
 URL:            https://github.com/keanehatescoding/anticheat-arm64
 # Same immutable, tag-pinned release tarball the AUR PKGBUILD uses (see
 # packaging/aur/PKGBUILD) -- GitHub extracts this to
