@@ -531,14 +531,14 @@ permissions on the socket become the trust boundary instead of network
 exposure).
 
 **Server side.** Stdlib-only Python (`http.server` + `sqlite3`, zero
-third-party dependencies) with two separate bearer-token tiers:
+third-party dependencies) with three separate bearer-token tiers:
 
 ```
-POST /report            report-key   -- what the daemon uses
-POST /ban               admin-key    -- {client_id, reason}
-POST /unban              admin-key   -- {client_id}
-GET  /banned/<id>        admin-key   -- what a game server would call
-GET  /reports/<id>       admin-key   -- raw reports for a human to review
+POST /report            report-key               -- what the daemon uses
+POST /ban               admin-key                -- {client_id, reason}
+POST /unban             admin-key                -- {client_id}
+GET  /banned/<id>       lookup-key or admin-key  -- what a game server would call
+GET  /reports/<id>      admin-key                -- raw reports for a human to review
 ```
 
 ```
@@ -547,7 +547,12 @@ AC_SERVER_REPORT_KEY=<report-key> AC_SERVER_ADMIN_KEY=<admin-key> \
 ```
 
 Both keys are required at startup — it refuses to run with no auth
-configured rather than defaulting to open. Client IDs are validated
+configured rather than defaulting to open. The lookup key is optional
+(`--lookup-key` / `AC_SERVER_LOOKUP_KEY`): it is read-only and accepted
+only by `GET /banned/<id>`, so a game or matchmaking server doing ban
+lookups holds it instead of the admin key and can't ban, unban or read
+reports if it is compromised. Without one, `GET /banned/<id>` stays
+admin-only. Client IDs are validated
 against a bounded alnum/`.`/`_`/`-` pattern before touching the database;
 report bodies are capped at 4 KiB.
 
@@ -662,12 +667,13 @@ server {
 }
 ```
 
-**Key rotation.** `--report-key`/`--admin-key` (and their `AC_SERVER_*`
-env-var equivalents) are static for the life of the process — there's no
+**Key rotation.** `--report-key`/`--admin-key`/`--lookup-key` (and their
+`AC_SERVER_*` env-var equivalents) are static for the life of the process — there's no
 way to change them without a restart. To avoid a hard cutover where every
 daemon and admin client must be updated in lockstep with the server, each
 tier also accepts one additional "-old" key (`--report-key-old`/
-`--admin-key-old`, or `AC_SERVER_REPORT_KEY_OLD`/`AC_SERVER_ADMIN_KEY_OLD`)
+`--admin-key-old`/`--lookup-key-old`, or `AC_SERVER_REPORT_KEY_OLD`/
+`AC_SERVER_ADMIN_KEY_OLD`/`AC_SERVER_LOOKUP_KEY_OLD`)
 during a rotation window. This is *not* zero-downtime in the connection
 sense: `ac_server.service` is a plain `Type=simple` unit with no socket
 activation, so `systemctl restart` still stops the listener before
@@ -675,16 +681,18 @@ starting the replacement — a request arriving in that gap is refused or
 times out like any other brief service restart, same as restarting for
 any other reason. What the "-old" key avoids is a *coordinated* cutover:
 
-1. Restart with the *new* key as `--report-key`/`--admin-key` and the
-   *current* (about-to-be-retired) key as `--report-key-old`/
-   `--admin-key-old`. Both are accepted during this window.
-2. Roll every daemon (`AC_REPORT_KEY`) and admin client over to the new
-   key.
+1. Restart with the *new* key as `--report-key`/`--admin-key`/
+   `--lookup-key` and the *current* (about-to-be-retired) key as
+   `--report-key-old`/`--admin-key-old`/`--lookup-key-old`. Both are
+   accepted during this window.
+2. Roll every daemon (`AC_REPORT_KEY`), admin client and game server
+   over to the new key.
 3. Restart once more without the `-old` flags to finish the rotation.
 
-A key can never be valid for both tiers at once, `-old` included — the
-server refuses to start if e.g. `--report-key-old` collides with
-`--admin-key` (see the startup check next to `report_keys & admin_keys`).
+A key can never be valid for more than one tier at once, `-old` included —
+the server refuses to start if e.g. `--report-key-old` collides with
+`--admin-key`, or `--lookup-key` with either (see the startup check over
+`tiers` in `main()`).
 
 **Backups.** The `bans` table is the one piece of state that actually
 matters operationally (`reports` is useful history but not

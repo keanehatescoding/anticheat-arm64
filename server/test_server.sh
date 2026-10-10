@@ -28,6 +28,7 @@ TERM_KILLER_PID=""
 TP_SERVER_PID=""
 NOTP_SERVER_PID=""
 ROT_SERVER_PID=""
+LK_SERVER_PID=""
 UNIX_SERVER_PID=""
 # cleanup is invoked via trap below; shellcheck cannot always see that
 # shellcheck disable=SC2317,SC2329
@@ -43,6 +44,7 @@ cleanup() {
     [ -n "$TP_SERVER_PID" ] && kill "$TP_SERVER_PID" 2>/dev/null
     [ -n "$NOTP_SERVER_PID" ] && kill "$NOTP_SERVER_PID" 2>/dev/null
     [ -n "$ROT_SERVER_PID" ] && kill "$ROT_SERVER_PID" 2>/dev/null
+    [ -n "$LK_SERVER_PID" ] && kill "$LK_SERVER_PID" 2>/dev/null
     [ -n "$UNIX_SERVER_PID" ] && kill "$UNIX_SERVER_PID" 2>/dev/null
     wait "$SERVER_PID" 2>/dev/null
     wait "$RL_SERVER_PID" 2>/dev/null
@@ -52,6 +54,7 @@ cleanup() {
     wait "$TP_SERVER_PID" 2>/dev/null
     wait "$NOTP_SERVER_PID" 2>/dev/null
     wait "$ROT_SERVER_PID" 2>/dev/null
+    wait "$LK_SERVER_PID" 2>/dev/null
     wait "$UNIX_SERVER_PID" 2>/dev/null
     rm -f "$DB" "$DB-wal" "$DB-shm"
 }
@@ -1035,6 +1038,106 @@ wait "$ROT_SERVER_PID" 2>/dev/null
 ROT_SERVER_PID=""
 rm -rf "$ROT_TESTDIR"
 
+# Read-only lookup tier (#117): a dedicated instance started with a
+# lookup key (plus an "-old" one), proving it reaches GET /banned/<id>
+# and nothing else -- a game server holding it can't ban, unban, read
+# raw reports or file reports -- and that the admin key still works for
+# the lookup.
+LK_PORT=18812
+LK_TESTDIR="$(mktemp -d /tmp/ac_server_lookup_test.XXXXXXXX)"
+LK_DB="$LK_TESTDIR/ac_server.db"
+LK_KEY="lookup-new-$$"
+LK_KEY_OLD="lookup-old-$$"
+AC_SERVER_REPORT_KEY="$REPORT_KEY" AC_SERVER_ADMIN_KEY="$ADMIN_KEY" \
+    AC_SERVER_LOOKUP_KEY="$LK_KEY" AC_SERVER_LOOKUP_KEY_OLD="$LK_KEY_OLD" \
+    python3 ./ac_server.py --host 127.0.0.1 --port "$LK_PORT" --db "$LK_DB" \
+    --rate-limit 500 --rate-window 60 \
+    >"$LK_TESTDIR/server.log" 2>&1 &
+LK_SERVER_PID=$!
+LK_BASE="http://127.0.0.1:$LK_PORT"
+LK_CID="test-lookup-$$"
+
+LK_READY=0
+for _ in $(seq 1 50); do
+    if curl -s "$LK_BASE/banned/x" -H "Authorization: Bearer $ADMIN_KEY" 2>/dev/null \
+        | grep -q '"banned"'; then
+        LK_READY=1
+        break
+    fi
+    sleep 0.1
+done
+
+if [ "$LK_READY" -eq 1 ]; then
+    OUT=$(curl -s "$LK_BASE/banned/$LK_CID" -H "Authorization: Bearer $LK_KEY")
+    if echo "$OUT" | grep -q '"banned": *false'; then
+        pass "lookup: lookup key reads GET /banned/<id> (not banned)"
+    else
+        fail "lookup: lookup key should read GET /banned/<id> (got: $OUT)"
+    fi
+
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$LK_BASE/ban" \
+        -H "Authorization: Bearer $ADMIN_KEY" -H 'Content-Type: application/json' \
+        -d "{\"client_id\":\"$LK_CID\",\"reason\":\"lookup-test\"}")
+    OUT=$(curl -s "$LK_BASE/banned/$LK_CID" -H "Authorization: Bearer $LK_KEY")
+    if [ "$CODE" = "200" ] && echo "$OUT" | grep -q '"banned": *true'; then
+        pass "lookup: lookup key sees a ban made with the admin key"
+    else
+        fail "lookup: lookup key should see the ban (ban -> $CODE, got: $OUT)"
+    fi
+
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' "$LK_BASE/banned/$LK_CID" \
+        -H "Authorization: Bearer $LK_KEY_OLD")
+    if [ "$CODE" = "200" ]; then
+        pass "lookup: old lookup key accepted during rotation window -> 200"
+    else
+        fail "lookup: old lookup key should be 200 during rotation (got $CODE)"
+    fi
+
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' "$LK_BASE/banned/$LK_CID" \
+        -H "Authorization: Bearer $REPORT_KEY")
+    if [ "$CODE" = "401" ]; then
+        pass "lookup: report key still rejected on GET /banned/<id> -> 401"
+    else
+        fail "lookup: report key on GET /banned/<id> should be 401 (got $CODE)"
+    fi
+
+    # Both the current and the -old lookup key, on every other route.
+    for LK_TRY in "$LK_KEY" "$LK_KEY_OLD"; do
+        LK_CODES=""
+        LK_CODES="$LK_CODES $(curl -s -o /dev/null -w '%{http_code}' -X POST "$LK_BASE/ban" \
+            -H "Authorization: Bearer $LK_TRY" -H 'Content-Type: application/json' \
+            -d "{\"client_id\":\"$LK_CID-2\",\"reason\":\"x\"}")"
+        LK_CODES="$LK_CODES $(curl -s -o /dev/null -w '%{http_code}' -X POST "$LK_BASE/unban" \
+            -H "Authorization: Bearer $LK_TRY" -H 'Content-Type: application/json' \
+            -d "{\"client_id\":\"$LK_CID\"}")"
+        LK_CODES="$LK_CODES $(curl -s -o /dev/null -w '%{http_code}' "$LK_BASE/reports/$LK_CID" \
+            -H "Authorization: Bearer $LK_TRY")"
+        LK_CODES="$LK_CODES $(curl -s -o /dev/null -w '%{http_code}' -X POST "$LK_BASE/report" \
+            -H "Authorization: Bearer $LK_TRY" -H 'Content-Type: application/json' \
+            -d "{\"client_id\":\"$LK_CID\",\"event_type\":\"X\",\"detail\":\"d\",\"ts\":1}")"
+        if [ "$LK_CODES" = " 401 401 401 401" ]; then
+            pass "lookup: key ${LK_TRY%-"$$"} rejected on /ban, /unban, /reports/<id>, /report -> 401"
+        else
+            fail "lookup: key ${LK_TRY%-"$$"} should be 401 on /ban, /unban, /reports/<id>, /report (got$LK_CODES)"
+        fi
+    done
+
+    # The rejected /unban and /ban above must not have changed anything.
+    OUT=$(curl -s "$LK_BASE/banned/$LK_CID" -H "Authorization: Bearer $ADMIN_KEY")
+    OUT2=$(curl -s "$LK_BASE/banned/$LK_CID-2" -H "Authorization: Bearer $ADMIN_KEY")
+    if echo "$OUT" | grep -q '"banned": *true' && echo "$OUT2" | grep -q '"banned": *false'; then
+        pass "lookup: rejected ban/unban left the ban list unchanged"
+    else
+        fail "lookup: ban list changed after rejected requests (got: $OUT / $OUT2)"
+    fi
+else
+    fail "lookup-key test server never became ready on port $LK_PORT"
+fi
+kill "$LK_SERVER_PID" 2>/dev/null
+wait "$LK_SERVER_PID" 2>/dev/null
+LK_SERVER_PID=""
+rm -rf "$LK_TESTDIR"
+
 # --unix-socket transport (#67): a dedicated instance listening on an
 # AF_UNIX socket instead of TCP -- the alternative to plain-HTTP-over-TCP
 # this test exercises end to end (report ingestion, auth, the fixed
@@ -1315,6 +1418,39 @@ else
     pass "server refuses to start when an old report key equals the admin key"
 fi
 rm -rf "$BADROT_TESTDIR"
+
+# Lookup tier (#117): it must not overlap either other tier, -old
+# included, and an -old lookup key needs a current one. Each case names
+# what the refusal should say, so an unrelated startup failure can't pass.
+BADLK_TESTDIR="$(mktemp -d /tmp/ac_server_badlookup_test.XXXXXXXX)"
+badlk_case() {
+    # $1 = description, $2 = expected stderr substring, rest = env assignments
+    badlk_desc=$1
+    badlk_want=$2
+    shift 2
+    if env AC_SERVER_REPORT_KEY=r AC_SERVER_ADMIN_KEY=a "$@" \
+        python3 ./ac_server.py --port 18813 --db "$BADLK_TESTDIR/ac_server.db" \
+        >"$BADLK_TESTDIR/server.log" 2>&1; then
+        fail "server should refuse to start when $badlk_desc"
+    elif grep -q "$badlk_want" "$BADLK_TESTDIR/server.log"; then
+        pass "server refuses to start when $badlk_desc"
+    else
+        fail "wrong refusal when $badlk_desc: $(cat "$BADLK_TESTDIR/server.log")"
+    fi
+}
+badlk_case "the lookup key equals the admin key" \
+    "admin and lookup tiers must not overlap" AC_SERVER_LOOKUP_KEY=a
+badlk_case "the lookup key equals the report key" \
+    "report and lookup tiers must not overlap" AC_SERVER_LOOKUP_KEY=r
+badlk_case "an old lookup key equals the admin key" \
+    "admin and lookup tiers must not overlap" \
+    AC_SERVER_LOOKUP_KEY=l AC_SERVER_LOOKUP_KEY_OLD=a
+badlk_case "the lookup key equals an old admin key" \
+    "admin and lookup tiers must not overlap" \
+    AC_SERVER_LOOKUP_KEY=l AC_SERVER_ADMIN_KEY_OLD=l
+badlk_case "an old lookup key is set without a current one" \
+    "set without --lookup-key" AC_SERVER_LOOKUP_KEY_OLD=l
+rm -rf "$BADLK_TESTDIR"
 
 echo
 if [ "$FAIL" -eq 0 ]; then

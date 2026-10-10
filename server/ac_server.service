@@ -21,14 +21,18 @@
 #   sudo chmod 640 /etc/anticheat/ac_server.env
 #   sudo $EDITOR /etc/anticheat/ac_server.env   # AC_SERVER_REPORT_KEY=...
 #                                                # AC_SERVER_ADMIN_KEY=...
+#                                                # AC_SERVER_LOOKUP_KEY=...
+#                                                #   (optional, read-only:
+#                                                #   GET /banned/<id> only)
 #   sudo install -D -m 0755 server/ac_server.py /opt/anticheat/server/ac_server.py
 #   sudo cp server/ac_server.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now ac_server
 #
-# Key rotation: add AC_SERVER_REPORT_KEY_OLD / AC_SERVER_ADMIN_KEY_OLD to
-# the EnvironmentFile alongside the new AC_SERVER_REPORT_KEY /
-# AC_SERVER_ADMIN_KEY, `systemctl restart ac_server`, roll every daemon
+# Key rotation: add AC_SERVER_REPORT_KEY_OLD / AC_SERVER_ADMIN_KEY_OLD /
+# AC_SERVER_LOOKUP_KEY_OLD to the EnvironmentFile alongside the new
+# AC_SERVER_REPORT_KEY / AC_SERVER_ADMIN_KEY / AC_SERVER_LOOKUP_KEY,
+# `systemctl restart ac_server`, roll every daemon
 # and admin client over to the new keys, then remove the *_OLD lines and
 # restart once more -- see the README's "Key rotation" section. This is a
 # real `systemctl restart` (Type=simple, no socket activation) -- it

@@ -21,12 +21,17 @@ Two things this deliberately is NOT:
     would turn a bug or a spoofed report into a banned real player, which
     is a worse failure mode than a slower human-in-the-loop pipeline.
 
-Storage is a single SQLite file (zero extra services to run). Auth is two
-static bearer tokens: a report key (used by daemon instances, via
-AC_REPORT_KEY) and an admin key (used by whoever reviews/bans/queries).
-Each tier optionally accepts one additional "-old" key
-(AC_SERVER_REPORT_KEY_OLD / AC_SERVER_ADMIN_KEY_OLD) for a zero-downtime
-rotation window -- see --report-key-old/--admin-key-old below. There is no
+Storage is a single SQLite file (zero extra services to run). Auth is
+static bearer tokens in three tiers: a report key (used by daemon
+instances, via AC_REPORT_KEY), an admin key (used by whoever
+reviews/bans/queries), and an optional read-only lookup key
+(AC_SERVER_LOOKUP_KEY) accepted only by GET /banned/<client_id> -- the
+one to hand a game server, so that integrating the ban lookup doesn't
+also hand it ban/unban and the raw reports. Each tier optionally accepts
+one additional "-old" key (AC_SERVER_REPORT_KEY_OLD /
+AC_SERVER_ADMIN_KEY_OLD / AC_SERVER_LOOKUP_KEY_OLD) for a zero-downtime
+rotation window -- see --report-key-old/--admin-key-old/--lookup-key-old
+below. There is no
 built-in TLS -- run this behind a reverse proxy for anything reachable
 over an untrusted network, or keep it LAN/localhost-only, which is the
 deployment this was actually built and tested against.
@@ -536,7 +541,12 @@ class Store:
             conn.close()
 
 
-def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False):
+def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False,
+                 lookup_keys=frozenset()):
+    # The ban lookup is the only route the read-only lookup tier reaches;
+    # admin keys keep working on it.
+    banned_keys = admin_keys | lookup_keys
+
     class Handler(http.server.BaseHTTPRequestHandler):
         server_version = "ac_server/1"
         # Bounds every INDIVIDUAL blocking socket read on this connection
@@ -680,8 +690,9 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
                 return False
             # hmac.compare_digest is constant-time; a naive == here would
             # leak key-prefix-match timing to anyone who can hit this
-            # endpoint repeatedly. expected_keys is at most 2 (current +
-            # one still-valid-during-rotation previous key), so comparing
+            # endpoint repeatedly. expected_keys is at most 4 (current +
+            # one still-valid-during-rotation previous key per tier, and
+            # only GET /banned/<id> accepts two tiers), so comparing
             # against each candidate doesn't turn this into a meaningful
             # timing side channel between candidates either.
             return any(hmac.compare_digest(got, k) for k in expected_keys)
@@ -767,7 +778,7 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
                 return
             if self.path.startswith("/banned/"):
                 return self._call_with_auth(
-                    admin_keys, self._handle_banned, self.path[len("/banned/"):]
+                    banned_keys, self._handle_banned, self.path[len("/banned/"):]
                 )
             if self.path.startswith("/reports/"):
                 return self._call_with_auth(
@@ -907,6 +918,21 @@ def main():
         "(default: $AC_SERVER_ADMIN_KEY_OLD)",
     )
     ap.add_argument(
+        "--lookup-key",
+        default=None,
+        help="optional read-only bearer token accepted only by "
+        "GET /banned/<client_id> -- what a game server doing ban lookups "
+        "should hold instead of the admin key. Unset means only the "
+        "admin key can query bans (default: $AC_SERVER_LOOKUP_KEY)",
+    )
+    ap.add_argument(
+        "--lookup-key-old",
+        default=None,
+        help="a previous lookup key still accepted alongside --lookup-key, "
+        "same rotation-window purpose as --report-key-old "
+        "(default: $AC_SERVER_LOOKUP_KEY_OLD)",
+    )
+    ap.add_argument(
         "--rate-limit",
         type=int,
         default=60,
@@ -970,18 +996,39 @@ def main():
     report_keys = frozenset({report_key} | ({report_key_old} if report_key_old else set()))
     admin_keys = frozenset({admin_key} | ({admin_key_old} if admin_key_old else set()))
 
-    # Any key valid for one tier must not also be valid for the other --
-    # otherwise a daemon holding a report key (or an old one still in its
-    # rotation window) could authenticate to the admin-only ban/unban/query
-    # endpoints. This generalizes the original report_key == admin_key
-    # check to cover the old keys too.
-    if report_keys & admin_keys:
+    # The lookup tier is optional: unset (or empty) leaves GET /banned/<id>
+    # admin-only, exactly as before the tier existed.
+    lookup_key = _key_arg(args.lookup_key, "AC_SERVER_LOOKUP_KEY")
+    lookup_key_old = _key_arg(args.lookup_key_old, "AC_SERVER_LOOKUP_KEY_OLD")
+    if lookup_key_old and not lookup_key:
         sys.stderr.write(
-            "ac_server: a report key and an admin key (current or "
-            "-old) are identical -- report and admin tiers must not "
-            "overlap\n"
+            "ac_server: --lookup-key-old (or AC_SERVER_LOOKUP_KEY_OLD) is "
+            "set without --lookup-key -- an -old key is only for a rotation "
+            "window alongside a current one\n"
         )
         sys.exit(1)
+    lookup_keys = frozenset(k for k in (lookup_key, lookup_key_old) if k)
+
+    # Any key valid for one tier must not also be valid for another --
+    # otherwise a daemon holding a report key (or an old one still in its
+    # rotation window) could authenticate to the admin-only ban/unban/query
+    # endpoints, and a game server holding a lookup key could do the same
+    # or forge reports. This generalizes the original report_key ==
+    # admin_key check to cover the old keys and all three tiers.
+    tiers = (
+        ("report", report_keys),
+        ("admin", admin_keys),
+        ("lookup", lookup_keys),
+    )
+    for i, (name_a, keys_a) in enumerate(tiers):
+        for name_b, keys_b in tiers[i + 1:]:
+            if keys_a & keys_b:
+                sys.stderr.write(
+                    "ac_server: a %s key and a %s key (current or "
+                    "-old) are identical -- %s and %s tiers must not "
+                    "overlap\n" % (name_a, name_b, name_a, name_b)
+                )
+                sys.exit(1)
 
     if args.rate_limit <= 0 or args.rate_window <= 0:
         sys.stderr.write("ac_server: --rate-limit/--rate-window must be positive\n")
@@ -1023,7 +1070,8 @@ def main():
     store = Store(args.db, max_reports_per_client=args.max_reports_per_client)
     rate_limiter = RateLimiter(args.rate_limit, args.rate_window)
     handler = make_handler(
-        store, report_keys, admin_keys, rate_limiter, args.trust_proxy
+        store, report_keys, admin_keys, rate_limiter, args.trust_proxy,
+        lookup_keys=lookup_keys,
     )
     if args.unix_socket:
         httpd = ThreadingUnixHTTPServer(
@@ -1060,6 +1108,8 @@ def main():
         accepted_old_keys.append("report-key-old")
     if admin_key_old:
         accepted_old_keys.append("admin-key-old")
+    if lookup_key_old:
+        accepted_old_keys.append("lookup-key-old")
     rotation_note = ""
     if accepted_old_keys:
         rotation_note = (
