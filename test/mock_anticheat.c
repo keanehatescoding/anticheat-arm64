@@ -26,6 +26,14 @@
  *   AC_MOCK_CHECKSUM_ONLY=1
  *                       simulate a whole-table checksum mismatch with no
  *                       per-slot hook/redirect flagged (see #63)
+ *   AC_MOCK_COMPAT_HOOKED=1 / AC_MOCK_COMPAT_REDIRECT=1 /
+ *   AC_MOCK_COMPAT_CHECKSUM_ONLY=1
+ *                       the same three, in the AArch32 compat table only
+ *                       (the native table stays clean; see #114)
+ *   AC_MOCK_COMPAT=absent|unlocated
+ *                       report no compat table (kernel without
+ *                       CONFIG_COMPAT) / one that could not be located,
+ *                       instead of a checked one
  *   AC_MOCK_VERSION=N   report ioctl ABI version N instead of the real
  *                       AC_IOCTL_VERSION (simulates a stale module)
  *   AC_MOCK_STATE=path  state file location
@@ -195,6 +203,9 @@ static unsigned int last_hook_count;
 /* Same rising-edge convention as last_hook_count above, but for the
  * boot-baseline in-text-redirect check (AC_EV_SYSCALL_REDIRECT, #63). */
 static unsigned int last_redirect_count;
+/* Both again, for the AArch32 compat table (#114). */
+static unsigned int last_compat_hook_count;
+static unsigned int last_compat_redirect_count;
 
 /* Fill a 65-byte digest buffer with 64 repeats of `c` + NUL. Not a real
  * SHA-256 digest -- the mock only needs the daemon/CLI to see
@@ -315,7 +326,7 @@ static int do_ioctl(unsigned long req, void *arg)
         st->active_procs = S.nprots;
         st->events_dropped = S.events_dropped_total;
         st->locked = S.locked;
-        st->syscall_hook_count = last_hook_count;
+        st->syscall_hook_count = last_hook_count + last_compat_hook_count;
         /* AC_MOCK_KRETPROBE_MISSED: report lost kretprobe hits (#115).
          * Constant, like a real burst that has stopped, so the daemon
          * must warn on the first poll and stay quiet on later ones. */
@@ -473,6 +484,43 @@ static int do_ioctl(unsigned long req, void *arg)
                        "mock: syscall[0] handler changed 0x1111 -> 0x2222 (still core text)");
         last_hook_count = c->hooked;
         last_redirect_count = c->redirected;
+
+        /* AArch32 compat table (#114): checked and clean unless a knob
+         * says otherwise, with the same rising-edge event gating. */
+        {
+            struct ac_compat_syscall_check *cc = &c->compat;
+            const char *mode = getenv("AC_MOCK_COMPAT");
+            int bad;
+
+            memset(cc, 0, sizeof(*cc));
+            if (mode && strcmp(mode, "absent") == 0) {
+                cc->state = AC_COMPAT_TABLE_ABSENT;
+                return 0;
+            }
+            if (mode && strcmp(mode, "unlocated") == 0) {
+                cc->state = AC_COMPAT_TABLE_NOT_LOCATED;
+                return 0;
+            }
+            cc->state = AC_COMPAT_TABLE_CHECKED;
+            cc->table_addr = 0xffffffff82d04000ULL;
+            cc->nr_syscalls = 463;
+            cc->total = 463;
+            cc->hooked = getenv("AC_MOCK_COMPAT_HOOKED") ? 1 : 0;
+            cc->redirected = getenv("AC_MOCK_COMPAT_REDIRECT") ? 1 : 0;
+            bad = cc->hooked || cc->redirected ||
+                  getenv("AC_MOCK_COMPAT_CHECKSUM_ONLY") != NULL;
+            mock_fill_digest(cc->baseline_sha256, '3');
+            mock_fill_digest(cc->current_sha256, bad ? '4' : '3');
+            cc->checksum_mismatch = bad ? 1 : 0;
+            if (cc->hooked && !last_compat_hook_count)
+                push_event(AC_EV_SYSCALL_HOOK, 0, "?",
+                           "mock: compat_syscall[11] -> 0xdeadbeef outside core kernel text");
+            if (cc->redirected && !last_compat_redirect_count)
+                push_event(AC_EV_SYSCALL_REDIRECT, 0, "?",
+                           "mock: compat_syscall[3] handler changed 0x1111 -> 0x2222 (still core text)");
+            last_compat_hook_count = cc->hooked;
+            last_compat_redirect_count = cc->redirected;
+        }
         return 0;
     }
     case AC_IOCTL_GET_EVENTS: {

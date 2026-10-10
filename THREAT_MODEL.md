@@ -137,6 +137,24 @@ where the relevant code lives:
   actual in-scope adversary (ordinary user-to-root-userspace, or a cheat
   module installing the redirect *after* this module has already
   snapshotted the table) — also visually detectable by other means.
+- **Syscall hooks that don't go through a checked registry.** What is
+  covered: slots of `sys_call_table` and (with `CONFIG_COMPAT`)
+  `compat_sys_call_table` — out-of-text targets, in-text swaps since
+  load, whole-table checksum — plus, from userspace, kprobes and ftrace
+  callbacks on the syscall wrappers and the el0 dispatch functions as
+  listed in debugfs `kprobes/list` and tracefs `enabled_functions`. What
+  is not: inline patches to a handler's instructions (no text checksum),
+  hooks deeper in the call chain than the wrapper (`vfs_read`,
+  `do_sys_openat2`, an LSM hook), the exception vectors themselves, and
+  BPF programs attached anywhere else. The kprobe/ftrace scan reads
+  files a kernel-mode attacker can filter and a root attacker can make
+  unreadable by unmounting debugfs/tracefs (reported as "unavailable",
+  not as clean); only an `IPMODIFY` ftrace callback is treated as a
+  detection, since ordinary tracing tools attach kprobes and plain
+  callbacks to the same functions. Likewise the `/sys/module` reverse
+  cross-check catches a module that only unlinked itself from the module
+  list; one that also removed its kobject (`kobject_del`) is in neither
+  view (#114).
 - **A protected process nominating a malicious ptracer.**
   `prctl(PR_SET_PTRACER, pid)` from a protected process exempts that
   one thread group from ptrace/process_vm denial (#116, so crash

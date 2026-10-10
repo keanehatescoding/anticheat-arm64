@@ -565,6 +565,16 @@ if ! grep -q 'AC_KASAN_BOOT: syscalls exited 0' "$CONSOLE_LOG"; then
     exit 1
 fi
 
+# Same for the AArch32 table (#114): arm64 defconfig sets CONFIG_COMPAT, so
+# a run that prints anything but a located compat table means the search
+# missed and 32-bit syscall hooks went unchecked -- which 'syscalls' still
+# exits 0 for, hence the separate gate.
+if ! grep -q 'compat (AArch32) syscall table @' "$CONSOLE_LOG"; then
+    echo "FAIL: compat_sys_call_table was not located -- see the 'compat syscall" >&2
+    echo "      table' lines in $CONSOLE_LOG." >&2
+    exit 1
+fi
+
 if ! grep -q 'AC_KASAN_BOOT: PTRACER CHECK OK' "$CONSOLE_LOG"; then
     echo "FAIL: PR_SET_PTRACER exemption check (#116) did not pass: the nominated" >&2
     echo "      child must be allowed to ptrace/process_vm its protected parent, and" >&2

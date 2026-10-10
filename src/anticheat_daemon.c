@@ -2039,11 +2039,211 @@ static int cmd_scan(int argc, char **argv)
 }
 
 /* ------------------------------------------------------------------ */
+/* kprobes / ftrace callbacks on syscall entries (#114)                */
+/*                                                                      */
+/* AC_IOCTL_CHECK_SYSCALLS only reads table slots. A hook that leaves  */
+/* the table alone and instead attaches a kprobe or an ftrace callback */
+/* to a handler's entry is invisible to it, so list those from the     */
+/* kernel's own registries here. Userspace-side and best effort: the   */
+/* files need debugfs/tracefs mounted, and a kernel-mode attacker can  */
+/* filter them (see THREAT_MODEL.md).                                  */
+/* ------------------------------------------------------------------ */
+static const char *ac_kprobes_list_path = "/sys/kernel/debug/kprobes/list";
+static const char *ac_ftrace_paths[] = {
+    "/sys/kernel/tracing/enabled_functions",
+    "/sys/kernel/debug/tracing/enabled_functions",
+};
+
+/* The syscall wrappers and their inlined-or-not bodies, plus the el0
+ * dispatch path every syscall goes through before the table lookup. */
+static int is_syscall_entry_sym(const char *sym)
+{
+    static const char *const prefixes[] = {
+        "__arm64_sys_", "__arm64_compat_sys_", "__do_sys_", "__se_sys_",
+        "__do_compat_sys_", "__se_compat_sys_",
+    };
+    static const char *const exact[] = {
+        "invoke_syscall", "el0_svc_common", "do_el0_svc", "do_el0_svc_compat",
+    };
+    size_t i;
+
+    for (i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++)
+        if (strncmp(sym, prefixes[i], strlen(prefixes[i])) == 0)
+            return 1;
+    for (i = 0; i < sizeof(exact) / sizeof(exact[0]); i++)
+        if (strcmp(sym, exact[i]) == 0)
+            return 1;
+    return 0;
+}
+
+/* The module's own probes on syscall entries: keep in sync with
+ * ac_kprobes[] / ac_kretprobes[] in anticheat_module.c. One probe of the
+ * listed type at +0x0 on each of these is ours; anything beyond that is
+ * not. The list file names the probed symbol, not the probe's owner, so
+ * this is the only way to tell them apart from here. */
+static const struct {
+    char type;          /* 'k' kprobe, 'r' kretprobe */
+    const char *sym;
+} ac_own_probes[] = {
+    { 'k', "__arm64_sys_ptrace" },
+    { 'k', "__arm64_compat_sys_ptrace" },
+    { 'k', "__arm64_sys_process_vm_readv" },
+    { 'k', "__arm64_compat_sys_process_vm_readv" },
+    { 'k', "__arm64_sys_process_vm_writev" },
+    { 'k', "__arm64_compat_sys_process_vm_writev" },
+    { 'r', "__arm64_sys_execve" },
+    { 'r', "__arm64_sys_execveat" },
+    { 'r', "__arm64_compat_sys_execve" },
+    { 'r', "__arm64_compat_sys_execveat" },
+    { 'r', "__arm64_sys_prctl" },
+};
+#define AC_N_OWN_PROBES (sizeof(ac_own_probes) / sizeof(ac_own_probes[0]))
+
+struct ac_kprobe_scan {
+    unsigned int foreign;     /* armed probes on syscall entries, not ours */
+    char first[96];           /* "<type> <sym+off>" of the first one */
+};
+
+/* Parse /sys/kernel/debug/kprobes/list:
+ *   <addr>  <k|r>  <sym>+0x<off>  [<module>] [GONE][DISABLED][OPTIMIZED][FTRACE]
+ * Takes a stream so the unit test can feed it canned text. */
+static void scan_kprobes_stream(FILE *f, struct ac_kprobe_scan *out)
+{
+    unsigned char own_seen[AC_N_OWN_PROBES];
+    char line[512];
+
+    memset(out, 0, sizeof(*out));
+    memset(own_seen, 0, sizeof(own_seen));
+    while (fgets(line, sizeof(line), f)) {
+        char type[8], symoff[256], *plus;
+        int at_entry, mine = 0;
+        size_t i;
+
+        if (sscanf(line, "%*s %7s %255s", type, symoff) != 2)
+            continue;
+        /* Unregistered-in-progress or disarmed: not intercepting anything. */
+        if (strstr(line, "[GONE]") || strstr(line, "[DISABLED]"))
+            continue;
+        plus = strchr(symoff, '+');
+        at_entry = !plus || strtoul(plus + 1, NULL, 0) == 0;
+        if (plus)
+            *plus = '\0';
+        if (!is_syscall_entry_sym(symoff))
+            continue;
+        for (i = 0; at_entry && i < AC_N_OWN_PROBES; i++) {
+            if (!own_seen[i] && type[0] == ac_own_probes[i].type &&
+                type[1] == '\0' && strcmp(symoff, ac_own_probes[i].sym) == 0) {
+                own_seen[i] = 1;
+                mine = 1;
+                break;
+            }
+        }
+        if (mine)
+            continue;
+        if (plus)
+            *plus = '+';
+        if (!out->foreign++)
+            snprintf(out->first, sizeof(out->first), "%s %.80s", type, symoff);
+    }
+}
+
+struct ac_ftrace_scan {
+    unsigned int traced;      /* syscall entries with any callback attached */
+    unsigned int direct;      /* ...of which a direct-call trampoline (D) */
+    unsigned int ipmodify;    /* ...of which may rewrite the return pc (I) */
+    char first_ipmodify[96];
+};
+
+/* Parse tracefs enabled_functions:
+ *   <sym> [[module]] (<count>) R I D O M \ttramp: ...
+ * with tab-indented continuation lines. The flag letters sit between the
+ * count and the first tab; each is either its letter or a blank. */
+static void scan_ftrace_stream(FILE *f, struct ac_ftrace_scan *out)
+{
+    char line[1024];
+
+    memset(out, 0, sizeof(*out));
+    while (fgets(line, sizeof(line), f)) {
+        char sym[256], *p, *end;
+
+        if (line[0] == '\0' || isspace((unsigned char)line[0]))
+            continue;
+        if (sscanf(line, "%255s", sym) != 1 || !is_syscall_entry_sym(sym))
+            continue;
+        p = strstr(line, " (");
+        if (!p || !(p = strchr(p, ')')))
+            continue;
+        p++;
+        end = p + strcspn(p, "\t\n");
+        out->traced++;
+        if (memchr(p, 'D', (size_t)(end - p)))
+            out->direct++;
+        if (memchr(p, 'I', (size_t)(end - p))) {
+            if (!out->ipmodify++)
+                snprintf(out->first_ipmodify, sizeof(out->first_ipmodify),
+                         "%.90s", sym);
+        }
+    }
+}
+
+struct ac_trace_hooks {
+    int kprobes_ok;           /* 0: list unreadable, `kp` not meaningful */
+    int ftrace_ok;            /* 0: likewise for `ft` */
+    struct ac_kprobe_scan kp;
+    struct ac_ftrace_scan ft;
+};
+
+static void scan_trace_hooks(struct ac_trace_hooks *h)
+{
+    FILE *f;
+    size_t i;
+
+    memset(h, 0, sizeof(*h));
+    f = fopen(ac_kprobes_list_path, "r");
+    if (f) {
+        scan_kprobes_stream(f, &h->kp);
+        h->kprobes_ok = !ferror(f);
+        fclose(f);
+    }
+    for (i = 0; i < sizeof(ac_ftrace_paths) / sizeof(ac_ftrace_paths[0]); i++) {
+        f = fopen(ac_ftrace_paths[i], "r");
+        if (!f)
+            continue;
+        scan_ftrace_stream(f, &h->ft);
+        h->ftrace_ok = !ferror(f);
+        fclose(f);
+        break;
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* command: syscalls                                                   */
 /* ------------------------------------------------------------------ */
+static void print_table_check(unsigned int nr, unsigned int total,
+                              unsigned int hooked, int baseline_ready,
+                              const char *baseline, const char *current,
+                              int mismatch, unsigned int redirected)
+{
+    printf("  entries examined : %u\n", nr);
+    printf("  non-NULL entries : %u\n", total);
+    printf("  hooked           : %u\n", hooked);
+    if (baseline_ready) {
+        printf("  boot baseline    : %s\n", baseline);
+        printf("  current checksum : %s%s\n", current,
+               mismatch ? " (MISMATCH)" : "");
+        printf("  redirected       : %u (in-text handler swap since boot)\n",
+               redirected);
+    } else {
+        printf("  boot baseline    : unavailable (syscall table not located at load)\n");
+    }
+}
+
 static int cmd_syscalls(void)
 {
     struct ac_syscall_check c;
+    struct ac_trace_hooks th;
+    unsigned int hooked, redirected;
+    int mismatch;
 
     ac_open();
     memset(&c, 0, sizeof(c));
@@ -2057,28 +2257,70 @@ static int cmd_syscalls(void)
         return 1;
     }
     printf("syscall table @ %#llx\n", c.table_addr);
-    printf("  entries examined : %u\n", c.nr_syscalls);
-    printf("  non-NULL entries : %u\n", c.total);
-    printf("  hooked           : %u\n", c.hooked);
-    if (c.baseline_ready) {
-        printf("  boot baseline    : %s\n", c.baseline_sha256);
-        printf("  current checksum : %s%s\n", c.current_sha256,
-               c.checksum_mismatch ? " (MISMATCH)" : "");
-        printf("  redirected       : %u (in-text handler swap since boot)\n",
-               c.redirected);
-    } else {
-        printf("  boot baseline    : unavailable (syscall table not located at load)\n");
+    print_table_check(c.nr_syscalls, c.total, c.hooked, c.baseline_ready,
+                      c.baseline_sha256, c.current_sha256,
+                      c.checksum_mismatch, c.redirected);
+    hooked = c.hooked;
+    redirected = c.redirected;
+    mismatch = c.checksum_mismatch != 0;
+
+    switch (c.compat.state) {
+    case AC_COMPAT_TABLE_CHECKED:
+        printf("compat (AArch32) syscall table @ %#llx\n", c.compat.table_addr);
+        print_table_check(c.compat.nr_syscalls, c.compat.total,
+                          c.compat.hooked, 1, c.compat.baseline_sha256,
+                          c.compat.current_sha256,
+                          c.compat.checksum_mismatch, c.compat.redirected);
+        hooked += c.compat.hooked;
+        redirected += c.compat.redirected;
+        mismatch = mismatch || c.compat.checksum_mismatch;
+        break;
+    case AC_COMPAT_TABLE_NOT_LOCATED:
+        printf("compat (AArch32) syscall table: NOT LOCATED -- 32-bit syscall"
+               " hooks are not checked\n");
+        break;
+    default:
+        printf("compat (AArch32) syscall table: none (kernel built without"
+               " CONFIG_COMPAT)\n");
+        break;
     }
-    if (c.ok && c.redirected == 0 && !c.checksum_mismatch)
+
+    scan_trace_hooks(&th);
+    printf("probes on syscall entries\n");
+    if (th.kprobes_ok) {
+        printf("  foreign kprobes  : %u", th.kp.foreign);
+        if (th.kp.foreign)
+            printf(" (first: %s)", th.kp.first);
+        printf("\n");
+    } else {
+        printf("  foreign kprobes  : unavailable (cannot read %s)\n",
+               ac_kprobes_list_path);
+    }
+    if (th.ftrace_ok) {
+        printf("  ftrace callbacks : %u (%u direct-call, %u IPMODIFY)\n",
+               th.ft.traced, th.ft.direct, th.ft.ipmodify);
+    } else {
+        printf("  ftrace callbacks : unavailable (cannot read %s)\n",
+               ac_ftrace_paths[0]);
+    }
+    if ((th.kprobes_ok && th.kp.foreign) || (th.ftrace_ok && th.ft.traced))
+        printf("  note             : tracing tools (bpftrace, perf, ftrace) attach"
+               " these too; only IPMODIFY counts toward the result\n");
+
+    if (!hooked && !redirected && !mismatch &&
+        !(th.ftrace_ok && th.ft.ipmodify))
         printf("  result           : OK — no hooks detected\n");
     else {
-        if (!c.ok)
+        if (hooked)
             printf("  result           : COMPROMISED — syscall hooks present!\n");
-        if (c.redirected)
+        if (redirected)
             printf("  result           : COMPROMISED — in-text syscall redirect(s) present!\n");
-        if (c.checksum_mismatch && c.ok && c.redirected == 0)
+        if (mismatch && !hooked && !redirected)
             printf("  result           : COMPROMISED — syscall checksum mismatch"
                    " (handler churn not caught by per-slot checks)!\n");
+        if (th.ftrace_ok && th.ft.ipmodify)
+            printf("  result           : COMPROMISED — IPMODIFY ftrace hook on"
+                   " syscall entry %s!\n", th.ft.first_ipmodify);
         return 2;
     }
     ac_close();
@@ -2137,12 +2379,160 @@ static long collect_proc_modules(unsigned int cap)
     return (long)n;
 }
 
-static long crosscheck_modules(int verbose)
+/* Names from the last kernel-side walk, kept for the /sys/module
+ * cross-check below. */
+static char kmod_names[AC_MAX_MODS][AC_MOD_NAME_LEN];
+static unsigned int kmod_count;
+
+static int kmod_listed(const char *name)
+{
+    unsigned int i;
+
+    for (i = 0; i < kmod_count; i++)
+        if (strcmp(kmod_names[i], name) == 0)
+            return 1;
+    return 0;
+}
+
+/* Re-walk the kernel list into kmod_names[]. 0 on success, -1 if the walk
+ * failed or hit the cap (same at-cap reasoning as crosscheck_modules()). */
+static int kmod_rewalk(void)
+{
+    unsigned int count, i;
+    int rc = 0;
+
+    kmod_count = 0;
+    if (ioctl(dev_fd, AC_IOCTL_MODS_BEGIN, &count) < 0)
+        return -1;
+    if (count >= AC_MAX_MODS)
+        rc = -1;
+    for (i = 0; rc == 0 && i < count; i++) {
+        struct ac_mod_get g;
+
+        memset(&g, 0, sizeof(g));
+        g.index = i;
+        if (ioctl(dev_fd, AC_IOCTL_MODS_GET, &g) < 0) {
+            rc = -1;
+            break;
+        }
+        snprintf(kmod_names[kmod_count++], AC_MOD_NAME_LEN, "%s", g.mod.name);
+    }
+    (void)ioctl(dev_fd, AC_IOCTL_MODS_END, NULL);
+    return rc;
+}
+
+/*
+ * The reverse cross-check (#114). The kernel-side walk follows the module
+ * list, so a module that list_del()s itself drops out of it and out of
+ * /proc/modules at once -- both sides agree and the check above sees
+ * nothing. Its kobject is a separate structure though, and the usual
+ * list_del-only hide leaves /sys/module/<name> behind.
+ *
+ * Only a loadable, fully loaded module counts: `initstate` reads "live"
+ * (built-in modules with parameters have a directory but no initstate;
+ * one mid-load or mid-unload reads "coming"/"going") and it has a .text
+ * section. That mirrors what the kernel-side walk reports (LIVE, non-empty
+ * text), so a module it skips on purpose is not mistaken for a hidden one.
+ */
+static const char *ac_sysfs_module_dir = "/sys/module";
+
+static int sysfs_module_live(const char *dir, const char *name)
+{
+    char path[PATH_MAX], state[16];
+    FILE *f;
+    int live;
+
+    if (snprintf(path, sizeof(path), "%s/%s/initstate", dir, name) >=
+        (int)sizeof(path))
+        return 0;
+    f = fopen(path, "r");
+    if (!f)
+        return 0;
+    live = fgets(state, sizeof(state), f) && strcmp(state, "live\n") == 0;
+    fclose(f);
+    if (!live)
+        return 0;
+    if (snprintf(path, sizeof(path), "%s/%s/sections/.text", dir, name) >=
+        (int)sizeof(path))
+        return 0;
+    return access(path, F_OK) == 0;
+}
+
+#define AC_MAX_UNLISTED 32
+
+/* Live /sys/module entries the kernel walk in kmod_names[] did not report.
+ * Returns how many (names in `out`), or -1 if the directory could not be
+ * read or more than `cap` turned up -- that many at once means the two
+ * views are out of step, not that many modules are hidden. */
+static long collect_unlisted_modules(const char *dir,
+                                     char out[][AC_MOD_NAME_LEN],
+                                     unsigned int cap)
+{
+    DIR *d = opendir(dir);
+    struct dirent *de;
+    unsigned int n = 0;
+
+    if (!d)
+        return -1;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.' || strlen(de->d_name) >= AC_MOD_NAME_LEN)
+            continue;
+        if (kmod_listed(de->d_name) || !sysfs_module_live(dir, de->d_name))
+            continue;
+        if (n == cap) {
+            closedir(d);
+            return -1;
+        }
+        snprintf(out[n++], AC_MOD_NAME_LEN, "%s", de->d_name);
+    }
+    closedir(d);
+    return (long)n;
+}
+
+/* Count of modules live in /sys/module but absent from the kernel module
+ * list, or -1 if inconclusive. Expects kmod_names[] from a walk that just
+ * completed. A module finishing its load between that walk and the
+ * directory read looks exactly like a hidden one, so every candidate is
+ * confirmed against a second walk before it counts. */
+static long crosscheck_sysfs_modules(int verbose)
+{
+    static char cand[AC_MAX_UNLISTED][AC_MOD_NAME_LEN];
+    long n = collect_unlisted_modules(ac_sysfs_module_dir, cand,
+                                      AC_MAX_UNLISTED);
+    long i, unlisted = 0;
+
+    if (n < 0) {
+        if (verbose)
+            printf("could not cross-check %s -- result inconclusive\n",
+                   ac_sysfs_module_dir);
+        return -1;
+    }
+    if (n > 0 && kmod_rewalk() < 0)
+        return -1;
+    for (i = 0; i < n; i++) {
+        if (kmod_listed(cand[i]) ||
+            !sysfs_module_live(ac_sysfs_module_dir, cand[i]))
+            continue;
+        unlisted++;
+        if (verbose)
+            printf("  %-20s [IN %s BUT MISSING FROM THE KERNEL MODULE LIST!]\n",
+                   cand[i], ac_sysfs_module_dir);
+    }
+    if (verbose)
+        printf("unlisted modules: %ld\n", unlisted);
+    return unlisted;
+}
+
+/* *unlisted gets the reverse (/sys/module) result: a count, or -1 when
+ * that half was inconclusive or the forward walk never completed. */
+static long crosscheck_modules(int verbose, long *unlisted)
 {
     unsigned int count, i, hidden = 0, proc_count;
     long proc_count_r;
     int walk_failed = 0;
 
+    *unlisted = -1;
+    kmod_count = 0;
     if (ioctl(dev_fd, AC_IOCTL_MODS_BEGIN, &count) < 0)
         return -1;
     /* Fail inconclusive, not truncated: the walk below can only visit the
@@ -2191,6 +2581,7 @@ static long crosscheck_modules(int verbose)
             walk_failed = 1;
             break;
         }
+        snprintf(kmod_names[kmod_count++], AC_MOD_NAME_LEN, "%s", g.mod.name);
         for (j = 0; j < proc_count; j++) {
             if (strcmp(proc_names[j], g.mod.name) == 0) {
                 visible = 1;
@@ -2212,19 +2603,20 @@ static long crosscheck_modules(int verbose)
     }
     if (verbose)
         printf("hidden modules: %u\n", hidden);
+    *unlisted = crosscheck_sysfs_modules(verbose);
     return (long)hidden;
 }
 
 static int cmd_modules(void)
 {
-    long hidden;
+    long hidden, unlisted;
 
     ac_open();
-    hidden = crosscheck_modules(1);
+    hidden = crosscheck_modules(1, &unlisted);
     ac_close();
     if (hidden < 0)
         return 1;
-    return hidden ? 2 : 0;
+    return (hidden || unlisted > 0) ? 2 : 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2503,7 +2895,8 @@ static void sig_handler(int sig)
 static int check_syscalls_periodic(void)
 {
     /* Rising-edge state for a checksum-only compromise -- see below. */
-    static int checksum_only_reported;
+    static int checksum_only_reported, compat_checksum_only_reported;
+    static int compat_unlocated_reported;
     struct ac_syscall_check c;
 
     memset(&c, 0, sizeof(c));
@@ -2533,7 +2926,26 @@ static int check_syscalls_periodic(void)
     } else {
         checksum_only_reported = 0;
     }
-    return c.hooked;
+    /* Same for the AArch32 table (#114); its per-slot events arrive
+     * through the ring as "compat_syscall[n] ...". */
+    if (c.compat.state == AC_COMPAT_TABLE_CHECKED &&
+        c.compat.checksum_mismatch && !c.compat.hooked &&
+        !c.compat.redirected) {
+        if (!compat_checksum_only_reported)
+            logmsg(LOG_CRIT, "compat syscall table checksum mismatch: boot=%s "
+                   "current=%s (handler churn not individually flagged)",
+                   c.compat.baseline_sha256, c.compat.current_sha256);
+        compat_checksum_only_reported = 1;
+    } else {
+        compat_checksum_only_reported = 0;
+    }
+    if (c.compat.state == AC_COMPAT_TABLE_NOT_LOCATED &&
+        !compat_unlocated_reported) {
+        logmsg(LOG_WARNING, "compat syscall table was not located at module "
+               "load: AArch32 syscall hooks are not checked");
+        compat_unlocated_reported = 1;
+    }
+    return (int)(c.hooked + c.compat.hooked);
 }
 
 /* Rising-edge gate for the periodic hidden-module check (issue #108).
@@ -2579,14 +2991,57 @@ static int check_modules_periodic(void)
      * LOG_CRIT on every 10s tick (6 reports/min against one client_id,
      * filling --max-reports-per-client and eating the server's
      * rate-limit budget -- see #110). */
-    static long last_reported_hidden;
-    long hidden = crosscheck_modules(0);
+    static long last_reported_hidden, last_reported_unlisted;
+    long unlisted;
+    long hidden = crosscheck_modules(0, &unlisted);
 
     if (hidden < 0)
         return -1;   /* inconclusive (#76): leave the edge untouched */
     if (hidden_modules_rising_edge(hidden, &last_reported_hidden))
         logmsg(LOG_CRIT, "%ld module(s) hidden from /proc/modules", hidden);
+    /* The reverse direction (#114); -1 leaves its edge untouched too. */
+    if (hidden_modules_rising_edge(unlisted, &last_reported_unlisted))
+        logmsg(LOG_CRIT, "%ld module(s) present in /sys/module but missing "
+               "from the kernel module list", unlisted);
     return (int)hidden;
+}
+
+/* Periodic kprobe/ftrace scan of the syscall entries (#114). Severity
+ * follows what the attachment can do and how often it is innocent:
+ * IPMODIFY exists to divert the traced function (livepatch, and the usual
+ * ftrace-hook rootkit recipe) and nothing routine sets it on a syscall
+ * entry, so that is a detection. A kprobe or a plain/direct-call ftrace
+ * callback is what bpftrace, perf and BPF fentry programs attach all day,
+ * so those are warnings for an operator, not reports. Rising edge on each
+ * count, same as the module check above. */
+static void check_trace_hooks_periodic(void)
+{
+    static long last_kprobes, last_traced, last_ipmodify;
+    static int unavailable_reported;
+    struct ac_trace_hooks th;
+
+    scan_trace_hooks(&th);
+    if ((!th.kprobes_ok || !th.ftrace_ok) && !unavailable_reported) {
+        logmsg(LOG_WARNING, "syscall-entry probe scan incomplete: kprobes "
+               "list %s, ftrace enabled_functions %s (debugfs/tracefs not "
+               "mounted or locked down?)",
+               th.kprobes_ok ? "ok" : "unreadable",
+               th.ftrace_ok ? "ok" : "unreadable");
+        unavailable_reported = 1;
+    }
+    if (th.kprobes_ok &&
+        hidden_modules_rising_edge(th.kp.foreign, &last_kprobes))
+        logmsg(LOG_WARNING, "%u foreign kprobe(s) on syscall entries "
+               "(first: %s)", th.kp.foreign, th.kp.first);
+    if (th.ftrace_ok) {
+        if (hidden_modules_rising_edge(th.ft.traced, &last_traced))
+            logmsg(LOG_WARNING, "%u syscall entr%s with ftrace callbacks "
+                   "attached (%u direct-call)", th.ft.traced,
+                   th.ft.traced == 1 ? "y" : "ies", th.ft.direct);
+        if (hidden_modules_rising_edge(th.ft.ipmodify, &last_ipmodify))
+            logmsg(LOG_CRIT, "%u IPMODIFY ftrace hook(s) on syscall entries "
+                   "(first: %s)", th.ft.ipmodify, th.ft.first_ipmodify);
+    }
 }
 
 /* Per-pid baseline for AC_EV_ANON_EXEC-style detection: vdso/vvar are
@@ -5348,6 +5803,7 @@ static int cmd_start(int argc, char **argv)
             }
             if (now >= next_mod) {
                 check_modules_periodic();
+                check_trace_hooks_periodic();
                 next_mod = now + 10;
             }
             if (now >= next_scan) {
