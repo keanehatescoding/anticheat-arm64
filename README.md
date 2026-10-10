@@ -50,10 +50,34 @@ userspace daemon/CLI that talks to it over a small ioctl interface
    `AC_EV_SYSCALL_REDIRECT` — an in-text redirect (e.g. sys_read →
    sys_write) that the range check alone can't see (see #63).
 
+   On a `CONFIG_COMPAT` kernel the AArch32 `compat_sys_call_table` gets
+   the same three checks (#114). It is found by searching outward from
+   the native table for a table whose read/write slots hold the native
+   wrappers and whose execve slot holds `__arm64_compat_sys_execve`; its
+   events read `compat_syscall[n] ...`. If it can't be located the module
+   says so at load and `anticheat syscalls` prints `NOT LOCATED` rather
+   than a clean result.
+
+   A hook that leaves both tables alone and attaches to a handler's entry
+   instead is outside what a table check can see, so the daemon also reads
+   the kernel's own registries: `/sys/kernel/debug/kprobes/list` for
+   kprobes on syscall entries other than this module's, and tracefs
+   `enabled_functions` for ftrace callbacks on them. An `IPMODIFY`
+   callback — the flag an ftrace hook needs to divert the function — is
+   reported like a table hook. Other kprobes and ftrace callbacks are
+   logged as warnings only, since bpftrace, perf and BPF fentry programs
+   attach the same way. Both files need debugfs/tracefs mounted; when
+   they can't be read the scan says "unavailable".
+
 2. **Module enumeration.** The kernel-internal module list is walked
    (preemption disabled, since `module_mutex` is not exported) and compared
    by the daemon against `/proc/modules`, detecting modules hidden from
-   procfs.
+   procfs. That walk can't see a module that unlinked itself from the list
+   (`list_del(&THIS_MODULE->list)`), which also removes it from
+   `/proc/modules`, so the daemon checks the other direction too: a module
+   that is `live` with a `.text` section under `/sys/module` but absent
+   from the kernel-side walk (twice, to rule out one that just finished
+   loading) is reported (#114).
 
 3. **Protected process registry.** Processes are registered by pid; the
    registry stores `task_struct` references (namespace-safe, immune to pid
@@ -145,8 +169,8 @@ anticheat scan --pid N --check-hooks    Vulkan + GLX/OpenGL + EGL present-call h
 anticheat scan --pid N --check-preload  LD_PRELOAD check (heuristic, not a verdict)
 anticheat scan --pid N --check-vklayers Vulkan-layer env var check (heuristic, not a verdict)
 anticheat scan --pid N --check-implicit-layers  implicit Vulkan-layer manifest check (heuristic)
-anticheat syscalls                   verify syscall table integrity
-anticheat modules                    detect modules hidden from /proc/modules
+anticheat syscalls                   verify syscall table integrity (native + compat), list probes on syscall entries
+anticheat modules                    detect modules hidden from /proc/modules or from the kernel module list
 anticheat vmcheck                    VM/hypervisor detection (heuristic, not a verdict)
 anticheat events [--watch]           dump security events
 anticheat lock | unlock              pin / unpin the kernel module
@@ -1102,7 +1126,7 @@ design).
   closes most of that gap for a redirect installed *after* the module
   loads, but not against an adversary who already has kernel-write
   privilege equal to or greater than the module's own — such an attacker
-  can patch the in-kernel baseline (`ac_syscall_baseline[]`) the same way
+  can patch the in-kernel baseline (`ac_native_tbl.baseline[]`) the same way
   it can patch the table itself, and a redirect already present *before*
   the module's baseline snapshot at load time is captured as normal,
   never flagged. See THREAT_MODEL.md's "Within-core-kernel-text
