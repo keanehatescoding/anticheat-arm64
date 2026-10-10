@@ -1926,6 +1926,20 @@ static int ac_prctl_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
  * new task's pid via regs_return_value().  (A plain kprobe post_handler runs
  * after the first instruction of the function, not after it returns, so it
  * cannot see the return value.) */
+/* A kretprobe instance is held from entry to return, and kernel_clone()
+ * sleeps -- for a vfork() until the child execs or exits. Without this
+ * filter every clone on the system holds one, so a handful of unprotected
+ * processes parked in vfork() exhaust maxactive and every later protected
+ * fork is silently skipped (issue #115). Returning nonzero releases the
+ * instance straight away and skips ac_clone_ret(), which would have
+ * ignored an unprotected caller anyway. The one difference is a process
+ * that becomes protected while its own clone is in flight: that child is
+ * now treated as forked before protection, which it was. */
+static int ac_clone_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    return ac_is_protected_current() ? 0 : 1;
+}
+
 static int ac_clone_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
     long child_pid = (long)regs_return_value(regs);
@@ -1979,8 +1993,9 @@ static int ac_clone_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 
 static struct kretprobe ac_kp_clone = {
     .kp = { .symbol_name = "kernel_clone" },
+    .entry_handler = ac_clone_entry,
     .handler = ac_clone_ret,
-    .maxactive = 128,
+    .maxactive = 128,   /* floor; raised per CPU in ac_register_kprobes() */
 };
 
 /* execve()/execveat() tracking: a kretprobe, not a plain pre-handler.
@@ -2051,8 +2066,9 @@ static int ac_exec_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
             d->parent_pid = parent->pid;
             strscpy(d->parent_comm, parent->comm, sizeof(d->parent_comm));
             rcu_read_unlock();
+            return 0;
         }
-        return 0;
+        return 1;
     }
     if (current->mm && ac_is_protected_mm(current->mm)) {
         d->old_mm = current->mm;
@@ -2065,8 +2081,12 @@ static int ac_exec_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
          * re-exec of a protected process. */
         ac_emit(AC_EV_INFO, current->pid, current->comm,
                 "execve() invoked (path is a user pointer, not resolved)");
+        return 0;
     }
-    return 0;
+    /* Nothing for ac_exec_ret() to do: nonzero releases the instance now
+     * rather than holding it across the whole exec, so unprotected execs
+     * can't exhaust maxactive for protected ones (issue #115). */
+    return 1;
 }
 
 static int ac_exec_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
@@ -2157,6 +2177,16 @@ static struct kretprobe *ac_kretprobes[] = {
 static bool ac_kretp_ok[ARRAY_SIZE(ac_kretprobes)];
 static unsigned int ac_kretprobes_registered;
 
+/* Hits the kretprobe core dropped instead of running our handlers for
+ * (issue #115): rp->nmissed counts calls that found no free instance,
+ * kp.nmissed calls that recursed into another probe. Unlocked reads of
+ * plain counters, good enough for AC_IOCTL_STATUS. */
+static unsigned int ac_kretp_missed(const struct kretprobe *rp)
+{
+    return (unsigned int)READ_ONCE(rp->nmissed) +
+           (unsigned int)READ_ONCE(rp->kp.nmissed);
+}
+
 static struct kprobe ac_kp_ptrace = {
     .symbol_name = AC_SYM_PTRACE,
     .pre_handler = ac_ptrace_pre,
@@ -2206,6 +2236,11 @@ static void ac_register_kprobes(void)
                     ac_kprobes[i]->symbol_name, ret);
         }
     }
+    /* Only protected callers hold a kernel_clone instance (see
+     * ac_clone_entry()), but each can sleep in vfork(), so scale the
+     * pool with the machine as the kretprobe docs suggest. */
+    ac_kp_clone.maxactive = max_t(int, ac_kp_clone.maxactive,
+                                  2 * num_possible_cpus());
     for (i = 0; i < ARRAY_SIZE(ac_kretprobes); i++) {
         int ret = register_kretprobe(ac_kretprobes[i]);
 
@@ -2635,6 +2670,12 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         st.events_dropped = READ_ONCE(ac_dropped);
         st.locked = atomic_read(&ac_lock_count) > 0 ? 1 : 0;
         st.syscall_hook_count = READ_ONCE(ac_last_hook_count);
+        st.fork_missed = ac_kretp_missed(&ac_kp_clone);
+        st.exec_missed = ac_kretp_missed(&ac_kp_execve) +
+                         ac_kretp_missed(&ac_kp_execveat) +
+                         ac_kretp_missed(&ac_kp_execve32) +
+                         ac_kretp_missed(&ac_kp_execveat32);
+        st.prctl_missed = ac_kretp_missed(&ac_kp_prctl);
         if (copy_to_user(uarg, &st, sizeof(st)))
             return -EFAULT;
         return 0;

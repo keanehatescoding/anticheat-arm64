@@ -316,6 +316,13 @@ static int do_ioctl(unsigned long req, void *arg)
         st->events_dropped = S.events_dropped_total;
         st->locked = S.locked;
         st->syscall_hook_count = last_hook_count;
+        /* AC_MOCK_KRETPROBE_MISSED: report lost kretprobe hits (#115).
+         * Constant, like a real burst that has stopped, so the daemon
+         * must warn on the first poll and stay quiet on later ones. */
+        st->fork_missed = getenv("AC_MOCK_KRETPROBE_MISSED") ? 3 : 0;
+        st->exec_missed = getenv("AC_MOCK_KRETPROBE_MISSED") ? 2 : 0;
+        st->prctl_missed = 0;
+        st->reserved = 0;
         return 0;
     }
     case AC_IOCTL_ADD_PROC: {
