@@ -16,7 +16,7 @@
 #define AC_DEV_NAME     "anticheat"
 #define AC_DEV_PATH     "/dev/anticheat"
 #define AC_IOCTL_MAGIC  0xAC
-#define AC_IOCTL_VERSION 2
+#define AC_IOCTL_VERSION 3
 
 /* Upper bound (milliseconds) the kernel clamps struct ac_event_list's
  * block_ms field to for AC_IOCTL_GET_EVENTS -- see that struct's own
@@ -118,6 +118,18 @@ struct ac_status {
     unsigned int        events_dropped;   /* ring buffer drops since load */
     unsigned int        locked;           /* module pinned by lock ioctl */
     unsigned int        syscall_hook_count; /* from last CHECK_SYSCALLS */
+    /* kretprobe hits lost since load, per probe group (issue #115): the
+     * kretprobe core skips both handlers for a call it has no free
+     * instance for (or that recursed into another probe) and only counts
+     * it. A lost fork return is a child that did not inherit protection,
+     * a lost exec return a re-exec that was not rekeyed, a lost prctl
+     * return a PR_SET_PTRACER nomination that was not recorded. Added in
+     * AC_IOCTL_VERSION 3; `reserved` keeps the struct free of implicit
+     * tail padding and is always 0. */
+    unsigned int        fork_missed;      /* kernel_clone */
+    unsigned int        exec_missed;      /* execve/execveat + compat, summed */
+    unsigned int        prctl_missed;     /* prctl */
+    unsigned int        reserved;
 };
 
 struct ac_proc_id {

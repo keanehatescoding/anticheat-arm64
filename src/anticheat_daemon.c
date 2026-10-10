@@ -204,6 +204,9 @@ static int cmd_status(void)
     printf("  events dropped    : %u\n", st.events_dropped);
     printf("  locked            : %u\n", st.locked);
     printf("  syscall hooks     : %u (last check)\n", st.syscall_hook_count);
+    printf("  fork probe misses : %u\n", st.fork_missed);
+    printf("  exec probe misses : %u\n", st.exec_missed);
+    printf("  prctl probe misses: %u\n", st.prctl_missed);
     ac_close();
     return 0;
 }
@@ -2400,6 +2403,42 @@ static unsigned int ring_drop_delta(unsigned int cur, unsigned int *last)
 
     *last = cur;
     return delta;
+}
+
+/* Issue #115: the module's fork-inheritance, exec-rekey and
+ * PR_SET_PTRACER tracking all run from kretprobes, and a hit the
+ * kretprobe core has no free instance for is skipped with nothing but a
+ * counter to show for it. Warn when those counters (struct ac_status,
+ * cumulative since module load) grow between polls -- the first poll
+ * reports whatever was already lost before this daemon started.
+ * LOG_WARNING, not LOG_CRIT, for the same reason as the ring-overflow
+ * warning: it's an operational signal that coverage was lost, not a
+ * detection to auto-file into the ban pipeline. */
+static void check_kretprobe_missed_periodic(void)
+{
+    static unsigned int last_fork, last_exec, last_prctl;
+    struct ac_status st;
+    unsigned int d;
+
+    if (ioctl(dev_fd, AC_IOCTL_STATUS, &st) < 0)
+        return;
+    d = ring_drop_delta(st.fork_missed, &last_fork);
+    if (d)
+        logmsg(LOG_WARNING,
+               "kernel missed %u fork return probe(s) since last check -- "
+               "children of a protected process may not have inherited "
+               "protection", d);
+    d = ring_drop_delta(st.exec_missed, &last_exec);
+    if (d)
+        logmsg(LOG_WARNING,
+               "kernel missed %u exec return probe(s) since last check -- "
+               "a protected process may have lost protection across "
+               "execve()", d);
+    d = ring_drop_delta(st.prctl_missed, &last_prctl);
+    if (d)
+        logmsg(LOG_WARNING,
+               "kernel missed %u prctl return probe(s) since last check -- "
+               "a PR_SET_PTRACER nomination may not have been recorded", d);
 }
 
 static int cmd_events(int argc, char **argv)
@@ -5220,7 +5259,7 @@ static int cmd_start(int argc, char **argv)
     {
         time_t next_sys = 0, next_mod = 0, next_scan = 0, next_baseline = 0;
         time_t next_render = 0, next_preload = 0, next_vklayer = 0;
-        time_t next_implicit = 0;
+        time_t next_implicit = 0, next_missed = 0;
         unsigned int last_dropped = 0;
 
         while (!g_stop) {
@@ -5334,6 +5373,10 @@ static int cmd_start(int argc, char **argv)
             if (now >= next_implicit) {
                 check_implicit_layers_periodic();
                 next_implicit = now + ac_implicit_layer_check_interval();
+            }
+            if (now >= next_missed) {
+                check_kretprobe_missed_periodic();
+                next_missed = now + 5;
             }
             /* Fallback for anything that doesn't actually honor block_ms
              * -- a module built before this field existed (ioctl number

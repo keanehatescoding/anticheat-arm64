@@ -59,6 +59,9 @@ expect_rc  "unknown command"          1 ./anticheat bogus
 echo "== status =="
 expect_rc  "status"                   0 ./anticheat status
 expect_out "status: version"          "version"        ./anticheat status
+expect_out "status: no missed probes"  "fork probe misses : 0" ./anticheat status
+expect_out "status: missed fork probes" "fork probe misses : 3" env AC_MOCK_KRETPROBE_MISSED=1 ./anticheat status
+expect_out "status: missed exec probes" "exec probe misses : 2" env AC_MOCK_KRETPROBE_MISSED=1 ./anticheat status
 
 echo "== protect / list / unprotect =="
 expect_rc  "protect --pid \$\$"        0 ./anticheat protect --pid $$
@@ -364,6 +367,27 @@ if [ "$flood_warn_count" -eq 1 ]; then
     pass "start: ring-overflow warning logged exactly once"
 else
     fail "start: expected exactly 1 ring-overflow warning, got $flood_warn_count"
+fi
+
+# Missed-kretprobe visibility (#115): the mock reports a constant nonzero
+# fork_missed/exec_missed, so the monitor must warn once per counter on
+# its first status poll and not again on the next one (7s spans two 5s
+# polls). prctl_missed stays 0 and must not warn at all.
+missed_out=$(timeout -k 2 --preserve-status 7 \
+    env AC_MOCK_KRETPROBE_MISSED=1 ./anticheat start --foreground 2>&1)
+missed_fork=$(printf '%s' "$missed_out" | grep -c "missed 3 fork return probe")
+missed_exec=$(printf '%s' "$missed_out" | grep -c "missed 2 exec return probe")
+missed_prctl=$(printf '%s' "$missed_out" | grep -c "prctl return probe")
+if [ "$missed_fork" -eq 1 ] && [ "$missed_exec" -eq 1 ] && [ "$missed_prctl" -eq 0 ]; then
+    pass "start: missed fork/exec kretprobe warnings logged exactly once"
+else
+    fail "start: expected 1 fork, 1 exec, 0 prctl missed-probe warnings, got $missed_fork/$missed_exec/$missed_prctl"
+fi
+quiet_out=$(timeout -k 2 --preserve-status 2 ./anticheat start --foreground 2>&1)
+if printf '%s' "$quiet_out" | grep -q "return probe"; then
+    fail "start: missed-probe warning with all counters at zero"
+else
+    pass "start: no missed-probe warning when nothing was missed"
 fi
 
 echo "== daemon log / pid files (#79) =="

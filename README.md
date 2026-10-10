@@ -99,6 +99,10 @@ userspace daemon/CLI that talks to it over a small ioctl interface
    key off thread-group membership, not the exact registered `task_struct`,
    so a worker thread of a protected process that calls `fork()`/`execve()`
    is covered too.
+   A kretprobe hit the kernel has no free instance for is skipped, not
+   queued, so only protected callers hold an instance, and any hit that
+   is still lost is counted: `anticheat status` shows the totals and the
+   daemon logs a warning when they grow.
 
 6. **VMA memory scan.** A snapshot of the process address space is built
    under the mmap read lock (maple-tree iterator) and served to userspace
