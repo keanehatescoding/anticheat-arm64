@@ -186,7 +186,9 @@ static void set_kernel_list(const char *const *names, unsigned int n)
 
 static void test_sysfs_modules(void)
 {
-    static const char *const listed[] = { "ext4", "anticheat" };
+    /* No "anticheat": the real kernel-side walk never lists the module
+     * doing the walking, and that must not read as hidden. */
+    static const char *const listed[] = { "ext4", "snd" };
     static char out[AC_MAX_UNLISTED][AC_MOD_NAME_LEN];
     char dir[] = "/tmp/ac_integrity_scan_XXXXXX";
     char cmd[PATH_MAX + 16];
@@ -198,6 +200,7 @@ static void test_sysfs_modules(void)
     }
     fake_module(dir, "ext4", "live\n", 1);
     fake_module(dir, "anticheat", "live\n", 1);
+    fake_module(dir, "snd", "live\n", 1);
     fake_module(dir, "kernel", NULL, 0);          /* built-in: parameters only */
     fake_module(dir, "loading_mod", "coming\n", 1);
     fake_module(dir, "going_mod", "going\n", 1);
@@ -206,7 +209,7 @@ static void test_sysfs_modules(void)
     set_kernel_list(listed, 2);
     n = collect_unlisted_modules(dir, out, AC_MAX_UNLISTED);
     CHECK(n == 0,
-          "sysfs: listed, built-in, loading, unloading and text-less entries are not unlisted");
+          "sysfs: listed, own, built-in, loading, unloading and text-less entries are not unlisted");
 
     fake_module(dir, "rootkit", "live\n", 1);
     n = collect_unlisted_modules(dir, out, AC_MAX_UNLISTED);
@@ -214,7 +217,8 @@ static void test_sysfs_modules(void)
           "sysfs: a live module missing from the kernel list is reported by name");
 
     /* The same directory against an empty kernel list: three live
-     * modules, a cap of two -> out of step, not "two hidden". */
+     * modules besides our own, a cap of two -> out of step, not "two
+     * hidden". */
     set_kernel_list(listed, 0);
     CHECK(collect_unlisted_modules(dir, out, 2) == -1,
           "sysfs: more candidates than the cap is inconclusive");

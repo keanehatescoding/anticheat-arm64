@@ -483,15 +483,23 @@ static bool ac_table_plausible(unsigned long base, unsigned long anchor,
     return valid >= threshold;
 }
 
-/* Once the table is found, derive core-text bounds from its (plausible)
+/* Once a table is found, derive core-text bounds from its (plausible)
  * entries so the integrity check can classify entries even when the
- * _stext/_etext kprobe lookups failed. */
-static void ac_derive_bounds(unsigned long base, unsigned long anchor)
+ * _stext/_etext kprobe lookups failed. Called for the native table and
+ * then the compat one: a bound that was derived (not looked up) is
+ * widened by the second call, since the compat-only handlers need not lie
+ * between the lowest and highest native ones -- the net/compat.c socket
+ * calls link in after every native handler, and were reported as hooks
+ * when only the native table fed these bounds. */
+static bool ac_stext_derived, ac_text_end_derived;
+
+static void ac_derive_bounds(unsigned long base, unsigned long anchor,
+                             unsigned int nr)
 {
     unsigned int i;
     unsigned long lo = 0, hi = 0;
 
-    for (i = 0; i < __NR_syscalls; i++) {
+    for (i = 0; i < nr; i++) {
         unsigned long e = 0;
 
         if (ac_kread(&e, (void *)(base + i * sizeof(e)), sizeof(e)))
@@ -504,12 +512,19 @@ static void ac_derive_bounds(unsigned long base, unsigned long anchor)
             hi = e;
     }
     if (lo && hi) {
-        if (!ac_stext)
-            ac_stext = lo & ~0x1FFFFFUL;                 /* 2 MB round down */
-        if (!ac_text_end)
-            ac_text_end = (hi + 0x1FFFFFUL) & ~0x1FFFFFUL; /* 2 MB round up */
-        pr_info("derived text bounds: stext=0x%lx end=0x%lx\n",
-                ac_stext, ac_text_end);
+        lo &= ~0x1FFFFFUL;                       /* 2 MB round down */
+        hi = (hi + 0x1FFFFFUL) & ~0x1FFFFFUL;    /* 2 MB round up */
+        if (!ac_stext || (ac_stext_derived && lo < ac_stext)) {
+            ac_stext = lo;
+            ac_stext_derived = true;
+        }
+        if (!ac_text_end || (ac_text_end_derived && hi > ac_text_end)) {
+            ac_text_end = hi;
+            ac_text_end_derived = true;
+        }
+        if (ac_stext_derived || ac_text_end_derived)
+            pr_info("derived text bounds: stext=0x%lx end=0x%lx\n",
+                    ac_stext, ac_text_end);
     }
 }
 
@@ -575,7 +590,7 @@ static unsigned long ac_find_syscall_table(void)
                     addr, base, v2);
         if (v2 == wh && ac_table_plausible(base, rh, __NR_syscalls)) {
             ac_anchor = rh;
-            ac_derive_bounds(base, rh);
+            ac_derive_bounds(base, rh, __NR_syscalls);
             return base;
         }
     }
@@ -605,7 +620,7 @@ static unsigned long ac_find_syscall_table(void)
                                 addr, base, v2);
                     if (v2 == wh && ac_table_plausible(base, rh, __NR_syscalls)) {
                         ac_anchor = rh;
-                        ac_derive_bounds(base, rh);
+                        ac_derive_bounds(base, rh, __NR_syscalls);
                         return base;
                     }
                 }
@@ -687,7 +702,7 @@ static unsigned long ac_find_compat_table(void)
     hi = lo + win;
     for (addr = lo; addr < hi; addr += slot) {
         if (ac_compat_table_at(addr, rh, wh, ex))
-            return addr - AC_COMPAT_NR_READ * slot;
+            goto found;
         if (!(addr & 0xFFFFFUL))
             cond_resched();
     }
@@ -695,13 +710,18 @@ static unsigned long ac_find_compat_table(void)
     lo = native > win ? native - win : slot;
     for (addr = native - slot; addr >= lo; addr -= slot) {
         if (ac_compat_table_at(addr, rh, wh, ex))
-            return addr - AC_COMPAT_NR_READ * slot;
+            goto found;
         if (!(addr & 0xFFFFFUL))
             cond_resched();
     }
     pr_warn("compat syscall table not found within 0x%lx bytes of the native table at 0x%lx; try ac_scan_window=<bytes>\n",
             win, native);
     return 0;
+
+found:
+    addr -= AC_COMPAT_NR_READ * slot;
+    ac_derive_bounds(addr, rh, AC_NR_COMPAT);
+    return addr;
 }
 #endif /* AC_NR_COMPAT */
 

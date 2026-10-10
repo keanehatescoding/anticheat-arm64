@@ -2433,8 +2433,11 @@ static int kmod_rewalk(void)
  * one mid-load or mid-unload reads "coming"/"going") and it has a .text
  * section. That mirrors what the kernel-side walk reports (LIVE, non-empty
  * text), so a module it skips on purpose is not mistaken for a hidden one.
+ * That includes anticheat.ko itself: the walk starts from its own list
+ * node, so it reports every module but the one doing the walking.
  */
 static const char *ac_sysfs_module_dir = "/sys/module";
+#define AC_OWN_MODULE_NAME "anticheat"   /* obj-m in the Makefile */
 
 static int sysfs_module_live(const char *dir, const char *name)
 {
@@ -2476,6 +2479,8 @@ static long collect_unlisted_modules(const char *dir,
         return -1;
     while ((de = readdir(d)) != NULL) {
         if (de->d_name[0] == '.' || strlen(de->d_name) >= AC_MOD_NAME_LEN)
+            continue;
+        if (strcmp(de->d_name, AC_OWN_MODULE_NAME) == 0)
             continue;
         if (kmod_listed(de->d_name) || !sysfs_module_live(dir, de->d_name))
             continue;

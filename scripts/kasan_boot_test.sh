@@ -575,6 +575,15 @@ if ! grep -q 'compat (AArch32) syscall table @' "$CONSOLE_LOG"; then
     exit 1
 fi
 
+# The /sys/module reverse cross-check (#114) on a real kernel: nothing in
+# this VM is hidden, so any other count is a false positive (the first
+# version reported anticheat.ko itself here).
+if ! grep -q 'unlisted modules: 0' "$CONSOLE_LOG"; then
+    echo "FAIL: 'anticheat modules' did not report 'unlisted modules: 0' -- see" >&2
+    echo "      the 'MISSING FROM THE KERNEL MODULE LIST' lines in $CONSOLE_LOG." >&2
+    exit 1
+fi
+
 if ! grep -q 'AC_KASAN_BOOT: PTRACER CHECK OK' "$CONSOLE_LOG"; then
     echo "FAIL: PR_SET_PTRACER exemption check (#116) did not pass: the nominated" >&2
     echo "      child must be allowed to ptrace/process_vm its protected parent, and" >&2
