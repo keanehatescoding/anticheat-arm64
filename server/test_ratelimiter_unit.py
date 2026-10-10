@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT
 """test_ratelimiter_unit.py -- fast, deterministic test of
 RateLimiter._prune()'s bucket-cleanup behavior.
 

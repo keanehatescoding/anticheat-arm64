@@ -17,7 +17,7 @@ pkgrel=1
 pkgdesc="Kernel-mode anticheat: syscall/module integrity, ptrace denial, RWX/anon-exec detection"
 arch=('aarch64')
 url="https://github.com/keanehatescoding/anticheat-arm64"
-license=('GPL-2.0-only')
+license=('MIT')
 makedepends=('dkms')
 # A git+#tag= VCS source is always sha256sums=('SKIP') by design (there's
 # no meaningful checksum for a mutable ref) -- which also means a moved

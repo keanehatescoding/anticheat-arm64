@@ -232,7 +232,7 @@ test -s "$REPO_ROOT/anticheat.ko"
 # anticheat.ko was the only module loaded, so the whole detector was
 # being exercised against an empty list.
 #
-# Loading one throwaway GPL module before anticheat gives the walk
+# Loading one throwaway module before anticheat gives the walk
 # something it is *required* to find, turning "didn't crash" into
 # "didn't crash and still works". Generated here rather than committed
 # as a source file: it is scaffolding for this script alone, and
@@ -240,7 +240,7 @@ test -s "$REPO_ROOT/anticheat.ko"
 echo "== building the positive-control module =="
 mkdir -p "$WORKDIR/dummy"
 cat > "$WORKDIR/dummy/ac_dummy.c" <<'DUMMY_EOF'
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0 OR MIT
 /* Positive control for scripts/kasan_boot_test.sh: a module that does
  * nothing except exist, so the anticheat module walk has a non-empty
  * list to find. Deliberately trivial -- it must not itself be capable
@@ -262,7 +262,7 @@ static void __exit ac_dummy_exit(void)
 
 module_init(ac_dummy_init);
 module_exit(ac_dummy_exit);
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("Dual MIT/GPL");
 MODULE_DESCRIPTION("KASAN boot test positive control");
 DUMMY_EOF
 printf 'obj-m := ac_dummy.o\n' > "$WORKDIR/dummy/Makefile"
