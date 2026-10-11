@@ -68,6 +68,7 @@ import sys
 import threading
 import time
 import traceback
+import urllib.parse
 
 CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 MAX_BODY_BYTES = 4096
@@ -776,13 +777,28 @@ def make_handler(store, report_keys, admin_keys, rate_limiter, trust_proxy=False
         def _do_GET(self):
             if self._rate_limited():
                 return
-            if self.path.startswith("/banned/"):
+            # self.path is the raw request target: query string included,
+            # percent-escapes undecoded. Split and decode it before taking
+            # the client id, so /reports/<id>?limit=50 and /banned/agent%2E01
+            # aren't rejected as an "invalid client_id". The handlers still
+            # run the decoded id through _require_valid_client_id() -- it
+            # has to come after unquote(), since decoding is what could
+            # introduce a "/" or a NUL.
+            try:
+                path = urllib.parse.urlsplit(self.path).path
+            except ValueError:
+                return self._send_json(400, {"error": "bad request"})
+            if path.startswith("/banned/"):
                 return self._call_with_auth(
-                    banned_keys, self._handle_banned, self.path[len("/banned/"):]
+                    banned_keys,
+                    self._handle_banned,
+                    urllib.parse.unquote(path[len("/banned/"):]),
                 )
-            if self.path.startswith("/reports/"):
+            if path.startswith("/reports/"):
                 return self._call_with_auth(
-                    admin_keys, self._handle_reports, self.path[len("/reports/"):]
+                    admin_keys,
+                    self._handle_reports,
+                    urllib.parse.unquote(path[len("/reports/"):]),
                 )
             self._send_json(404, {"error": "not found"})
 
@@ -967,8 +983,6 @@ def main():
         "the audit trail (default: off, use the raw TCP peer)",
     )
     args = ap.parse_args()
-
-    import os
 
     def _key_arg(cli_value, env_name):
         # `cli_value or os.environ.get(...)` would treat an explicitly
