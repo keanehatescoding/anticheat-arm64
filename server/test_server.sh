@@ -387,6 +387,55 @@ else
     fail "expected 'syscall hook' in reports listing (got: $OUT)"
 fi
 
+# 13a. the client id comes from the parsed URL path, not the raw request
+# target: a query string is ignored and percent-escapes are decoded
+# before the allowlist runs ($CID contains "-", so %2D spells the same id)
+OUT=$(curl -s "$BASE/reports/$CID?limit=50" -H "Authorization: Bearer $ADMIN_KEY")
+if printf '%s' "$OUT" | grep -q "syscall hook"; then
+    pass "GET /reports/<id>?query ignores the query string"
+else
+    fail "GET /reports/<id>?query should list reports (got: $OUT)"
+fi
+OUT=$(curl -s "$BASE/banned/$CID?_=1" -H "Authorization: Bearer $ADMIN_KEY")
+if printf '%s' "$OUT" | grep -q '"banned": false'; then
+    pass "GET /banned/<id>?query ignores the query string"
+else
+    fail "GET /banned/<id>?query should be banned:false (got: $OUT)"
+fi
+ENC_CID=$(printf '%s' "$CID" | sed 's/-/%2D/g')
+OUT=$(curl -s "$BASE/reports/$ENC_CID" -H "Authorization: Bearer $ADMIN_KEY")
+if [ "$ENC_CID" != "$CID" ] && printf '%s' "$OUT" | grep -q "syscall hook"; then
+    pass "GET /reports/<percent-encoded id> is decoded to the same id"
+else
+    fail "percent-encoded id should list reports (got: $OUT)"
+fi
+# Decoding must not widen what reaches the store: an escaped "/", NUL or
+# invalid UTF-8 still fails the allowlist after unquote().
+for _enc in 'a%2Fb' 'a%00b' 'a%FFb' '%2E%2E%2Fx'; do
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/banned/$_enc" \
+        -H "Authorization: Bearer $ADMIN_KEY")
+    if [ "$CODE" = "400" ]; then
+        pass "GET /banned/$_enc -> 400 (allowlist runs after decoding)"
+    else
+        fail "GET /banned/$_enc should be 400 (got $CODE)"
+    fi
+done
+# A query string must not turn an unauthenticated request into anything
+# but 401, nor make an unknown route match.
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/banned/$CID?x=1")
+if [ "$CODE" = "401" ]; then
+    pass "GET /banned/<id>?query without credential -> 401"
+else
+    fail "GET /banned/<id>?query without credential should be 401 (got $CODE)"
+fi
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/nope?x=/banned/$CID" \
+    -H "Authorization: Bearer $ADMIN_KEY")
+if [ "$CODE" = "404" ]; then
+    pass "route prefix inside a query string does not match -> 404"
+else
+    fail "/nope?x=/banned/<id> should be 404 (got $CODE)"
+fi
+
 # 13b. non-finite / bool ts is normalized to null, not persisted --
 # json.loads accepts bare NaN/Infinity (stdlib default) and
 # isinstance(True, int) is True, so a bare isinstance gate lets all three
