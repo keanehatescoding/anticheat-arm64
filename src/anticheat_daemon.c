@@ -2156,15 +2156,20 @@ struct ac_ftrace_scan {
 
 /* Parse tracefs enabled_functions:
  *   <sym> [[module]] (<count>) R I D O M \ttramp: ...
- * with tab-indented continuation lines. The flag letters sit between the
- * count and the first tab; each is either its letter or a blank. */
+ * with tab-indented continuation lines. Each flag is a two-character
+ * field, a blank then its letter or another blank. A record with no
+ * trampoline enabled gets " -><sym>" appended with no tab in between, so
+ * the fields are walked one by one and the walk stops at the first thing
+ * that is not one: that symbol is arbitrary text, and scanning to the tab
+ * would read an I or D out of its name. */
 static void scan_ftrace_stream(FILE *f, struct ac_ftrace_scan *out)
 {
     char line[1024];
 
     memset(out, 0, sizeof(*out));
     while (fgets(line, sizeof(line), f)) {
-        char sym[256], *p, *end;
+        char sym[256], *p;
+        int direct = 0, ipmodify = 0;
 
         if (line[0] == '\0' || isspace((unsigned char)line[0]))
             continue;
@@ -2174,11 +2179,17 @@ static void scan_ftrace_stream(FILE *f, struct ac_ftrace_scan *out)
         if (!p || !(p = strchr(p, ')')))
             continue;
         p++;
-        end = p + strcspn(p, "\t\n");
+        for (; p[0] == ' ' && (p[1] == ' ' ||
+                               isupper((unsigned char)p[1])); p += 2) {
+            if (p[1] == 'D')
+                direct = 1;
+            else if (p[1] == 'I')
+                ipmodify = 1;
+        }
         out->traced++;
-        if (memchr(p, 'D', (size_t)(end - p)))
+        if (direct)
             out->direct++;
-        if (memchr(p, 'I', (size_t)(end - p))) {
+        if (ipmodify) {
             if (!out->ipmodify++)
                 snprintf(out->first_ipmodify, sizeof(out->first_ipmodify),
                          "%.90s", sym);
@@ -2507,13 +2518,21 @@ static long crosscheck_sysfs_modules(int verbose)
     long i, unlisted = 0;
 
     if (n < 0) {
+        logmsg(LOG_WARNING, "crosscheck_modules: could not cross-check %s "
+               "-- result inconclusive", ac_sysfs_module_dir);
         if (verbose)
             printf("could not cross-check %s -- result inconclusive\n",
                    ac_sysfs_module_dir);
         return -1;
     }
-    if (n > 0 && kmod_rewalk() < 0)
+    if (n > 0 && kmod_rewalk() < 0) {
+        logmsg(LOG_WARNING, "crosscheck_modules: kernel module list re-walk "
+               "failed -- %s cross-check inconclusive", ac_sysfs_module_dir);
+        if (verbose)
+            printf("kernel module list re-walk failed -- %s cross-check "
+                   "inconclusive\n", ac_sysfs_module_dir);
         return -1;
+    }
     for (i = 0; i < n; i++) {
         if (kmod_listed(cand[i]) ||
             !sysfs_module_live(ac_sysfs_module_dir, cand[i]))
@@ -2621,7 +2640,9 @@ static int cmd_modules(void)
     ac_close();
     if (hidden < 0)
         return 1;
-    return (hidden || unlisted > 0) ? 2 : 0;
+    if (hidden || unlisted > 0)
+        return 2;
+    return unlisted < 0 ? 1 : 0;
 }
 
 /* ------------------------------------------------------------------ */

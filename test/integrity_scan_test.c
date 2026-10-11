@@ -125,6 +125,21 @@ static void test_ftrace(void)
     CHECK(strcmp(t.first_ipmodify, "__arm64_sys_kill") == 0,
           "ftrace: the first IPMODIFY entry is named");
 
+    /* No trampoline enabled: the kernel appends " -><sym>" straight after
+     * the flag fields, with no tab to mark where they end. */
+    f = text_stream(
+        "__arm64_sys_openat (1)             ->Individual_DIRECT_fn+0x0/0x10 [IDmod]\n"
+        "__arm64_sys_read (1) R   D   M  ->Innocent_fn+0x0/0x10\n"
+        "\tdirect-->bpf_trampoline_123+0x0/0x100\n"
+        "__arm64_sys_kill (1) R I ->DIRECT_fn+0x0/0x10\n");
+    scan_ftrace_stream(f, &t);
+    fclose(f);
+    CHECK(t.traced == 3, "ftrace: tab-less records are still counted");
+    CHECK(t.direct == 1,
+          "ftrace: direct flag not read out of an appended ->symbol");
+    CHECK(t.ipmodify == 1 && strcmp(t.first_ipmodify, "__arm64_sys_kill") == 0,
+          "ftrace: IPMODIFY flag not read out of an appended ->symbol");
+
     f = text_stream("");
     scan_ftrace_stream(f, &t);
     fclose(f);
