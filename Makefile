@@ -350,6 +350,31 @@ ci:
 	else \
 		echo "warning: not a git checkout -- skipping executable-bit, shellcheck, and AUR metadata checks"; \
 	fi
+	$(MAKE) ci-actions-pin-check
+
+# Every third-party `uses:` in a workflow must name a full 40-hex commit
+# SHA, not a tag (see issues #39, #90): a tag is mutable, so `@v7` runs
+# whatever the action's owner -- or whoever compromises them -- points it
+# at next, with this repo's token and artifacts. #39 pinned checkout and
+# left ten lines floating; this keeps the next `uses:` line from
+# regressing. Local actions (`./path`) have no ref to pin and are exempt.
+# Keep the trailing `# vX.Y.Z` comment -- Dependabot rewrites both.
+ci-actions-pin-check:
+	@set -eu; \
+	fail=0; \
+	for f in .github/workflows/*.yml .github/workflows/*.yaml; do \
+		[ -f "$$f" ] || continue; \
+		bad="$$(grep -nE '^[[:space:]]*(-[[:space:]]+)?uses:' "$$f" \
+			| grep -vE 'uses:[[:space:]]*["'"'"']?\./' \
+			| grep -vE 'uses:[[:space:]]*["'"'"']?[^@[:space:]]+@[0-9a-f]{40}["'"'"']?([[:space:]]|$$)' || true)"; \
+		if [ -n "$$bad" ]; then \
+			printf '%s\n' "$$bad" | while IFS=: read -r line rest; do \
+				echo "::error file=$$f,line=$$line::action not pinned to a full commit SHA:$$rest"; \
+			done; \
+			fail=1; \
+		fi; \
+	done; \
+	exit $$fail
 
 # Packaging version consistency (see issues #46, #91): packaging/aur/.SRCINFO is a
 # checked-in, hand-regenerated copy of PKGBUILD metadata (makepkg
@@ -488,4 +513,4 @@ install-deck: all
 uninstall-deck:
 	rm -rf "$(DECK_PREFIX)"
 
-.PHONY: all module daemon hooks mock test-mock priv-drop-test render-hook-test mount-ns-test thread-exit-migration-test thread-spawn-after-protect-test ptracer-nominate-test ioctl-fuzz baseline-test ac-report-status-test ac-report-url-test ac-report-cooldown-test daemon-limits-test daemon-reporting-test integrity-scan-test ci ci-aur-check clean install uninstall install-deck uninstall-deck
+.PHONY: all module daemon hooks mock test-mock priv-drop-test render-hook-test mount-ns-test thread-exit-migration-test thread-spawn-after-protect-test ptracer-nominate-test ioctl-fuzz baseline-test ac-report-status-test ac-report-url-test ac-report-cooldown-test daemon-limits-test daemon-reporting-test integrity-scan-test ci ci-aur-check ci-actions-pin-check clean install uninstall install-deck uninstall-deck
