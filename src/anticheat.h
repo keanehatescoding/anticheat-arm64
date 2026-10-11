@@ -16,7 +16,7 @@
 #define AC_DEV_NAME     "anticheat"
 #define AC_DEV_PATH     "/dev/anticheat"
 #define AC_IOCTL_MAGIC  0xAC
-#define AC_IOCTL_VERSION 3
+#define AC_IOCTL_VERSION 4
 
 /* Upper bound (milliseconds) the kernel clamps struct ac_event_list's
  * block_ms field to for AC_IOCTL_GET_EVENTS -- see that struct's own
@@ -117,7 +117,8 @@ struct ac_status {
     unsigned int        active_procs;     /* protected process count */
     unsigned int        events_dropped;   /* ring buffer drops since load */
     unsigned int        locked;           /* module pinned by lock ioctl */
-    unsigned int        syscall_hook_count; /* from last CHECK_SYSCALLS */
+    unsigned int        syscall_hook_count; /* from last CHECK_SYSCALLS:
+                                              * native + compat tables */
     /* kretprobe hits lost since load, per probe group (issue #115): the
      * kretprobe core skips both handlers for a call it has no free
      * instance for (or that recursed into another probe) and only counts
@@ -186,6 +187,29 @@ struct ac_scan_get {
     struct ac_vma_info vma;     /* out */
 };
 
+/* compat_sys_call_table state, see struct ac_compat_syscall_check.state */
+#define AC_COMPAT_TABLE_ABSENT      0   /* kernel built without CONFIG_COMPAT:
+                                         * there is no table to check */
+#define AC_COMPAT_TABLE_CHECKED     1   /* located at load; fields below valid */
+#define AC_COMPAT_TABLE_NOT_LOCATED 2   /* the kernel has one but the load-time
+                                         * scan did not find it: AArch32 syscall
+                                         * hooks are NOT being checked */
+
+/* Same checks as the native fields of struct ac_syscall_check, for
+ * compat_sys_call_table (the table AArch32 tasks dispatch through). Only
+ * `state` is meaningful unless it is AC_COMPAT_TABLE_CHECKED. */
+struct ac_compat_syscall_check {
+    unsigned long long table_addr;
+    unsigned int       state;             /* AC_COMPAT_TABLE_* */
+    unsigned int       nr_syscalls;       /* table size examined */
+    unsigned int       total;             /* non-NULL entries */
+    unsigned int       hooked;            /* entries outside core kernel text */
+    unsigned int       redirected;        /* in-text handler swaps since load */
+    unsigned int       checksum_mismatch; /* 1 if current != baseline digest */
+    char               baseline_sha256[65];
+    char               current_sha256[65];
+};
+
 struct ac_syscall_check {
     unsigned long long table_addr;
     unsigned int       nr_syscalls;   /* table size examined */
@@ -222,6 +246,10 @@ struct ac_syscall_check {
                                               * empty if baseline_ready == 0 */
     char               current_sha256[65];  /* hex digest of the live table
                                               * as of this check */
+    /* The AArch32 compat table, checked the same three ways (#114). Added
+     * in AC_IOCTL_VERSION 4. Everything above this point describes the
+     * native table only; a caller wanting one verdict must look at both. */
+    struct ac_compat_syscall_check compat;
 };
 
 struct ac_mod_info {

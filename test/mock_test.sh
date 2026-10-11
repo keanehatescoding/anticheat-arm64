@@ -216,10 +216,28 @@ expect_out "syscalls checksum-only alert" "COMPROMISED"  env AC_MOCK_CHECKSUM_ON
 expect_out "syscalls checksum-only mismatch shown" "MISMATCH" env AC_MOCK_CHECKSUM_ONLY=1 ./anticheat syscalls
 expect_out "syscalls checksum-only hooked/redirected both zero" "hooked           : 0" env AC_MOCK_CHECKSUM_ONLY=1 ./anticheat syscalls
 
+echo "== syscall integrity: AArch32 compat table (#114) =="
+# A hook that touches only compat_sys_call_table leaves every native-table
+# number clean, so each of these fails if the verdict ignores c.compat.
+expect_out "syscalls: compat table shown" "compat (AArch32) syscall table @" ./anticheat syscalls
+expect_rc  "syscalls compat hooked -> rc 2" 2 env AC_MOCK_COMPAT_HOOKED=1 ./anticheat syscalls
+expect_out "syscalls compat hook alert" "syscall hooks present" env AC_MOCK_COMPAT_HOOKED=1 ./anticheat syscalls
+expect_rc  "syscalls compat redirected -> rc 2" 2 env AC_MOCK_COMPAT_REDIRECT=1 ./anticheat syscalls
+expect_out "syscalls compat redirect alert" "in-text syscall redirect" env AC_MOCK_COMPAT_REDIRECT=1 ./anticheat syscalls
+expect_rc  "syscalls compat checksum-only -> rc 2" 2 env AC_MOCK_COMPAT_CHECKSUM_ONLY=1 ./anticheat syscalls
+expect_out "syscalls compat checksum-only alert" "checksum mismatch" env AC_MOCK_COMPAT_CHECKSUM_ONLY=1 ./anticheat syscalls
+expect_rc  "syscalls: no CONFIG_COMPAT is clean" 0 env AC_MOCK_COMPAT=absent ./anticheat syscalls
+expect_out "syscalls: no CONFIG_COMPAT stated" "without CONFIG_COMPAT" env AC_MOCK_COMPAT=absent ./anticheat syscalls
+expect_out "syscalls: unlocated compat table stated" "NOT LOCATED" env AC_MOCK_COMPAT=unlocated ./anticheat syscalls
+expect_out "syscalls: probe scan section shown" "probes on syscall entries" ./anticheat syscalls
+
 echo "== hidden module detection =="
 expect_rc  "modules -> rc 2 (hidden)" 2 ./anticheat modules
 expect_out "modules: hidden count"     "hidden modules: 1" ./anticheat modules
 expect_out "modules: hidden name"      "hidden_rootkit" ./anticheat modules
+# Reverse direction (#114): nothing live in /sys/module is absent from the
+# (mock) kernel list, which is built from the same host.
+expect_out "modules: /sys/module cross-check ran" "unlisted modules: 0" ./anticheat modules
 
 echo "== vmcheck =="
 # Pure userspace DMI reads -- doesn't touch /dev/anticheat at all,
@@ -354,6 +372,27 @@ if [ "$hidden_crit_count" -eq 1 ]; then
     pass "start: hidden-module alert logged exactly once across polls"
 else
     fail "start: expected exactly 1 hidden-module log line, got $hidden_crit_count"
+fi
+
+# The compat table's per-slot events come through the same ring (#114):
+# one line, on the rising edge, naming the compat table.
+compat_out=$(timeout -k 2 --preserve-status 7 \
+    env AC_MOCK_COMPAT_HOOKED=1 ./anticheat start --foreground 2>&1)
+compat_crit_count=$(printf '%s' "$compat_out" | grep -c "SYSCALL-HOOK.*compat_syscall")
+if [ "$compat_crit_count" -eq 1 ]; then
+    pass "start: compat syscall-hook alert logged exactly once"
+else
+    fail "start: expected exactly 1 compat SYSCALL-HOOK log line, got $compat_crit_count"
+fi
+
+# ...and its checksum-only case is daemon-side, like the native one.
+compat_sum_out=$(timeout -k 2 --preserve-status 7 \
+    env AC_MOCK_COMPAT_CHECKSUM_ONLY=1 ./anticheat start --foreground 2>&1)
+compat_sum_count=$(printf '%s' "$compat_sum_out" | grep -c "compat syscall table checksum mismatch")
+if [ "$compat_sum_count" -eq 1 ]; then
+    pass "start: compat checksum-only mismatch alert logged exactly once"
+else
+    fail "start: expected exactly 1 compat checksum mismatch log line, got $compat_sum_count"
 fi
 
 # Ring-overflow visibility (#109): AC_MOCK_FLOOD overflows the mock ring
