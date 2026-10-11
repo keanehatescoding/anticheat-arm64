@@ -358,7 +358,8 @@ ci:
 # at next, with this repo's token and artifacts. #39 pinned checkout and
 # left ten lines floating; this keeps the next `uses:` line from
 # regressing. Local actions (`./path`) have no ref to pin and are exempt.
-# Flow-style steps (`- { uses: ... }`) are matched too. Comments are
+# Flow-style steps (`- { uses: ... }`) and quoted keys (`"uses":`) are
+# matched too. Comments are
 # stripped first and every `uses:` on a line must pass on its own, so a
 # pinned ref in a trailing comment or a second key cannot vouch for a
 # floating one.
@@ -369,9 +370,9 @@ ci-actions-pin-check:
 	for f in .github/workflows/*.yml .github/workflows/*.yaml; do \
 		[ -f "$$f" ] || continue; \
 		bad="$$(sed -E 's/(^|[[:space:]])#.*$$//' "$$f" \
-			| grep -nE '^[[:space:]]*(-[[:space:]]+)?uses:|[{,][[:space:]]*uses:' \
-			| sed -E 's/uses:[[:space:]]*["'"'"']?(\.\/[^[:space:],}]*|[^@[:space:]]+@[0-9a-f]{40})["'"'"']?([[:space:],}]|$$)/\2/g' \
-			| grep 'uses:' || true)"; \
+			| grep -nE '^[[:space:]]*(-[[:space:]]+)?["'"'"']?uses["'"'"']?[[:space:]]*:|[{,][[:space:]]*["'"'"']?uses["'"'"']?[[:space:]]*:' \
+			| sed -E 's/["'"'"']?uses["'"'"']?[[:space:]]*:[[:space:]]*["'"'"']?(\.\/[^[:space:],}]*|[^@[:space:]]+@[0-9a-f]{40})["'"'"']?([[:space:],}]|$$)/\2/g' \
+			| grep -E '["'"'"']?uses["'"'"']?[[:space:]]*:' || true)"; \
 		if [ -n "$$bad" ]; then \
 			printf '%s\n' "$$bad" | while IFS=: read -r line rest; do \
 				echo "::error file=$$f,line=$$line::action not pinned to a full commit SHA:$$rest"; \
