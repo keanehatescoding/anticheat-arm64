@@ -358,16 +358,20 @@ ci:
 # at next, with this repo's token and artifacts. #39 pinned checkout and
 # left ten lines floating; this keeps the next `uses:` line from
 # regressing. Local actions (`./path`) have no ref to pin and are exempt.
-# Flow-style steps (`- { uses: ... }`) are matched too.
+# Flow-style steps (`- { uses: ... }`) are matched too. Comments are
+# stripped first and every `uses:` on a line must pass on its own, so a
+# pinned ref in a trailing comment or a second key cannot vouch for a
+# floating one.
 # Keep the trailing `# vX.Y.Z` comment -- Dependabot rewrites both.
 ci-actions-pin-check:
 	@set -eu; \
 	fail=0; \
 	for f in .github/workflows/*.yml .github/workflows/*.yaml; do \
 		[ -f "$$f" ] || continue; \
-		bad="$$(grep -nE '^[[:space:]]*(-[[:space:]]+)?uses:|[{,][[:space:]]*uses:' "$$f" \
-			| grep -vE 'uses:[[:space:]]*["'"'"']?\./' \
-			| grep -vE 'uses:[[:space:]]*["'"'"']?[^@[:space:]]+@[0-9a-f]{40}["'"'"']?([[:space:],}]|$$)' || true)"; \
+		bad="$$(sed -E 's/(^|[[:space:]])#.*$$//' "$$f" \
+			| grep -nE '^[[:space:]]*(-[[:space:]]+)?uses:|[{,][[:space:]]*uses:' \
+			| sed -E 's/uses:[[:space:]]*["'"'"']?(\.\/[^[:space:],}]*|[^@[:space:]]+@[0-9a-f]{40})["'"'"']?([[:space:],}]|$$)/\2/g' \
+			| grep 'uses:' || true)"; \
 		if [ -n "$$bad" ]; then \
 			printf '%s\n' "$$bad" | while IFS=: read -r line rest; do \
 				echo "::error file=$$f,line=$$line::action not pinned to a full commit SHA:$$rest"; \
