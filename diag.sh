@@ -10,7 +10,7 @@ cd "$(dirname "$0")" || exit 1
 # Serialize concurrent diagnostic runs (issue thread): module loading,
 # diagnostics, protection checks and cleanup must not overlap, otherwise one
 # run can unload the module while another is still using it.
-LOCKFILE="/tmp/anticheat-diag.lock"
+LOCKFILE="/run/anticheat-diag.lock"
 exec 9>"$LOCKFILE" || { echo "lock open failed"; exit 1; }
 flock -x 9 || { echo "lock failed"; exit 1; }
 
@@ -65,16 +65,16 @@ cleanup() {
     fi
     [ -n "$CHILD_PIDFILE" ] && rm -f "$CHILD_PIDFILE"
     CHILD_PIDFILE=""
-    if [ "$LOADED_BY_US" -eq 1 ]; then
+    if [ "$LOADED_BY_US" -eq 1 ] && [ -n "$MODULE_INSTANCE" ]; then
+        sleep 0.2
         _current_instance="$(stat -c '%d:%i' /sys/module/anticheat 2>/dev/null || true)"
-        if [ -n "$MODULE_INSTANCE" ] && [ -n "$_current_instance" ] && [ "$_current_instance" != "$MODULE_INSTANCE" ]; then
-            echo "warning: anticheat module was replaced during this run; not unloading" >&2
-        else
-            sleep 0.2
+        if [ "$_current_instance" = "$MODULE_INSTANCE" ]; then
             if ! rmmod anticheat 2>/dev/null; then
                 echo "error: rmmod anticheat failed; module may still be loaded" >&2
                 [ "$rc" -eq 0 ] && rc=1
             fi
+        else
+            echo "warning: anticheat module was replaced during this run; not unloading" >&2
         fi
     fi
     exec 9>&- 2>/dev/null || true
@@ -95,12 +95,14 @@ if [ -d /sys/module/anticheat ]; then
     echo "note: anticheat is already loaded; diagnosing it in place and leaving it loaded" >&2
     echo "      (not reloaded with ac_verbose=1, so the init log below may be sparse or stale)" >&2
 else
-    # Mark ownership before insmod so an interrupt between the two cannot
-    # leave a module we loaded without teardown.
-    LOADED_BY_US=1
-    insmod ./anticheat.ko ac_verbose=1 || { LOADED_BY_US=0; echo "INSMOD FAILED"; exit 1; }
-    MODULE_INSTANCE="$(stat -c '%d:%i' /sys/module/anticheat 2>/dev/null || true)"
-    sleep 0.3
+    if insmod ./anticheat.ko ac_verbose=1; then
+        MODULE_INSTANCE="$(stat -c '%d:%i' /sys/module/anticheat 2>/dev/null || true)"
+        LOADED_BY_US=1
+        sleep 0.3
+    else
+        echo "INSMOD FAILED"
+        exit 1
+    fi
 fi
 
 echo
@@ -113,7 +115,7 @@ echo "== status =="
 
 echo
 echo "== control: root ptrace on a NON-protected process =="
-sleep 300 & P=$!
+sleep 300 9>&- & P=$!
 timeout 2 strace -p $P -e trace=none >/dev/null 2>&1; rc=$?
 kill "$P" 2>/dev/null
 kill -CONT "$P" 2>/dev/null
@@ -131,7 +133,7 @@ echo "== protected process + attach =="
 # empty pidfile path or an empty $C, producing a diagnostic run that
 # looks like it worked but didn't actually test fork inheritance.
 CHILD_PIDFILE="$(mktemp)" || { echo "mktemp failed"; exit 1; }
-bash -c 'sleep 300 & echo $! > "$1"; wait' _ "$CHILD_PIDFILE" & V=$!
+bash -c 'trap "kill %1 2>/dev/null" EXIT TERM INT; sleep 300 & echo $! > "$1"; wait' _ "$CHILD_PIDFILE" 9>&- & V=$!
 ./anticheat protect --pid $V
 sleep 0.5
 C=$(cat "$CHILD_PIDFILE")
@@ -172,6 +174,6 @@ echo "== modules =="
 
 echo
 echo "== dmesg: post-attempt =="
-dmesg | tail -30 | grep -iE "anticheat|probe|ptrace|kill" | tail -15
+dmesg | tail -30 | grep -iE "anticheat|probe|kprobe|ptrace|kill" | tail -15
 
 echo "== done =="
