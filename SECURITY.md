@@ -2,11 +2,11 @@
 
 ## Overview
 
-This repo ships a Linux kernel-mode anticheat: a loadable kernel module (LKM) that performs kernel-level integrity checks and process protection, plus a userspace daemon/CLI that talks to it over an ioctl interface (`/dev/anticheat`). Because the kernel module runs in ring 0, a bug here can have far more impact than a typical userspace bug — up to and including local privilege escalation or full system compromise. Kernel-module and ioctl-boundary issues are treated as the highest-priority class of report.
+This repo ships a Linux kernel-mode anticheat: a loadable kernel module (LKM) that performs kernel-level integrity checks and process protection, plus a userspace daemon/CLI that talks to it over an ioctl interface (`/dev/anticheat`). Because the kernel module runs in ring 0, a bug here can have far more impact than a typical userspace bug — up to and including local privilege escalation or full system compromise. Kernel-module and ioctl-boundary issues are treated as the highest-priority class of report. See [THREAT_MODEL.md](THREAT_MODEL.md) for the adversary model and trust boundaries.
 
 ## Supported Versions
 
-This project is under active, pre-1.0 development. Only the latest commit on `master` is supported — please confirm an issue reproduces there before reporting.
+This project is under active, pre-1.0 development. Only the latest commit on `master` is supported — please confirm an issue reproduces there before reporting. The kernel module is **ARM64 (AArch64) only** and requires kernel headers **>= 6.12**; x86-64 lives in the sibling [`anticheat_x86-64`](https://github.com/keanehatescoding/anticheat_x86-64) repo. The userspace daemon builds on other Linux hosts for development, but releases ship the `aarch64` binary.
 
 ## Reporting a Vulnerability
 
@@ -23,7 +23,7 @@ This opens a private advisory visible only to you and the maintainer until a fix
 - A clear description of the issue and its impact
 - Affected component: kernel module (`anticheat.ko`), ioctl interface, userspace daemon/CLI, render-hook/ELF-parsing logic, or the optional report server (`ac_server.py`)
 - Steps to reproduce, PoC code, or a crash/panic log
-- Kernel version, distro, and architecture
+- Kernel version (>= 6.12 for the module), distro, and architecture (ARM64/AArch64 only; x86-64 is in the sibling `anticheat_x86-64` repo)
 - Whether the bug is reachable without the module already protecting a process
 
 ## Scope
@@ -31,6 +31,8 @@ This opens a private advisory visible only to you and the maintainer until a fix
 **Treated as a security vulnerability:**
 - Memory-safety bugs in the kernel module or its ioctl handlers (overflows, use-after-free, races, missing bounds/permission checks) — especially anything reachable from an unprivileged, unprotected process
 - A way for an unprivileged process to issue privileged ioctls (protect/unprotect/lock/etc.) without proper authorization
+- A way for any process, protected or unprotected, to read, write, or ptrace-attach to a protected process's memory without being denied by the module
+- A way for a monitored or unprivileged process to stall, hang, or blind the daemon so that detection or enforcement is degraded
 - Memory-safety issues in the userspace daemon when parsing untrusted input (a monitored process's ELF file, `/proc/<pid>/mem`, ioctl-supplied data)
 - Vulnerabilities in the optional report server (`ac_server.py`) — injection, auth bypass, ban-list tampering
 - Crashes or kernel panics triggerable by a process the module hasn't (yet) protected
