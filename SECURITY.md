@@ -31,7 +31,7 @@ This opens a private advisory visible only to you and the maintainer until a fix
 **Treated as a security vulnerability:**
 - Memory-safety bugs in the kernel module or its ioctl handlers (overflows, use-after-free, races, missing bounds/permission checks) — especially anything reachable from an unprivileged, unprotected process
 - A way for an unprivileged process to issue privileged ioctls (protect/unprotect/lock/etc.) without proper authorization
-- A way for an unprotected process to read, write, or ptrace-attach to a protected process's memory without being denied by the module
+- A way for any process, protected or unprotected, to read, write, or ptrace-attach to a protected process's memory without being denied by the module
 - A way for a monitored or unprivileged process to stall, hang, or blind the daemon so that detection or enforcement is degraded
 - Memory-safety issues in the userspace daemon when parsing untrusted input (a monitored process's ELF file, `/proc/<pid>/mem`, ioctl-supplied data)
 - Vulnerabilities in the optional report server (`ac_server.py`) — injection, auth bypass, ban-list tampering
