@@ -3264,8 +3264,13 @@ static int ac_read_environ_vars(int pid, struct ac_environ_query *vars,
         const char *entry = buf + pos;
         size_t entry_len = strlen(entry);
 
-        if (entry_len == 0)
-            break;   /* malformed/truncated read -- stop rather than misread */
+        if (entry_len == 0) {
+            /* Unexpected NUL (e.g. a leading empty entry) should not hide
+             * every variable after it: skip it and keep scanning so a single
+             * NUL byte can't trivially suppress LD_PRELOAD/VK-layer checks. */
+            pos++;
+            continue;
+        }
         for (i = 0; i < nvars; i++) {
             size_t nlen = strlen(vars[i].name);
 
