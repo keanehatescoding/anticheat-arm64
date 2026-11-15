@@ -84,12 +84,19 @@ echo "== protect --comm: exe-basename precision (issue #69) =="
 # scans the real /proc, not the mocked ioctl ABI, so it needs actual
 # pids on disk, not just mock state.
 AC_TESTBIN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ac_testbin.XXXXXX") || exit 1
+cat > "$AC_TESTBIN_DIR/sleeper.c" <<'C'
+#include <unistd.h>
+int main(void) {
+    sleep(30);
+    return 0;
+}
+C
 
 # > 15 chars, so the old comm-string-only match couldn't have found this
 # pid at all (comm would read back truncated) -- only the exe-basename
 # match can.
 AC_LONGNAME="ac69-exe-match-longname-$$"
-cp /bin/sleep "$AC_TESTBIN_DIR/$AC_LONGNAME"
+gcc -O2 -o "$AC_TESTBIN_DIR/$AC_LONGNAME" "$AC_TESTBIN_DIR/sleeper.c"
 chmod +x "$AC_TESTBIN_DIR/$AC_LONGNAME"
 "$AC_TESTBIN_DIR/$AC_LONGNAME" 30 &
 AC_LONGPID=$!
@@ -106,7 +113,7 @@ wait "$AC_LONGPID" 2>/dev/null
 # back to the original /proc/<pid>/comm string match, not fail outright.
 AC_SHORTNAME="ac69delfb$$"
 AC_SHORTNAME="${AC_SHORTNAME:0:15}"
-cp /bin/sleep "$AC_TESTBIN_DIR/$AC_SHORTNAME"
+gcc -O2 -o "$AC_TESTBIN_DIR/$AC_SHORTNAME" "$AC_TESTBIN_DIR/sleeper.c"
 chmod +x "$AC_TESTBIN_DIR/$AC_SHORTNAME"
 "$AC_TESTBIN_DIR/$AC_SHORTNAME" 30 &
 AC_DELPID=$!
