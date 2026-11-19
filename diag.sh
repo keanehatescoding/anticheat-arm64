@@ -24,11 +24,22 @@ CHILD_PIDFILE=""
 cleanup() {
     [ -n "$V" ] && ./anticheat unprotect --pid "$V" >/dev/null 2>&1
     [ -n "$P" ] && kill "$P" 2>/dev/null
-    # The victim wrapper runs under setsid, so $V is also its process-group
-    # id: signalling -$V reaches the wrapper AND its sleep child in one shot,
-    # even if we are interrupted before the pidfile below was ever read
-    # (when $C would still be empty).
-    [ -n "$V" ] && kill -TERM -- "-$V" 2>/dev/null
+    # The victim wrapper was spawned under job control, so $V is also its
+    # process-group id: signalling -$V reaches the wrapper AND its sleep
+    # child in one shot, even if we are interrupted before the pidfile below
+    # was read (when $C would still be empty). One signal is not enough,
+    # though: a TERM that lands between the victim's fork and exec can be
+    # swallowed by the shell handler it inherited from this script, and the
+    # wrapper then goes on to start its sleep child. So keep signalling the
+    # group until it is empty (kill fails once no member is left; bash reaps
+    # the exited leader itself), with a KILL as the backstop.
+    if [ -n "$V" ]; then
+        for _ in $(seq 1 40); do
+            kill -TERM -- "-$V" 2>/dev/null || break
+            sleep 0.05
+        done
+        kill -KILL -- "-$V" 2>/dev/null
+    fi
     [ -n "$CHILD_PIDFILE" ] && rm -f "$CHILD_PIDFILE"
     if [ "$LOADED_BY_US" -eq 1 ]; then
         sleep 0.2
@@ -50,8 +61,14 @@ if [ -d /sys/module/anticheat ]; then
     echo "note: anticheat is already loaded; diagnosing it in place and leaving it loaded" >&2
     echo "      (not reloaded with ac_verbose=1, so the init log below may be sparse or stale)" >&2
 else
-    insmod ./anticheat.ko ac_verbose=1 || { echo "INSMOD FAILED"; exit 1; }
+    # Claim ownership BEFORE insmod runs: a SIGTERM while insmod is in
+    # flight, or right after it returns, must still reach rmmod in cleanup.
+    # (rmmod on a module that never loaded just fails quietly.) If insmod
+    # itself fails, nothing of ours is loaded -- the kernel rolls a failed
+    # load back -- so drop the claim: cleanup then must not rmmod, which
+    # could otherwise unload a copy somebody else loaded in the meantime.
     LOADED_BY_US=1
+    insmod ./anticheat.ko ac_verbose=1 || { LOADED_BY_US=0; echo "INSMOD FAILED"; exit 1; }
     sleep 0.3
 fi
 
@@ -81,10 +98,16 @@ echo "== protected process + attach =="
 # empty pidfile path or an empty $C, producing a diagnostic run that
 # looks like it worked but didn't actually test fork inheritance.
 CHILD_PIDFILE="$(mktemp)" || { echo "mktemp failed"; exit 1; }
-# setsid gives the wrapper its own session/process group (PGID == $V) so
-# cleanup can kill the wrapper and its child together via `kill -- -$V`,
-# independent of when (or whether) the child pid is read below.
-setsid bash -c 'sleep 300 & echo $! > "$1"; wait' _ "$CHILD_PIDFILE" & V=$!
+# Job control (set -m) makes bash itself put the wrapper in its own process
+# group (PGID == $V) at fork time, from the parent side -- so the group
+# exists the moment `V=$!` is set, with no dependency on the child getting
+# far enough to call setsid() itself. Cleanup can then kill the wrapper and
+# its child together via `kill -- -$V`, independent of when (or whether) the
+# child pid is read below. Turned back off straight after the spawn so the
+# rest of the script gets no job-status noise.
+set -m
+bash -c 'sleep 300 & echo $! > "$1"; wait' _ "$CHILD_PIDFILE" & V=$!
+set +m
 ./anticheat protect --pid $V
 sleep 0.5
 C=$(cat "$CHILD_PIDFILE")
