@@ -94,8 +94,11 @@ AC_TESTBIN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ac_testbin.XXXXXX") || exit 1
 # copied file's real name, which is what these tests exercise. Returns once
 # the pid has actually exec'd the copy, so callers never race the exec.
 ac_spawn_named_copy() {
+    # Cleared up front so a failed setup never leaves a stale (or unset,
+    # under set -u) AC_SPAWNPID for the caller to read.
+    AC_SPAWNPID=""
     cp "$BASH" "$AC_TESTBIN_DIR/$1" || return 1
-    chmod +x "$AC_TESTBIN_DIR/$1"
+    chmod +x "$AC_TESTBIN_DIR/$1" || return 1
     # `; :` stops bash exec'ing sleep in place, so the copy stays the exe.
     "$AC_TESTBIN_DIR/$1" -c 'sleep 30; :' &
     AC_SPAWNPID=$!
@@ -103,6 +106,14 @@ ac_spawn_named_copy() {
         [ "$(readlink "/proc/$AC_SPAWNPID/exe" 2>/dev/null)" = "$AC_TESTBIN_DIR/$1" ] && break
         sleep 0.1
     done
+}
+# Fixture setup failure is fatal, but must not leak the temp dir: report it,
+# remove the dir, and bail before anything reads AC_SPAWNPID.
+ac_spawn_or_die() {
+    ac_spawn_named_copy "$1" && [ -n "$AC_SPAWNPID" ] && return 0
+    echo "FAIL fixture setup: could not create/start $AC_TESTBIN_DIR/$1" >&2
+    rm -rf "$AC_TESTBIN_DIR"
+    exit 1
 }
 ac_kill_spawn() {
     pkill -P "$1" 2>/dev/null
@@ -114,7 +125,7 @@ ac_kill_spawn() {
 # pid at all (comm would read back truncated) -- only the exe-basename
 # match can.
 AC_LONGNAME="ac69-exe-match-longname-$$"
-ac_spawn_named_copy "$AC_LONGNAME"
+ac_spawn_or_die "$AC_LONGNAME"
 AC_LONGPID=$AC_SPAWNPID
 expect_rc  "protect --comm matches full (>15-char) exe basename" 0 \
     ./anticheat protect --comm "$AC_LONGNAME"
@@ -128,12 +139,12 @@ ac_kill_spawn "$AC_LONGPID"
 # back to the original /proc/<pid>/comm string match, not fail outright.
 AC_SHORTNAME="ac69delfb$$"
 AC_SHORTNAME="${AC_SHORTNAME:0:15}"
-# ac_spawn_named_copy waits for the child to actually exec the copied
+# ac_spawn_or_die waits for the child to actually exec the copied
 # binary before we delete it out from under it -- deleting too early can
 # still catch it mid-fork, in which case /proc/<pid>/exe would resolve to
 # nothing (ENOENT) instead of "... (deleted)", and the fallback-to-comm-
 # string assertion below would flake intermittently.
-ac_spawn_named_copy "$AC_SHORTNAME"
+ac_spawn_or_die "$AC_SHORTNAME"
 AC_DELPID=$AC_SPAWNPID
 rm -f "$AC_TESTBIN_DIR/$AC_SHORTNAME"
 expect_rc  "protect --comm falls back to comm string (exe deleted)" 0 \

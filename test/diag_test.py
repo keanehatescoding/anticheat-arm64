@@ -23,7 +23,7 @@ id() { record "id $*"; echo "$TEST_UID"; }
 [() {
     if builtin [ "$#" -eq 3 ] && builtin [ "$1" = -d ] &&
        builtin [ "$2" = /sys/module/anticheat ]; then
-        builtin [ "$TEST_LOADED" = 1 ]; return
+        builtin [ "$TEST_LOADED" = 1 ]; return $?
     fi
     builtin [ "$@"
 }
@@ -43,13 +43,16 @@ insmod() {
 }
 rmmod() { record "rmmod $*"; return "$TEST_RMMOD_RC"; }
 sleep() {
-    if builtin [ "$1" = 0.5 ] && builtin [ "$TEST_FAILURE" = before-child-read ]; then
-        exit 73
-    fi
-    # Ensure the wrapper writes the pidfile before the parent reads it.
+    # Ensure the wrapper writes the pidfile before the parent reads it. This
+    # also gates the injected failure below: exiting first would start
+    # cleanup before the bash() stub has written child.pid, and the stub
+    # could then recreate the file after cleanup removed it.
     if builtin [ "$1" = 0.5 ]; then
         for ((i=0; i<100; i++)); do
-            builtin [ -s "$CASE_DIR/child.pid" ] && return 0
+            if builtin [ -s "$CASE_DIR/child.pid" ]; then
+                builtin [ "$TEST_FAILURE" = before-child-read ] && exit 73
+                return 0
+            fi
             command sleep 0.001
         done
         return 1
@@ -74,8 +77,12 @@ timeout() {
 kill() {
     record "kill $*"
     # Exercise both a group disappearing after TERM and the KILL backstop.
+    # `return $?`, not a bare `return`: bash documents that a bare return run
+    # from an EXIT/trap handler (diag.sh's cleanup) reports the status from
+    # BEFORE the trap began, not the last command, which made this stub
+    # always "succeed" and the TERM loop spin all 40 times.
     if builtin [ "${1:-}" = -TERM ]; then
-        builtin [ "$TEST_STUBBORN" = 1 ]; return
+        builtin [ "$TEST_STUBBORN" = 1 ]; return $?
     fi
     return 0
 }
@@ -222,9 +229,16 @@ for name in ac69-exe-match-longname-test ac69deleted; do
     [ "$(readlink "/proc/$pid/exe")" = "$AC_TESTBIN_DIR/$name (deleted)" ]
     ac_kill_spawn "$pid" || :
     ! kill -0 "$pid" 2>/dev/null
-    # A dead child may briefly remain as a zombie until init reaps it.
-    state=$(awk '{print $3}' "/proc/$child/stat" 2>/dev/null) || state=""
-    [ -z "$state" ] || [ "$state" = Z ]
+    # ac_kill_spawn only waits for the wrapper, so the signalled child may
+    # still be dying. Poll (bounded) until it is gone or a zombie awaiting
+    # reaping; fail only if the deadline expires.
+    gone=0
+    for _ in $(seq 1 100); do
+        state=$(awk '{print $3}' "/proc/$child/stat" 2>/dev/null) || state=""
+        if [ -z "$state" ] || [ "$state" = Z ]; then gone=1; break; fi
+        sleep 0.05
+    done
+    [ "$gone" = 1 ]
     AC_SPAWNPID=""
 done
 '''
