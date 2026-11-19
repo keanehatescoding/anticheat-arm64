@@ -24,8 +24,11 @@ CHILD_PIDFILE=""
 cleanup() {
     [ -n "$V" ] && ./anticheat unprotect --pid "$V" >/dev/null 2>&1
     [ -n "$P" ] && kill "$P" 2>/dev/null
-    [ -n "$V" ] && kill "$V" 2>/dev/null
-    [ -n "$C" ] && kill "$C" 2>/dev/null
+    # The victim wrapper runs under setsid, so $V is also its process-group
+    # id: signalling -$V reaches the wrapper AND its sleep child in one shot,
+    # even if we are interrupted before the pidfile below was ever read
+    # (when $C would still be empty).
+    [ -n "$V" ] && kill -TERM -- "-$V" 2>/dev/null
     [ -n "$CHILD_PIDFILE" ] && rm -f "$CHILD_PIDFILE"
     if [ "$LOADED_BY_US" -eq 1 ]; then
         sleep 0.2
@@ -78,7 +81,10 @@ echo "== protected process + attach =="
 # empty pidfile path or an empty $C, producing a diagnostic run that
 # looks like it worked but didn't actually test fork inheritance.
 CHILD_PIDFILE="$(mktemp)" || { echo "mktemp failed"; exit 1; }
-bash -c 'sleep 300 & echo $! > "$1"; wait' _ "$CHILD_PIDFILE" & V=$!
+# setsid gives the wrapper its own session/process group (PGID == $V) so
+# cleanup can kill the wrapper and its child together via `kill -- -$V`,
+# independent of when (or whether) the child pid is read below.
+setsid bash -c 'sleep 300 & echo $! > "$1"; wait' _ "$CHILD_PIDFILE" & V=$!
 ./anticheat protect --pid $V
 sleep 0.5
 C=$(cat "$CHILD_PIDFILE")
