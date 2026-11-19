@@ -85,36 +85,42 @@ echo "== protect --comm: exe-basename precision (issue #69) =="
 # pids on disk, not just mock state.
 AC_TESTBIN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ac_testbin.XXXXXX") || exit 1
 
-# Copy /bin/sleep to $AC_TESTBIN_DIR/$1 and run the copy in the background
-# (pid in AC_SPAWNPID). argv[0] is forced to "sleep" because /bin/sleep may
-# be a multi-call binary (e.g. uutils coreutils) that picks its applet from
-# argv[0] and otherwise dies with "unknown program '<copy name>'". comm and
-# /proc/<pid>/exe still come from the copied file's real name, which is
-# what these tests exercise. Returns once the pid has actually exec'd the
-# copy, so callers never race the bash->copy exec.
-ac_spawn_sleep_copy() {
-    cp /bin/sleep "$AC_TESTBIN_DIR/$1" || return 1
+# Copy bash to $AC_TESTBIN_DIR/$1 and run the copy in the background (pid in
+# AC_SPAWNPID) as a process that just waits on a sleep child. A copy of
+# /bin/sleep is NOT usable here: it may be a multi-call binary (e.g. uutils
+# coreutils) that picks its applet from its own name and dies with "unknown
+# program '<copy name>'", so the process never lives long enough to match.
+# bash does not dispatch on its name. comm and /proc/<pid>/exe come from the
+# copied file's real name, which is what these tests exercise. Returns once
+# the pid has actually exec'd the copy, so callers never race the exec.
+ac_spawn_named_copy() {
+    cp "$BASH" "$AC_TESTBIN_DIR/$1" || return 1
     chmod +x "$AC_TESTBIN_DIR/$1"
-    bash -c 'exec -a sleep "$0" 30' "$AC_TESTBIN_DIR/$1" &
+    # `; :` stops bash exec'ing sleep in place, so the copy stays the exe.
+    "$AC_TESTBIN_DIR/$1" -c 'sleep 30; :' &
     AC_SPAWNPID=$!
     for _ in $(seq 1 50); do
         [ "$(readlink "/proc/$AC_SPAWNPID/exe" 2>/dev/null)" = "$AC_TESTBIN_DIR/$1" ] && break
         sleep 0.1
     done
 }
+ac_kill_spawn() {
+    pkill -P "$1" 2>/dev/null
+    kill "$1" 2>/dev/null
+    { wait "$1"; } 2>/dev/null
+}
 
 # > 15 chars, so the old comm-string-only match couldn't have found this
 # pid at all (comm would read back truncated) -- only the exe-basename
 # match can.
 AC_LONGNAME="ac69-exe-match-longname-$$"
-ac_spawn_sleep_copy "$AC_LONGNAME"
+ac_spawn_named_copy "$AC_LONGNAME"
 AC_LONGPID=$AC_SPAWNPID
 expect_rc  "protect --comm matches full (>15-char) exe basename" 0 \
     ./anticheat protect --comm "$AC_LONGNAME"
 expect_out "list shows exe-basename-matched pid" "$AC_LONGPID" ./anticheat list
 ./anticheat unprotect --pid "$AC_LONGPID" >/dev/null 2>&1
-kill "$AC_LONGPID" 2>/dev/null
-wait "$AC_LONGPID" 2>/dev/null
+ac_kill_spawn "$AC_LONGPID"
 
 # <= 15 chars, then the backing file is deleted while the process keeps
 # running: /proc/<pid>/exe now resolves to "... (deleted)", which
@@ -122,20 +128,19 @@ wait "$AC_LONGPID" 2>/dev/null
 # back to the original /proc/<pid>/comm string match, not fail outright.
 AC_SHORTNAME="ac69delfb$$"
 AC_SHORTNAME="${AC_SHORTNAME:0:15}"
-# ac_spawn_sleep_copy waits for the child to actually exec the copied
+# ac_spawn_named_copy waits for the child to actually exec the copied
 # binary before we delete it out from under it -- deleting too early can
 # still catch it mid-fork, in which case /proc/<pid>/exe would resolve to
 # nothing (ENOENT) instead of "... (deleted)", and the fallback-to-comm-
 # string assertion below would flake intermittently.
-ac_spawn_sleep_copy "$AC_SHORTNAME"
+ac_spawn_named_copy "$AC_SHORTNAME"
 AC_DELPID=$AC_SPAWNPID
 rm -f "$AC_TESTBIN_DIR/$AC_SHORTNAME"
 expect_rc  "protect --comm falls back to comm string (exe deleted)" 0 \
     ./anticheat protect --comm "$AC_SHORTNAME"
 expect_out "list shows comm-fallback-matched pid" "$AC_DELPID" ./anticheat list
 ./anticheat unprotect --pid "$AC_DELPID" >/dev/null 2>&1
-kill "$AC_DELPID" 2>/dev/null
-wait "$AC_DELPID" 2>/dev/null
+ac_kill_spawn "$AC_DELPID"
 
 rm -rf "$AC_TESTBIN_DIR"
 
