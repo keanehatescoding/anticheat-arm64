@@ -206,7 +206,7 @@ def test_named_process_helpers():
     with tempfile.TemporaryDirectory(prefix="ac-named-test-") as directory:
         script = helpers + r'''
 set -eu
-AC_TESTBIN_DIR=$1
+AC_TESTBIN_DIR=$(cd "$1" && pwd -P)
 AC_SPAWNPID=""
 cleanup_test() {
     if [ -n "$AC_SPAWNPID" ]; then ac_kill_spawn "$AC_SPAWNPID" || :; fi
