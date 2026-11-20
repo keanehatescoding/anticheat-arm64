@@ -84,6 +84,13 @@ echo "== protect --comm: exe-basename precision (issue #69) =="
 # scans the real /proc, not the mocked ioctl ABI, so it needs actual
 # pids on disk, not just mock state.
 AC_TESTBIN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ac_testbin.XXXXXX") || exit 1
+# Resolve to an absolute PHYSICAL path before any fixture starts: the kernel
+# reports /proc/<pid>/exe from the resolved filesystem path, so a TMPDIR like
+# "/tmp/." or one that goes through a symlink would otherwise never string-
+# match what readlink returns, and a perfectly healthy fixture would be
+# rejected by the readiness check below. On failure, don't leak the dir.
+AC_TESTBIN_REAL=$(cd "$AC_TESTBIN_DIR" && pwd -P) || { rm -rf "$AC_TESTBIN_DIR"; exit 1; }
+AC_TESTBIN_DIR=$AC_TESTBIN_REAL
 
 # Copy bash to $AC_TESTBIN_DIR/$1 and run the copy in the background (pid in
 # AC_SPAWNPID) as a process that just waits on a sleep child. A copy of
