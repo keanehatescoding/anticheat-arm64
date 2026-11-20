@@ -23,7 +23,8 @@ id() { record "id $*"; echo "$TEST_UID"; }
 [() {
     if builtin [ "$#" -eq 3 ] && builtin [ "$1" = -d ] &&
        builtin [ "$2" = /sys/module/anticheat ]; then
-        builtin [ "$TEST_LOADED" = 1 ]; return $?
+        # Present if it was loaded before the run, or insmod put it there.
+        builtin [ "$TEST_LOADED" = 1 ] || builtin [ -e "$CASE_DIR/present" ]; return $?
     fi
     builtin [ "$@"
 }
@@ -38,9 +39,26 @@ insmod() {
     record "insmod $*"
     case "$TEST_FAILURE" in
         insmod) return 1 ;;
-        during-insmod) exit 73 ;;
+        # Interrupted after the module got in but before the script could
+        # record its instance / after insmod returned.
+        during-insmod) : > "$CASE_DIR/present"; exit 73 ;;
+        # Interrupted before the module ever appeared.
+        during-insmod-absent) exit 73 ;;
     esac
+    : > "$CASE_DIR/present"
 }
+# Module identity (device:inode of /sys/module/anticheat). The first call is
+# the post-insmod record; later calls are cleanup's check, which reports a
+# different instance when TEST_REPLACED=1.
+stat() {
+    record "stat $*"
+    echo x >> "$CASE_DIR/stat_calls"
+    if builtin [ "$TEST_REPLACED" = 1 ] && builtin [ "$(wc -l < "$CASE_DIR/stat_calls")" -gt 1 ]; then
+        echo 9:9; return 0
+    fi
+    echo 1:1
+}
+flock() { record "flock $*"; }
 rmmod() { record "rmmod $*"; return "$TEST_RMMOD_RC"; }
 sleep() {
     # Ensure the wrapper writes the pidfile before the parent reads it. This
@@ -104,7 +122,8 @@ def run_case(**options):
         (case / "anticheat").chmod(0o755)
         env = dict(os.environ, CASE_DIR=directory, BASH_ENV=str(case / "stubs"),
                    TEST_UID="0", TEST_LOADED="0", TEST_FAILURE="",
-                   TEST_STUBBORN="0", TEST_RMMOD_RC="0")
+                   TEST_STUBBORN="0", TEST_RMMOD_RC="0", TEST_REPLACED="0",
+                   AC_DIAG_LOCKFILE=str(case / "lock"))
         env.update(options)
         result = subprocess.run(["bash", str(case / "diag.sh")], env=env,
                                 text=True, capture_output=True, timeout=10)
@@ -189,10 +208,49 @@ def test_stubborn_group():
 
 
 def test_diagnostic_failures():
-    result, calls = run_case(TEST_FAILURE="cli", TEST_RMMOD_RC="1")
+    # A failing diagnostic command must still allow the full cleanup.
+    result, calls = run_case(TEST_FAILURE="cli")
     assert result.returncode == 0 and "== done ==" in result.stdout, result
     assert_victim_cleanup(calls)
     assert calls[-1] == "rmmod anticheat", calls
+
+
+def test_rmmod_failure_is_reported():
+    result, calls = run_case(TEST_RMMOD_RC="1")
+    assert "== done ==" in result.stdout, result
+    assert result.returncode == 1, result
+    assert "rmmod anticheat failed" in result.stderr, result
+    assert calls[-1] == "rmmod anticheat", calls
+
+
+def test_replaced_module_is_not_unloaded():
+    result, calls = run_case(TEST_REPLACED="1")
+    assert result.returncode == 0 and "== done ==" in result.stdout, result
+    assert module_calls(calls) == ["insmod ./anticheat.ko ac_verbose=1"], calls
+    assert "replaced during this run" in result.stderr, result
+    assert_victim_cleanup(calls)
+
+
+def test_interrupted_insmod_unloads_only_if_module_appeared():
+    # Signal after the module got in but before its instance was recorded:
+    # identity is unknown, so cleanup unloads what is present.
+    result, calls = run_case(TEST_FAILURE="during-insmod")
+    assert result.returncode == 73, result
+    assert module_calls(calls) == ["insmod ./anticheat.ko ac_verbose=1", "rmmod anticheat"], calls
+    # Signal before the module ever appeared: nothing to unload, no spurious
+    # rmmod failure.
+    result, calls = run_case(TEST_FAILURE="during-insmod-absent")
+    assert result.returncode == 73, result
+    assert module_calls(calls) == ["insmod ./anticheat.ko ac_verbose=1"], calls
+    assert "rmmod anticheat failed" not in result.stderr, result
+
+
+def test_serialized_by_lock():
+    result, calls = run_case()
+    assert any(c.startswith("flock -x 9") for c in calls), calls
+    # Taken before any module work.
+    assert calls.index(next(c for c in calls if c.startswith("flock"))) < \
+        calls.index("insmod ./anticheat.ko ac_verbose=1"), calls
 
 
 
@@ -250,6 +308,9 @@ done
 if __name__ == "__main__":
     for test in (test_non_root, test_fresh_module, test_existing_module,
                  test_load_failure, test_early_exits, test_stubborn_group,
-                 test_diagnostic_failures, test_named_process_helpers):
+                 test_diagnostic_failures, test_rmmod_failure_is_reported,
+                 test_replaced_module_is_not_unloaded,
+                 test_interrupted_insmod_unloads_only_if_module_appeared,
+                 test_serialized_by_lock, test_named_process_helpers):
         test()
         print(f"PASS {test.__name__}")

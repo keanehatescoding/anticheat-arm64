@@ -7,6 +7,15 @@ cd "$(dirname "$0")" || exit 1
 
 [ "$(id -u)" -eq 0 ] || { echo "run with sudo"; exit 1; }
 
+# Serialize concurrent diagnostic runs (issue thread): module loading,
+# diagnostics, protection checks and cleanup must not overlap, otherwise one
+# run can unload the module while another is still using it.
+# AC_DIAG_LOCKFILE exists only so test/diag_test.py can run unprivileged;
+# the default is what a real run uses.
+LOCKFILE="${AC_DIAG_LOCKFILE:-/run/anticheat-diag.lock}"
+exec 9>"$LOCKFILE" || { echo "lock open failed"; exit 1; }
+flock -x 9 || { echo "lock failed"; exit 1; }
+
 # Everything this run creates, and only that, is torn down from the EXIT
 # trap (issue #93): a mid-script exit must not leave the module loaded, the
 # victim alive, or its protection registered -- and a module that was
@@ -14,6 +23,7 @@ cd "$(dirname "$0")" || exit 1
 # protected-process registrations and the boot-time syscall baseline, so it
 # is never unloaded here.
 LOADED_BY_US=0
+MODULE_INSTANCE=""
 P=""
 V=""
 C=""
@@ -22,29 +32,68 @@ CHILD_PIDFILE=""
 # cleanup is invoked via trap below; shellcheck cannot always see that
 # shellcheck disable=SC2317,SC2329
 cleanup() {
-    [ -n "$V" ] && ./anticheat unprotect --pid "$V" >/dev/null 2>&1
-    [ -n "$P" ] && kill "$P" 2>/dev/null
-    # The victim wrapper was spawned under job control, so $V is also its
-    # process-group id: signalling -$V reaches the wrapper AND its sleep
-    # child in one shot, even if we are interrupted before the pidfile below
-    # was read (when $C would still be empty). One signal is not enough,
-    # though: a TERM that lands between the victim's fork and exec can be
-    # swallowed by the shell handler it inherited from this script, and the
-    # wrapper then goes on to start its sleep child. So keep signalling the
-    # group until it is empty (kill fails once no member is left; bash reaps
-    # the exited leader itself), with a KILL as the backstop.
+    rc=$?
     if [ -n "$V" ]; then
+        if ! ./anticheat unprotect --pid "$V" >/dev/null 2>&1; then
+            echo "warning: unprotect --pid $V failed; cleanup not yet confirmed" >&2
+        fi
+    fi
+    if [ -n "$P" ]; then
+        kill "$P" 2>/dev/null
+        kill -CONT "$P" 2>/dev/null
+        wait "$P" 2>/dev/null
+        P=""
+    fi
+    if [ -n "$V" ]; then
+        # The victim wrapper was spawned under job control, so $V is also its
+        # process-group id: signalling -$V reaches the wrapper AND its sleep
+        # child in one shot, even if we are interrupted before the pidfile
+        # was read (when $C is still empty) -- no pgrep/pidfile lookup, and no
+        # window where a recycled pid could be signalled. One signal is not
+        # enough, though: a TERM that lands between the victim's fork and exec
+        # can be swallowed by the shell handler it inherited from this
+        # script, and the wrapper then goes on to start its sleep child. So
+        # keep signalling the group until it is empty (kill fails once no
+        # member is left), CONT-ing it each round in case it is stopped, with
+        # a KILL as the backstop. Signalling $V itself first covers the case
+        # where the group does not exist yet or job control was unavailable.
+        kill "$V" 2>/dev/null
+        kill -CONT "$V" 2>/dev/null
         for _ in $(seq 1 40); do
             kill -TERM -- "-$V" 2>/dev/null || break
+            kill -CONT -- "-$V" 2>/dev/null
             sleep 0.05
         done
         kill -KILL -- "-$V" 2>/dev/null
+        wait "$V" 2>/dev/null
     fi
     [ -n "$CHILD_PIDFILE" ] && rm -f "$CHILD_PIDFILE"
+    CHILD_PIDFILE=""
     if [ "$LOADED_BY_US" -eq 1 ]; then
         sleep 0.2
-        rmmod anticheat 2>/dev/null
+        # Normally the instance recorded right after insmod must still be the
+        # one loaded. If we were interrupted before it could be recorded
+        # (during or just after insmod) identity cannot be verified: the
+        # module was absent when we started and we hold the diag lock, so
+        # unload whatever is present now -- and nothing if it never appeared.
+        _unload=0
+        if [ -n "$MODULE_INSTANCE" ]; then
+            _current_instance="$(stat -c '%d:%i' /sys/module/anticheat 2>/dev/null || true)"
+            if [ "$_current_instance" = "$MODULE_INSTANCE" ]; then
+                _unload=1
+            else
+                echo "warning: anticheat module was replaced during this run; not unloading" >&2
+            fi
+        elif [ -d /sys/module/anticheat ]; then
+            _unload=1
+        fi
+        if [ "$_unload" -eq 1 ] && ! rmmod anticheat 2>/dev/null; then
+            echo "error: rmmod anticheat failed; module may still be loaded" >&2
+            [ "$rc" -eq 0 ] && rc=1
+        fi
     fi
+    exec 9>&- 2>/dev/null || true
+    exit "$rc"
 }
 
 trap cleanup EXIT
@@ -61,15 +110,20 @@ if [ -d /sys/module/anticheat ]; then
     echo "note: anticheat is already loaded; diagnosing it in place and leaving it loaded" >&2
     echo "      (not reloaded with ac_verbose=1, so the init log below may be sparse or stale)" >&2
 else
-    # Claim ownership BEFORE insmod runs: a SIGTERM while insmod is in
-    # flight, or right after it returns, must still reach rmmod in cleanup.
-    # (rmmod on a module that never loaded just fails quietly.) If insmod
-    # itself fails, nothing of ours is loaded -- the kernel rolls a failed
-    # load back -- so drop the claim: cleanup then must not rmmod, which
-    # could otherwise unload a copy somebody else loaded in the meantime.
+    # Claim ownership BEFORE insmod runs: a SIGTERM while insmod is in flight,
+    # or right after it returns but before the instance is recorded below,
+    # must still reach the unload in cleanup. If insmod itself fails the
+    # kernel rolls the load back, so drop the claim: cleanup must not unload
+    # a copy somebody else loaded in the meantime.
     LOADED_BY_US=1
-    insmod ./anticheat.ko ac_verbose=1 || { LOADED_BY_US=0; echo "INSMOD FAILED"; exit 1; }
-    sleep 0.3
+    if insmod ./anticheat.ko ac_verbose=1; then
+        MODULE_INSTANCE="$(stat -c '%d:%i' /sys/module/anticheat 2>/dev/null || true)"
+        sleep 0.3
+    else
+        LOADED_BY_US=0
+        echo "INSMOD FAILED"
+        exit 1
+    fi
 fi
 
 echo
@@ -82,9 +136,11 @@ echo "== status =="
 
 echo
 echo "== control: root ptrace on a NON-protected process =="
-sleep 300 & P=$!
+sleep 300 9>&- & P=$!
 timeout 2 strace -p $P -e trace=none >/dev/null 2>&1; rc=$?
-kill $P 2>/dev/null
+kill "$P" 2>/dev/null
+kill -CONT "$P" 2>/dev/null
+wait "$P" 2>/dev/null
 P=""
 echo "strace -p non-protected rc=$rc   (0 = attach worked, 124 = hung/timed out)"
 
@@ -100,13 +156,13 @@ echo "== protected process + attach =="
 CHILD_PIDFILE="$(mktemp)" || { echo "mktemp failed"; exit 1; }
 # Job control (set -m) makes bash itself put the wrapper in its own process
 # group (PGID == $V) at fork time, from the parent side -- so the group
-# exists the moment `V=$!` is set, with no dependency on the child getting
-# far enough to call setsid() itself. Cleanup can then kill the wrapper and
-# its child together via `kill -- -$V`, independent of when (or whether) the
-# child pid is read below. Turned back off straight after the spawn so the
-# rest of the script gets no job-status noise.
+# exists the moment `V=$!` is set and cleanup can kill the wrapper and its
+# child together via `kill -- -$V`, independent of when (or whether) the
+# child pid is read below. Turned back off straight after the spawn. Fd 9
+# (the diag lock) is closed for the child so it can never outlive the run
+# holding the lock.
 set -m
-bash -c 'sleep 300 & echo $! > "$1"; wait' _ "$CHILD_PIDFILE" & V=$!
+bash -c 'trap "kill %1 2>/dev/null" EXIT TERM INT; sleep 300 & echo $! > "$1"; wait' _ "$CHILD_PIDFILE" 9>&- & V=$!
 set +m
 ./anticheat protect --pid $V
 sleep 0.5
@@ -115,6 +171,7 @@ if [ -z "$C" ]; then
     echo "warning: could not read child pid from $CHILD_PIDFILE" >&2
 fi
 rm -f "$CHILD_PIDFILE"
+CHILD_PIDFILE=""
 echo "victim=$V child=$C"
 timeout 2 strace -p $V -e trace=none >/dev/null 2>&1; rc=$?
 echo "strace -p protected rc=$rc"
