@@ -91,8 +91,9 @@ AC_TESTBIN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ac_testbin.XXXXXX") || exit 1
 # coreutils) that picks its applet from its own name and dies with "unknown
 # program '<copy name>'", so the process never lives long enough to match.
 # bash does not dispatch on its name. comm and /proc/<pid>/exe come from the
-# copied file's real name, which is what these tests exercise. Returns once
-# the pid has actually exec'd the copy, so callers never race the exec.
+# copied file's real name, which is what these tests exercise. Returns 0 only
+# once the pid has actually exec'd the copy (so callers never race the exec),
+# and 1 -- with the process reaped and AC_SPAWNPID cleared -- if it never does.
 ac_spawn_named_copy() {
     # Cleared up front so a failed setup never leaves a stale (or unset,
     # under set -u) AC_SPAWNPID for the caller to read.
@@ -103,9 +104,15 @@ ac_spawn_named_copy() {
     "$AC_TESTBIN_DIR/$1" -c 'sleep 30; :' &
     AC_SPAWNPID=$!
     for _ in $(seq 1 50); do
-        [ "$(readlink "/proc/$AC_SPAWNPID/exe" 2>/dev/null)" = "$AC_TESTBIN_DIR/$1" ] && break
+        [ "$(readlink "/proc/$AC_SPAWNPID/exe" 2>/dev/null)" = "$AC_TESTBIN_DIR/$1" ] && return 0
         sleep 0.1
     done
+    # Never saw the copy become the exe (e.g. a noexec temp dir: cp and chmod
+    # succeed but the exec fails). Success is ONLY a matching readlink above;
+    # reap whatever was started and fail, so no caller accepts a dead fixture.
+    ac_kill_spawn "$AC_SPAWNPID"
+    AC_SPAWNPID=""
+    return 1
 }
 # Fixture setup failure is fatal, but must not leak the temp dir: report it,
 # remove the dir, and bail before anything reads AC_SPAWNPID.
