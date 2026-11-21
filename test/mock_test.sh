@@ -84,28 +84,68 @@ echo "== protect --comm: exe-basename precision (issue #69) =="
 # scans the real /proc, not the mocked ioctl ABI, so it needs actual
 # pids on disk, not just mock state.
 AC_TESTBIN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ac_testbin.XXXXXX") || exit 1
-cat > "$AC_TESTBIN_DIR/sleeper.c" <<'C'
-#include <unistd.h>
-int main(void) {
-    sleep(30);
-    return 0;
+# Resolve to an absolute PHYSICAL path before any fixture starts: the kernel
+# reports /proc/<pid>/exe from the resolved filesystem path, so a TMPDIR like
+# "/tmp/." or one that goes through a symlink would otherwise never string-
+# match what readlink returns, and a perfectly healthy fixture would be
+# rejected by the readiness check below. On failure, don't leak the dir.
+AC_TESTBIN_REAL=$(cd "$AC_TESTBIN_DIR" && pwd -P) || { rm -rf "$AC_TESTBIN_DIR"; exit 1; }
+AC_TESTBIN_DIR=$AC_TESTBIN_REAL
+
+# Copy bash to $AC_TESTBIN_DIR/$1 and run the copy in the background (pid in
+# AC_SPAWNPID) as a process that just waits on a sleep child. A copy of
+# /bin/sleep is NOT usable here: it may be a multi-call binary (e.g. uutils
+# coreutils) that picks its applet from its own name and dies with "unknown
+# program '<copy name>'", so the process never lives long enough to match.
+# bash does not dispatch on its name. comm and /proc/<pid>/exe come from the
+# copied file's real name, which is what these tests exercise. Returns 0 only
+# once the pid has actually exec'd the copy (so callers never race the exec),
+# and 1 -- with the process reaped and AC_SPAWNPID cleared -- if it never does.
+ac_spawn_named_copy() {
+    # Cleared up front so a failed setup never leaves a stale (or unset,
+    # under set -u) AC_SPAWNPID for the caller to read.
+    AC_SPAWNPID=""
+    cp "$BASH" "$AC_TESTBIN_DIR/$1" || return 1
+    chmod +x "$AC_TESTBIN_DIR/$1" || return 1
+    # `; :` stops bash exec'ing sleep in place, so the copy stays the exe.
+    "$AC_TESTBIN_DIR/$1" -c 'sleep 30; :' &
+    AC_SPAWNPID=$!
+    for _ in $(seq 1 50); do
+        [ "$(readlink "/proc/$AC_SPAWNPID/exe" 2>/dev/null)" = "$AC_TESTBIN_DIR/$1" ] && return 0
+        sleep 0.1
+    done
+    # Never saw the copy become the exe (e.g. a noexec temp dir: cp and chmod
+    # succeed but the exec fails). Success is ONLY a matching readlink above;
+    # reap whatever was started and fail, so no caller accepts a dead fixture.
+    ac_kill_spawn "$AC_SPAWNPID"
+    AC_SPAWNPID=""
+    return 1
 }
-C
+# Fixture setup failure is fatal, but must not leak the temp dir: report it,
+# remove the dir, and bail before anything reads AC_SPAWNPID.
+ac_spawn_or_die() {
+    ac_spawn_named_copy "$1" && [ -n "$AC_SPAWNPID" ] && return 0
+    echo "FAIL fixture setup: could not create/start $AC_TESTBIN_DIR/$1" >&2
+    rm -rf "$AC_TESTBIN_DIR"
+    exit 1
+}
+ac_kill_spawn() {
+    pkill -P "$1" 2>/dev/null
+    kill "$1" 2>/dev/null
+    { wait "$1"; } 2>/dev/null
+}
 
 # > 15 chars, so the old comm-string-only match couldn't have found this
 # pid at all (comm would read back truncated) -- only the exe-basename
 # match can.
 AC_LONGNAME="ac69-exe-match-longname-$$"
-gcc -O2 -o "$AC_TESTBIN_DIR/$AC_LONGNAME" "$AC_TESTBIN_DIR/sleeper.c"
-chmod +x "$AC_TESTBIN_DIR/$AC_LONGNAME"
-"$AC_TESTBIN_DIR/$AC_LONGNAME" 30 &
-AC_LONGPID=$!
+ac_spawn_or_die "$AC_LONGNAME"
+AC_LONGPID=$AC_SPAWNPID
 expect_rc  "protect --comm matches full (>15-char) exe basename" 0 \
     ./anticheat protect --comm "$AC_LONGNAME"
 expect_out "list shows exe-basename-matched pid" "$AC_LONGPID" ./anticheat list
 ./anticheat unprotect --pid "$AC_LONGPID" >/dev/null 2>&1
-kill "$AC_LONGPID" 2>/dev/null
-wait "$AC_LONGPID" 2>/dev/null
+ac_kill_spawn "$AC_LONGPID"
 
 # <= 15 chars, then the backing file is deleted while the process keeps
 # running: /proc/<pid>/exe now resolves to "... (deleted)", which
@@ -113,26 +153,19 @@ wait "$AC_LONGPID" 2>/dev/null
 # back to the original /proc/<pid>/comm string match, not fail outright.
 AC_SHORTNAME="ac69delfb$$"
 AC_SHORTNAME="${AC_SHORTNAME:0:15}"
-gcc -O2 -o "$AC_TESTBIN_DIR/$AC_SHORTNAME" "$AC_TESTBIN_DIR/sleeper.c"
-chmod +x "$AC_TESTBIN_DIR/$AC_SHORTNAME"
-"$AC_TESTBIN_DIR/$AC_SHORTNAME" 30 &
-AC_DELPID=$!
-# Wait for the child to actually exec the copied binary before deleting
-# it out from under it -- deleting too early can still catch it mid-fork,
-# in which case /proc/<pid>/exe would resolve to nothing (ENOENT) instead
-# of "... (deleted)", and the fallback-to-comm-string assertion below
-# would flake intermittently.
-for _ in $(seq 1 50); do
-    [ "$(readlink "/proc/$AC_DELPID/exe" 2>/dev/null)" = "$AC_TESTBIN_DIR/$AC_SHORTNAME" ] && break
-    sleep 0.1
-done
+# ac_spawn_or_die waits for the child to actually exec the copied
+# binary before we delete it out from under it -- deleting too early can
+# still catch it mid-fork, in which case /proc/<pid>/exe would resolve to
+# nothing (ENOENT) instead of "... (deleted)", and the fallback-to-comm-
+# string assertion below would flake intermittently.
+ac_spawn_or_die "$AC_SHORTNAME"
+AC_DELPID=$AC_SPAWNPID
 rm -f "$AC_TESTBIN_DIR/$AC_SHORTNAME"
 expect_rc  "protect --comm falls back to comm string (exe deleted)" 0 \
     ./anticheat protect --comm "$AC_SHORTNAME"
 expect_out "list shows comm-fallback-matched pid" "$AC_DELPID" ./anticheat list
 ./anticheat unprotect --pid "$AC_DELPID" >/dev/null 2>&1
-kill "$AC_DELPID" 2>/dev/null
-wait "$AC_DELPID" 2>/dev/null
+ac_kill_spawn "$AC_DELPID"
 
 rm -rf "$AC_TESTBIN_DIR"
 
