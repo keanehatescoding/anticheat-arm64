@@ -3869,6 +3869,49 @@ static int ac_layer_in_name_list(const char *name, const char *list)
     return 0;
 }
 
+/* True if the layer's shared library is currently mapped into `pid`.
+ * The environment alone can't show every way a layer ends up loaded: the
+ * application may request it by name (ppEnabledLayerNames) or an override
+ * layer may re-enable it, and neither leaves a trace in environ. A mapped
+ * library is direct evidence the layer is live, so it outranks a set
+ * disable variable. Matches the library's file name against each mapped
+ * file's file name (manifest paths are often bare names resolved by
+ * dlopen). Absence proves nothing -- the layer may simply not be loaded
+ * yet -- so this can only ever add a layer to the report. */
+static int ac_layer_library_mapped(int pid, const char *library_path)
+{
+    const char *base = strrchr(library_path, '/');
+    char path[64], line[PATH_MAX + 128];
+    size_t blen;
+    FILE *f;
+    int hit = 0;
+
+    base = base ? base + 1 : library_path;
+    blen = strlen(base);
+    if (!blen)
+        return 0;
+    snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+    f = fopen(path, "r");
+    if (!f)
+        return 0;
+    while (!hit && fgets(line, sizeof(line), f)) {
+        char *file = strchr(line, '/');
+        char *nl, *slash;
+
+        if (!file)
+            continue;
+        if ((nl = strchr(file, '\n')))
+            *nl = '\0';
+        slash = strrchr(file, '/');
+        file = slash ? slash + 1 : file;
+        if (strncmp(file, base, blen) == 0 &&
+            (file[blen] == '\0' || strcmp(file + blen, " (deleted)") == 0))
+            hit = 1;
+    }
+    fclose(f);
+    return hit;
+}
+
 /* Enumerates every standard implicit_layer.d directory and returns the
  * layers that are actually active for this specific target: present,
  * and not disabled via its own "disable_environment" variable (if the
@@ -3910,11 +3953,20 @@ static int ac_scan_active_implicit_layers(int pid,
              * in VK_INSTANCE_LAYERS, which the loader adds with no disable
              * check. If that list was truncated to fit our buffer we can't
              * rule the name out, so keep the layer. A read error also falls
-             * through and reports the layer (fail toward visibility). */
+             * through and reports the layer (fail toward visibility).
+             *
+             * The loader has two further ways to load a layer despite its
+             * disable variable -- the application requesting it by name,
+             * and an override layer listing it -- and neither is visible in
+             * environ. So a layer whose library is already mapped is kept
+             * too (see ac_layer_library_mapped()). We don't parse override
+             * manifests: one that hasn't loaded its components yet is a
+             * known gap of this heuristic. */
             if (ac_read_environ_vars(pid, q, 2) == 0 && q[0].found &&
                 !(q[1].found &&
                   (q[1].truncated ||
-                   ac_layer_in_name_list(found[i].name, q[1].value))))
+                   ac_layer_in_name_list(found[i].name, q[1].value))) &&
+                !ac_layer_library_mapped(pid, found[i].library_path))
                 continue;   /* explicitly disabled for this process */
         }
         out[nactive++] = found[i];
