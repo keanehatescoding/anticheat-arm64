@@ -66,7 +66,6 @@
 #include <time.h>
 #include <dirent.h>
 #include <ctype.h>
-#include <fnmatch.h>
 #include <elf.h>
 #include <netdb.h>
 #include <arpa/inet.h>
@@ -1773,6 +1772,7 @@ struct ac_environ_query {
     const char *name;                    /* variable name, no '=' */
     char value[AC_ENVIRON_VAL_LEN];       /* out */
     int found;                            /* out */
+    int truncated;                        /* out: value didn't fit in value[] */
 };
 
 static int ac_read_environ_vars(int pid, struct ac_environ_query *vars,
@@ -3224,8 +3224,10 @@ static int ac_read_environ_vars(int pid, struct ac_environ_query *vars,
     unsigned int i;
     int truncated;
 
-    for (i = 0; i < nvars; i++)
+    for (i = 0; i < nvars; i++) {
         vars[i].found = 0;
+        vars[i].truncated = 0;
+    }
 
     snprintf(path, sizeof(path), "/proc/%d/environ", pid);
     fd = open(path, O_RDONLY);
@@ -3278,6 +3280,7 @@ static int ac_read_environ_vars(int pid, struct ac_environ_query *vars,
             if (!vars[i].found && entry_len > nlen &&
                 strncmp(entry, vars[i].name, nlen) == 0 && entry[nlen] == '=') {
                 snprintf(vars[i].value, sizeof(vars[i].value), "%s", entry + nlen + 1);
+                vars[i].truncated = (entry_len - nlen - 1) >= sizeof(vars[i].value);
                 vars[i].found = 1;
             }
         }
@@ -3844,25 +3847,21 @@ static void ac_scan_implicit_layer_dir(const char *dir,
     closedir(d);
 }
 
-/* True if `name` matches any glob in a loader layer list such as
- * VK_LOADER_LAYERS_ENABLE (comma-delimited) or VK_INSTANCE_LAYERS
- * (colon-delimited on Linux). Both separators are accepted. */
-static int ac_layer_in_glob_list(const char *name, const char *list)
+/* True if `name` is an exact entry of a VK_INSTANCE_LAYERS-style list
+ * (colon-delimited on Linux). The loader adds layers named there by exact
+ * name, with no check of the layer's own disable_environment variable. */
+static int ac_layer_in_name_list(const char *name, const char *list)
 {
-    char item[AC_ENVIRON_VAL_LEN];
+    size_t nlen = strlen(name);
     const char *p = list;
 
-    if (!name[0])
+    if (!nlen)
         return 0;
     while (*p) {
-        size_t len = strcspn(p, ",:");
+        size_t len = strcspn(p, ":");
 
-        if (len > 0 && len < sizeof(item)) {
-            memcpy(item, p, len);
-            item[len] = '\0';
-            if (fnmatch(item, name, 0) == 0)
-                return 1;
-        }
+        if (len == nlen && strncmp(p, name, nlen) == 0)
+            return 1;
         p += len;
         if (*p)
             p++;
@@ -3898,23 +3897,24 @@ static int ac_scan_active_implicit_layers(int pid,
 
     for (i = 0; i < nfound && nactive < outcap; i++) {
         if (found[i].disable_env[0]) {
-            /* [0] disable variable, [1]/[2] loader force-enable lists */
-            struct ac_environ_query q[3];
+            /* [0] the layer's disable variable, [1] VK_INSTANCE_LAYERS */
+            struct ac_environ_query q[2];
 
             memset(q, 0, sizeof(q));
             q[0].name = found[i].disable_env;
-            q[1].name = "VK_LOADER_LAYERS_ENABLE";
-            q[2].name = "VK_INSTANCE_LAYERS";
-            /* The loader only treats the variable as a disable when it is
-             * set to a NON-EMPTY value, so "NAME=" leaves the layer active.
-             * And a layer the loader is told to force on stays active even
-             * with its disable variable set -- skipping it would let the
-             * scan omit a layer that is really loaded. On a read error we
-             * fall through and report the layer (fail toward visibility). */
-            if (ac_read_environ_vars(pid, q, 3) == 0 &&
-                q[0].found && q[0].value[0] &&
-                !(q[1].found && ac_layer_in_glob_list(found[i].name, q[1].value)) &&
-                !(q[2].found && ac_layer_in_glob_list(found[i].name, q[2].value)))
+            q[1].name = "VK_INSTANCE_LAYERS";
+            /* Mirrors the loader (loader_implicit_layer_is_enabled): the
+             * disable variable counts whenever it is SET, even to an empty
+             * string, and takes priority over VK_LOADER_LAYERS_ENABLE. The
+             * one thing that still loads such a layer is naming it exactly
+             * in VK_INSTANCE_LAYERS, which the loader adds with no disable
+             * check. If that list was truncated to fit our buffer we can't
+             * rule the name out, so keep the layer. A read error also falls
+             * through and reports the layer (fail toward visibility). */
+            if (ac_read_environ_vars(pid, q, 2) == 0 && q[0].found &&
+                !(q[1].found &&
+                  (q[1].truncated ||
+                   ac_layer_in_name_list(found[i].name, q[1].value))))
                 continue;   /* explicitly disabled for this process */
         }
         out[nactive++] = found[i];
