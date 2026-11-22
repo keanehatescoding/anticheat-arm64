@@ -1772,6 +1772,7 @@ struct ac_environ_query {
     const char *name;                    /* variable name, no '=' */
     char value[AC_ENVIRON_VAL_LEN];       /* out */
     int found;                            /* out */
+    int truncated;                        /* out: value didn't fit in value[] */
 };
 
 static int ac_read_environ_vars(int pid, struct ac_environ_query *vars,
@@ -3223,8 +3224,10 @@ static int ac_read_environ_vars(int pid, struct ac_environ_query *vars,
     unsigned int i;
     int truncated;
 
-    for (i = 0; i < nvars; i++)
+    for (i = 0; i < nvars; i++) {
         vars[i].found = 0;
+        vars[i].truncated = 0;
+    }
 
     snprintf(path, sizeof(path), "/proc/%d/environ", pid);
     fd = open(path, O_RDONLY);
@@ -3264,14 +3267,20 @@ static int ac_read_environ_vars(int pid, struct ac_environ_query *vars,
         const char *entry = buf + pos;
         size_t entry_len = strlen(entry);
 
-        if (entry_len == 0)
-            break;   /* malformed/truncated read -- stop rather than misread */
+        if (entry_len == 0) {
+            /* Unexpected NUL (e.g. a leading empty entry) should not hide
+             * every variable after it: skip it and keep scanning so a single
+             * NUL byte can't trivially suppress LD_PRELOAD/VK-layer checks. */
+            pos++;
+            continue;
+        }
         for (i = 0; i < nvars; i++) {
             size_t nlen = strlen(vars[i].name);
 
             if (!vars[i].found && entry_len > nlen &&
                 strncmp(entry, vars[i].name, nlen) == 0 && entry[nlen] == '=') {
                 snprintf(vars[i].value, sizeof(vars[i].value), "%s", entry + nlen + 1);
+                vars[i].truncated = (entry_len - nlen - 1) >= sizeof(vars[i].value);
                 vars[i].found = 1;
             }
         }
@@ -3838,6 +3847,89 @@ static void ac_scan_implicit_layer_dir(const char *dir,
     closedir(d);
 }
 
+/* True if `name` is an exact entry of a VK_INSTANCE_LAYERS-style list
+ * (colon-delimited on Linux). The loader adds layers named there by exact
+ * name, with no check of the layer's own disable_environment variable. */
+static int ac_layer_in_name_list(const char *name, const char *list)
+{
+    size_t nlen = strlen(name);
+    const char *p = list;
+
+    if (!nlen)
+        return 0;
+    while (*p) {
+        size_t len = strcspn(p, ":");
+
+        if (len == nlen && strncmp(p, name, nlen) == 0)
+            return 1;
+        p += len;
+        if (*p)
+            p++;
+    }
+    return 0;
+}
+
+/* True if the layer's shared library is currently mapped into `pid`.
+ * The environment alone can't show every way a layer ends up loaded: the
+ * application may request it by name (ppEnabledLayerNames) or an override
+ * layer may re-enable it, and neither leaves a trace in environ. A mapped
+ * library is direct evidence the layer is live, so it outranks a set
+ * disable variable. Matches the library's file name against each mapped
+ * file's file name (manifest paths are often bare names resolved by
+ * dlopen). Absence proves nothing -- the layer may simply not be loaded
+ * yet -- so this can only ever add a layer to the report. */
+static int ac_layer_library_mapped(int pid, const char *library_path)
+{
+    const char *base = strrchr(library_path, '/');
+    char path[64], line[PATH_MAX + 128], resolved[PATH_MAX];
+    const char *want_full = NULL;   /* set when the manifest gives an absolute path */
+    size_t blen;
+    FILE *f;
+    int hit = 0;
+
+    base = base ? base + 1 : library_path;
+    blen = strlen(base);
+    if (!blen)
+        return 0;
+    /* An absolute manifest path that resolves names one specific file, so
+     * match that file (symlinks resolved -- /proc/<pid>/maps shows resolved
+     * paths) rather than any same-named library elsewhere. A bare name, or a
+     * relative path we have no manifest directory for, is resolved by
+     * dlopen's search path, and an absolute path that no longer resolves
+     * (e.g. a symlink removed after the layer loaded, leaving only the
+     * backing file mapped) can't be told apart from a different library: for
+     * those only the file name can be compared, which errs toward reporting
+     * the layer. */
+    if (library_path[0] == '/' && realpath(library_path, resolved))
+        want_full = resolved;
+    snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+    f = fopen(path, "r");
+    if (!f)
+        return 0;
+    while (!hit && fgets(line, sizeof(line), f)) {
+        char *file = strchr(line, '/');
+        char *nl, *slash;
+        size_t flen;
+
+        if (!file)
+            continue;
+        if ((nl = strchr(file, '\n')))
+            *nl = '\0';
+        flen = strlen(file);
+        if (flen > 10 && strcmp(file + flen - 10, " (deleted)") == 0)
+            file[flen - 10] = '\0';
+        if (want_full) {
+            hit = strcmp(file, want_full) == 0;
+            continue;
+        }
+        slash = strrchr(file, '/');
+        file = slash ? slash + 1 : file;
+        hit = strcmp(file, base) == 0;
+    }
+    fclose(f);
+    return hit;
+}
+
 /* Enumerates every standard implicit_layer.d directory and returns the
  * layers that are actually active for this specific target: present,
  * and not disabled via its own "disable_environment" variable (if the
@@ -3866,11 +3958,33 @@ static int ac_scan_active_implicit_layers(int pid,
 
     for (i = 0; i < nfound && nactive < outcap; i++) {
         if (found[i].disable_env[0]) {
-            struct ac_environ_query q;
+            /* [0] the layer's disable variable, [1] VK_INSTANCE_LAYERS */
+            struct ac_environ_query q[2];
 
-            memset(&q, 0, sizeof(q));
-            q.name = found[i].disable_env;
-            if (ac_read_environ_vars(pid, &q, 1) == 0 && q.found)
+            memset(q, 0, sizeof(q));
+            q[0].name = found[i].disable_env;
+            q[1].name = "VK_INSTANCE_LAYERS";
+            /* Mirrors the loader (loader_implicit_layer_is_enabled): the
+             * disable variable counts whenever it is SET, even to an empty
+             * string, and takes priority over VK_LOADER_LAYERS_ENABLE. The
+             * one thing that still loads such a layer is naming it exactly
+             * in VK_INSTANCE_LAYERS, which the loader adds with no disable
+             * check. If that list was truncated to fit our buffer we can't
+             * rule the name out, so keep the layer. A read error also falls
+             * through and reports the layer (fail toward visibility).
+             *
+             * The loader has two further ways to load a layer despite its
+             * disable variable -- the application requesting it by name,
+             * and an override layer listing it -- and neither is visible in
+             * environ. So a layer whose library is already mapped is kept
+             * too (see ac_layer_library_mapped()). We don't parse override
+             * manifests: one that hasn't loaded its components yet is a
+             * known gap of this heuristic. */
+            if (ac_read_environ_vars(pid, q, 2) == 0 && q[0].found &&
+                !(q[1].found &&
+                  (q[1].truncated ||
+                   ac_layer_in_name_list(found[i].name, q[1].value))) &&
+                !ac_layer_library_mapped(pid, found[i].library_path))
                 continue;   /* explicitly disabled for this process */
         }
         out[nactive++] = found[i];
