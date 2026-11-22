@@ -3891,13 +3891,17 @@ static int ac_layer_library_mapped(int pid, const char *library_path)
     blen = strlen(base);
     if (!blen)
         return 0;
-    /* An absolute manifest path names one specific file, so match that file
-     * (symlinks resolved -- /proc/<pid>/maps shows resolved paths) rather
-     * than any same-named library elsewhere. A bare name, or a relative
-     * path we have no manifest directory for, is resolved by dlopen's search
-     * path, so for those only the file name can be compared. */
-    if (library_path[0] == '/')
-        want_full = realpath(library_path, resolved) ? resolved : library_path;
+    /* An absolute manifest path that resolves names one specific file, so
+     * match that file (symlinks resolved -- /proc/<pid>/maps shows resolved
+     * paths) rather than any same-named library elsewhere. A bare name, or a
+     * relative path we have no manifest directory for, is resolved by
+     * dlopen's search path, and an absolute path that no longer resolves
+     * (e.g. a symlink removed after the layer loaded, leaving only the
+     * backing file mapped) can't be told apart from a different library: for
+     * those only the file name can be compared, which errs toward reporting
+     * the layer. */
+    if (library_path[0] == '/' && realpath(library_path, resolved))
+        want_full = resolved;
     snprintf(path, sizeof(path), "/proc/%d/maps", pid);
     f = fopen(path, "r");
     if (!f)
