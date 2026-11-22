@@ -3881,7 +3881,8 @@ static int ac_layer_in_name_list(const char *name, const char *list)
 static int ac_layer_library_mapped(int pid, const char *library_path)
 {
     const char *base = strrchr(library_path, '/');
-    char path[64], line[PATH_MAX + 128];
+    char path[64], line[PATH_MAX + 128], resolved[PATH_MAX];
+    const char *want_full = NULL;   /* set when the manifest gives an absolute path */
     size_t blen;
     FILE *f;
     int hit = 0;
@@ -3890,6 +3891,13 @@ static int ac_layer_library_mapped(int pid, const char *library_path)
     blen = strlen(base);
     if (!blen)
         return 0;
+    /* An absolute manifest path names one specific file, so match that file
+     * (symlinks resolved -- /proc/<pid>/maps shows resolved paths) rather
+     * than any same-named library elsewhere. A bare name, or a relative
+     * path we have no manifest directory for, is resolved by dlopen's search
+     * path, so for those only the file name can be compared. */
+    if (library_path[0] == '/')
+        want_full = realpath(library_path, resolved) ? resolved : library_path;
     snprintf(path, sizeof(path), "/proc/%d/maps", pid);
     f = fopen(path, "r");
     if (!f)
@@ -3897,16 +3905,22 @@ static int ac_layer_library_mapped(int pid, const char *library_path)
     while (!hit && fgets(line, sizeof(line), f)) {
         char *file = strchr(line, '/');
         char *nl, *slash;
+        size_t flen;
 
         if (!file)
             continue;
         if ((nl = strchr(file, '\n')))
             *nl = '\0';
+        flen = strlen(file);
+        if (flen > 10 && strcmp(file + flen - 10, " (deleted)") == 0)
+            file[flen - 10] = '\0';
+        if (want_full) {
+            hit = strcmp(file, want_full) == 0;
+            continue;
+        }
         slash = strrchr(file, '/');
         file = slash ? slash + 1 : file;
-        if (strncmp(file, base, blen) == 0 &&
-            (file[blen] == '\0' || strcmp(file + blen, " (deleted)") == 0))
-            hit = 1;
+        hit = strcmp(file, base) == 0;
     }
     fclose(f);
     return hit;
