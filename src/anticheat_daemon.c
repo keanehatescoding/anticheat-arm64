@@ -3984,10 +3984,10 @@ static void ac_add_implicit_scan_dir(char dirs[][PATH_MAX],
     }
 }
 
-/* Splits a colon-separated path list (XDG_CONFIG_DIRS, XDG_DATA_DIRS,
- * VK_IMPLICIT_LAYER_PATH, ...) into individual entries, appending the
- * supplied suffix (e.g. "/vulkan/implicit_layer.d") to each. An empty
- * list yields nothing (caller applies its own default). */
+/* Splits a colon-separated path list (XDG_CONFIG_DIRS, XDG_DATA_DIRS, ...)
+ * into individual entries, appending the supplied suffix
+ * (e.g. "/vulkan/implicit_layer.d") to each. An empty list yields nothing
+ * (caller applies its own default). */
 static void ac_split_path_list(const char *list, const char *suffix,
                                char dirs[][PATH_MAX], unsigned int *ndirs)
 {
@@ -4068,11 +4068,10 @@ static int ac_scan_active_implicit_layers(int pid,
     if (have_vip) {
         /* VK_IMPLICIT_LAYER_PATH replaces the implicit search path when the
          * variable is present, even if it is empty (an empty replacement list
-         * disables implicit layers). Scan each entry both as a manifest
-         * directory (VK_LAYER_PATH style) and with the implicit_layer.d
-         * suffix, since either convention appears in practice. */
+         * disables implicit layers). Like VK_LAYER_PATH, each entry names a
+         * manifest directory directly: the loader does not append the
+         * implicit_layer.d suffix to these entries. */
         ac_split_path_list(vk_implicit_path, "", dirs, &ndirs);
-        ac_split_path_list(vk_implicit_path, "/vulkan/implicit_layer.d", dirs, &ndirs);
     } else {
         if (ac_resolve_pid_home(pid, home, sizeof(home)) == 0) {
             char cfg[PATH_MAX + 64];
@@ -4131,8 +4130,9 @@ static int ac_scan_active_implicit_layers(int pid,
         if (aq.found && aq.truncated)
             return -1;
         if (aq.found && aq.value[0]) {
+            /* Same as VK_IMPLICIT_LAYER_PATH: entries are manifest
+             * directories used as-is (no implicit_layer.d suffix). */
             ac_split_path_list(aq.value, "", dirs, &ndirs);
-            ac_split_path_list(aq.value, "/vulkan/implicit_layer.d", dirs, &ndirs);
         }
     }
 
