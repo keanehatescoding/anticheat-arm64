@@ -4065,11 +4065,12 @@ static int ac_scan_active_implicit_layers(int pid,
     if (q[3].found) { have_xdd = 1; snprintf(xdg_data_dirs, sizeof(xdg_data_dirs), "%s", q[3].value); }
     if (q[4].found) { have_vip = 1; snprintf(vk_implicit_path, sizeof(vk_implicit_path), "%s", q[4].value); }
 
-    if (have_vip && vk_implicit_path[0]) {
-        /* VK_IMPLICIT_LAYER_PATH replaces the implicit search path. Scan
-         * each entry both as a manifest directory (VK_LAYER_PATH style)
-         * and with the implicit_layer.d suffix, since either convention
-         * appears in practice. */
+    if (have_vip) {
+        /* VK_IMPLICIT_LAYER_PATH replaces the implicit search path when the
+         * variable is present, even if it is empty (an empty replacement list
+         * disables implicit layers). Scan each entry both as a manifest
+         * directory (VK_LAYER_PATH style) and with the implicit_layer.d
+         * suffix, since either convention appears in practice. */
         ac_split_path_list(vk_implicit_path, "", dirs, &ndirs);
         ac_split_path_list(vk_implicit_path, "/vulkan/implicit_layer.d", dirs, &ndirs);
     } else {
@@ -4141,11 +4142,16 @@ static int ac_scan_active_implicit_layers(int pid,
          * view so sandboxed/contained targets are inspected as they see
          * themselves rather than as the daemon's host namespace sees them.
          * /proc/<pid>/root is "/" when both share a view, so this is a
-         * no-op there. */
+         * no-op there. Relative entries (e.g. from VK_IMPLICIT_LAYER_PATH)
+         * are resolved against the target's working directory. */
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat-truncation"
-        snprintf(target_path, sizeof(target_path), "/proc/%d/root%s", pid,
-                 dirs[j]);
+        if (dirs[j][0] == '/')
+            snprintf(target_path, sizeof(target_path), "/proc/%d/root%s", pid,
+                     dirs[j]);
+        else
+            snprintf(target_path, sizeof(target_path), "/proc/%d/cwd/%s", pid,
+                     dirs[j]);
 #pragma GCC diagnostic pop
         ac_scan_implicit_layer_dir(target_path, found, &nfound);
     }
