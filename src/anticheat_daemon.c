@@ -4024,7 +4024,7 @@ static int ac_scan_active_implicit_layers(int pid,
     char home[PATH_MAX];
     char dirs[256][PATH_MAX];
     unsigned int ndirs = 0;
-    struct ac_environ_query q[5];
+    struct ac_environ_query q[6];
     char xdg_config_home[AC_ENVIRON_VAL_LEN];
     char xdg_data_home[AC_ENVIRON_VAL_LEN];
     char xdg_config_dirs[AC_ENVIRON_VAL_LEN];
@@ -4039,7 +4039,7 @@ static int ac_scan_active_implicit_layers(int pid,
     memset(xdg_data_dirs, 0, sizeof(xdg_data_dirs));
     memset(vk_implicit_path, 0, sizeof(vk_implicit_path));
 
-    for (j = 0; j < 5; j++) {
+    for (j = 0; j < 6; j++) {
         memset(&q[j], 0, sizeof(q[j]));
     }
     q[0].name = "XDG_CONFIG_HOME";
@@ -4047,15 +4047,16 @@ static int ac_scan_active_implicit_layers(int pid,
     q[2].name = "XDG_CONFIG_DIRS";
     q[3].name = "XDG_DATA_DIRS";
     q[4].name = "VK_IMPLICIT_LAYER_PATH";
+    q[5].name = "HOME";
 
     /* Read the target's own environ for XDG + VK_IMPLICIT_LAYER_PATH.
      * An incomplete read (failure or a value that didn't fit our buffer)
      * makes the whole scan inconclusive rather than silently treating
      * unknown settings as absent: the periodic caller then keeps its
      * previous baseline instead of replacing it with a partial result. */
-    if (ac_read_environ_vars(pid, q, 5) != 0)
+    if (ac_read_environ_vars(pid, q, 6) != 0)
         return -1;
-    for (j = 0; j < 5; j++) {
+    for (j = 0; j < 6; j++) {
         if (q[j].found && q[j].truncated)
             return -1;
     }
