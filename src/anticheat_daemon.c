@@ -4073,29 +4073,32 @@ static int ac_scan_active_implicit_layers(int pid,
          * implicit_layer.d suffix to these entries. */
         ac_split_path_list(vk_implicit_path, "", dirs, &ndirs);
     } else {
-        if (ac_resolve_pid_home(pid, home, sizeof(home)) == 0) {
-            char cfg[PATH_MAX + 64];
+        char cfg[PATH_MAX + 64];
+        /* A configured XDG home is usable without a passwd entry: the
+         * Vulkan loader honours it directly. Only look up the passwd home
+         * for a setting that is missing, and treat each setting
+         * independently. */
+        bool have_home = (ac_resolve_pid_home(pid, home, sizeof(home)) == 0);
 
+        if ((have_xch && xdg_config_home[0]) || have_home) {
             if (have_xch && xdg_config_home[0])
                 snprintf(cfg, sizeof(cfg), "%s", xdg_config_home);
             else
                 snprintf(cfg, sizeof(cfg), "%s/.config", home);
-            {
-                size_t cl = strlen(cfg);
-                if (cl + strlen("/vulkan/implicit_layer.d") < sizeof(cfg))
-                    snprintf(cfg + cl, sizeof(cfg) - cl, "/vulkan/implicit_layer.d");
-            }
+            size_t cl = strlen(cfg);
+            if (cl + strlen("/vulkan/implicit_layer.d") < sizeof(cfg))
+                snprintf(cfg + cl, sizeof(cfg) - cl, "/vulkan/implicit_layer.d");
             ac_add_implicit_scan_dir(dirs, &ndirs, cfg);
+        }
 
+        if ((have_xdh && xdg_data_home[0]) || have_home) {
             if (have_xdh && xdg_data_home[0])
                 snprintf(cfg, sizeof(cfg), "%s", xdg_data_home);
             else
                 snprintf(cfg, sizeof(cfg), "%s/.local/share", home);
-            {
-                size_t cl = strlen(cfg);
-                if (cl + strlen("/vulkan/implicit_layer.d") < sizeof(cfg))
-                    snprintf(cfg + cl, sizeof(cfg) - cl, "/vulkan/implicit_layer.d");
-            }
+            size_t cl = strlen(cfg);
+            if (cl + strlen("/vulkan/implicit_layer.d") < sizeof(cfg))
+                snprintf(cfg + cl, sizeof(cfg) - cl, "/vulkan/implicit_layer.d");
             ac_add_implicit_scan_dir(dirs, &ndirs, cfg);
         }
 
