@@ -4078,7 +4078,7 @@ static int ac_scan_active_implicit_layers(int pid,
          * Vulkan loader honours it directly. Only look up the passwd home
          * for a setting that is missing, and treat each setting
          * independently. */
-        bool have_home = (ac_resolve_pid_home(pid, home, sizeof(home)) == 0);
+        int have_home = (ac_resolve_pid_home(pid, home, sizeof(home)) == 0);
 
         if ((have_xch && xdg_config_home[0]) || have_home) {
             if (have_xch && xdg_config_home[0])
