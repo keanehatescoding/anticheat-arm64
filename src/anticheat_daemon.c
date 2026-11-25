@@ -4080,7 +4080,14 @@ static int ac_scan_active_implicit_layers(int pid,
          * independently. */
         int have_home = (ac_resolve_pid_home(pid, home, sizeof(home)) == 0);
 
-        if ((have_xch && xdg_config_home[0]) || have_home) {
+        /* The loader uses the target's HOME for a missing XDG home, not the
+         * passwd entry: a sandbox can override HOME independently. */
+        if (q[5].found && q[5].value[0])
+            snprintf(home, sizeof(home), "%s", q[5].value);
+        else if (!have_home)
+            home[0] = '\0';
+
+        if ((have_xch && xdg_config_home[0]) || home[0]) {
             if (have_xch && xdg_config_home[0])
                 snprintf(cfg, sizeof(cfg), "%s", xdg_config_home);
             else
@@ -4091,7 +4098,7 @@ static int ac_scan_active_implicit_layers(int pid,
             ac_add_implicit_scan_dir(dirs, &ndirs, cfg);
         }
 
-        if ((have_xdh && xdg_data_home[0]) || have_home) {
+        if ((have_xdh && xdg_data_home[0]) || home[0]) {
             if (have_xdh && xdg_data_home[0])
                 snprintf(cfg, sizeof(cfg), "%s", xdg_data_home);
             else
