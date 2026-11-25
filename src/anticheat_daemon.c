@@ -4000,8 +4000,10 @@ static void ac_split_path_list(const char *list, const char *suffix,
         size_t len = strcspn(p, ":");
         if (len > 0 && len < PATH_MAX) {
             snprintf(entry, sizeof(entry), "%.*s", (int)len, p);
-            /* trim trailing slash for clean suffix join */
-            while (entry[0] && entry[strlen(entry) - 1] == '/')
+            /* trim trailing slashes for a clean suffix join, but keep the
+             * root slash: "/" is a real directory, not an empty entry. */
+            while (entry[0] && entry[strlen(entry) - 1] == '/' &&
+                   strcmp(entry, "/") != 0)
                 entry[strlen(entry) - 1] = '\0';
             if (entry[0]) {
                 char full[PATH_MAX];
