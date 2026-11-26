@@ -4032,7 +4032,7 @@ static int ac_scan_active_implicit_layers(int pid,
 {
     struct ac_implicit_layer found[AC_MAX_IMPLICIT_LAYERS];
     unsigned int nfound = 0, nactive = 0, i;
-    char home[PATH_MAX];
+    char home[PATH_MAX] = "";
     char dirs[256][PATH_MAX];
     unsigned int ndirs = 0;
     struct ac_environ_query q[6];
@@ -4158,10 +4158,11 @@ static int ac_scan_active_implicit_layers(int pid,
         }
     }
 
-    /* Flatpak export directories are part of the loader's implicit search
-     * path regardless of XDG_DATA_DIRS (issue #112), so scan them on every
-     * path, not only when XDG_DATA_DIRS is unset. */
-    {
+    /* Flatpak export directories are part of the loader's default implicit
+     * search path (issue #112). They must be scanned regardless of
+     * XDG_DATA_DIRS, but a VK_IMPLICIT_LAYER_PATH replacement excludes all
+     * default locations - don't add them when that variable is set. */
+    if (!have_vip) {
         char fp[PATH_MAX + 64];
 
         if (have_xdh && xdg_data_home[0])
