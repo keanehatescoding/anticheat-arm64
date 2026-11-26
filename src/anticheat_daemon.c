@@ -3824,9 +3824,12 @@ static void ac_scan_implicit_layer_file(const char *path,
     free(buf);
 }
 
-static void ac_scan_implicit_layer_dir(const char *dir,
-                                        struct ac_implicit_layer *layers,
-                                        unsigned int *count)
+/* Returns 0 when the directory was scanned (or is simply absent) and -1
+ * when an existing directory could not be read: a partial scan must be
+ * reported as inconclusive rather than replacing a good baseline. */
+static int ac_scan_implicit_layer_dir(const char *dir,
+                                      struct ac_implicit_layer *layers,
+                                      unsigned int *count)
 {
     DIR *d;
     struct dirent *de;
@@ -3838,12 +3841,17 @@ static void ac_scan_implicit_layer_dir(const char *dir,
      * manifest directly. */
     if (stat(dir, &st) == 0 && S_ISREG(st.st_mode)) {
         ac_scan_implicit_layer_file(dir, layers, count);
-        return;
+        return 0;
     }
 
     d = opendir(dir);
-    if (!d)
-        return;
+    if (!d) {
+        /* Optional directories are allowed to be missing; a directory that
+         * exists but cannot be read is a real scan failure. */
+        if (errno == ENOENT || errno == ENOTDIR)
+            return 0;
+        return -1;
+    }
     while (*count < AC_MAX_IMPLICIT_LAYERS && (de = readdir(d)) != NULL) {
         char path[PATH_MAX];
         size_t namelen = strlen(de->d_name);
@@ -3873,6 +3881,7 @@ static void ac_scan_implicit_layer_dir(const char *dir,
         ac_scan_implicit_layer_file(path, layers, count);
     }
     closedir(d);
+    return 0;
 }
 
 /* True if `name` is an exact entry of a VK_INSTANCE_LAYERS-style list
@@ -4149,6 +4158,29 @@ static int ac_scan_active_implicit_layers(int pid,
         }
     }
 
+    /* Flatpak export directories are part of the loader's implicit search
+     * path regardless of XDG_DATA_DIRS (issue #112), so scan them on every
+     * path, not only when XDG_DATA_DIRS is unset. */
+    {
+        char fp[PATH_MAX + 64];
+
+        if (have_xdh && xdg_data_home[0])
+            snprintf(fp, sizeof(fp), "%s", xdg_data_home);
+        else if (home[0])
+            snprintf(fp, sizeof(fp), "%s/.local/share", home);
+        else
+            fp[0] = '\0';
+        if (fp[0]) {
+            size_t fl = strlen(fp);
+            if (fl + strlen("/flatpak/exports/share/vulkan/implicit_layer.d") < sizeof(fp))
+                snprintf(fp + fl, sizeof(fp) - fl,
+                         "/flatpak/exports/share/vulkan/implicit_layer.d");
+            ac_add_implicit_scan_dir(dirs, &ndirs, fp);
+        }
+        ac_add_implicit_scan_dir(dirs, &ndirs,
+            "/var/lib/flatpak/exports/share/vulkan/implicit_layer.d");
+    }
+
     for (j = 0; j < ndirs; j++) {
         char target_path[PATH_MAX + 64];
         /* Resolve the directory through the target process's own filesystem
@@ -4166,7 +4198,8 @@ static int ac_scan_active_implicit_layers(int pid,
             snprintf(target_path, sizeof(target_path), "/proc/%d/cwd/%s", pid,
                      dirs[j]);
 #pragma GCC diagnostic pop
-        ac_scan_implicit_layer_dir(target_path, found, &nfound);
+        if (ac_scan_implicit_layer_dir(target_path, found, &nfound) < 0)
+            return -1; /* inconclusive: do not publish a partial baseline */
     }
 
     for (i = 0; i < nfound && nactive < outcap; i++) {
