@@ -3399,6 +3399,64 @@ static void preload_mark_warned(int pid, unsigned long long st0)
     }
 }
 
+/* /proc/<pid>/environ larger than AC_ENVIRON_BUF is read as -1/EMSGSIZE.
+ * The checks that depend on it can't prove a variable is absent, so the
+ * result is inconclusive. Warn once per pid generation instead of silently
+ * skipping every cycle (#111). */
+static struct ac_preload_warned g_environ_trunc_warned[AC_MAX_PROTS];
+
+static void environ_trunc_warned_forget_stale(const struct ac_prot_list *pl)
+{
+    unsigned int i, j;
+
+    for (i = 0; i < AC_MAX_PROTS; i++) {
+        if (!g_environ_trunc_warned[i].in_use)
+            continue;
+        for (j = 0; j < pl->count; j++)
+            if (pl->items[j].pid == g_environ_trunc_warned[i].pid)
+                break;
+        if (j == pl->count)
+            g_environ_trunc_warned[i].in_use = 0;
+    }
+}
+
+static int environ_trunc_already_warned(int pid, unsigned long long st0)
+{
+    unsigned int i;
+
+    for (i = 0; i < AC_MAX_PROTS; i++) {
+        if (!g_environ_trunc_warned[i].in_use ||
+            g_environ_trunc_warned[i].pid != pid)
+            continue;
+        if (!g_environ_trunc_warned[i].have_starttime ||
+            st0 != g_environ_trunc_warned[i].starttime) {
+            g_environ_trunc_warned[i].in_use = 0;
+            return 0;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+static void environ_trunc_mark_warned(int pid, unsigned long long st0)
+{
+    unsigned int i, free_slot = AC_MAX_PROTS;
+
+    for (i = 0; i < AC_MAX_PROTS; i++) {
+        if (g_environ_trunc_warned[i].in_use &&
+            g_environ_trunc_warned[i].pid == pid)
+            return;
+        if (free_slot == AC_MAX_PROTS && !g_environ_trunc_warned[i].in_use)
+            free_slot = i;
+    }
+    if (free_slot != AC_MAX_PROTS) {
+        g_environ_trunc_warned[free_slot].pid = pid;
+        g_environ_trunc_warned[free_slot].starttime = st0;
+        g_environ_trunc_warned[free_slot].have_starttime = 1;
+        g_environ_trunc_warned[free_slot].in_use = 1;
+    }
+}
+
 static void check_ld_preload_periodic(void)
 {
     struct ac_prot_list pl;
@@ -3408,6 +3466,7 @@ static void check_ld_preload_periodic(void)
     if (ioctl(dev_fd, AC_IOCTL_LIST_PROTECTED, &pl) < 0)
         return;
     preload_warned_forget_stale(&pl);
+    environ_trunc_warned_forget_stale(&pl);
     for (i = 0; i < pl.count; i++) {
         char val[512];
         unsigned long long st0 = 0;
@@ -3416,8 +3475,25 @@ static void check_ld_preload_periodic(void)
             continue;   /* gone before the check; retry next period */
         if (preload_already_warned(pl.items[i].pid, st0))
             continue;
-        if (ac_read_ld_preload(pl.items[i].pid, val, sizeof(val)) != 1)
-            continue;
+        {
+            int lrc = ac_read_ld_preload(pl.items[i].pid, val, sizeof(val));
+
+            if (lrc < 0) {
+                if (errno == EMSGSIZE &&
+                    !environ_trunc_already_warned(pl.items[i].pid, st0) &&
+                    proc_same_generation(pl.items[i].pid, st0)) {
+                    logmsg(LOG_WARNING,
+                           "pid %d (%s): /proc/%d/environ exceeds %d bytes; "
+                           "LD_PRELOAD check inconclusive (not reported as clean)",
+                           pl.items[i].pid, pl.items[i].comm,
+                           pl.items[i].pid, AC_ENVIRON_BUF);
+                    environ_trunc_mark_warned(pl.items[i].pid, st0);
+                }
+                continue;
+            }
+            if (lrc != 1)
+                continue;
+        }
         if (!proc_same_generation(pl.items[i].pid, st0))
             continue;   /* exited/reused mid-check: val may be another
                          * generation's -- discard, retry next period */
@@ -3508,6 +3584,7 @@ static void check_vk_layers_periodic(void)
     if (ioctl(dev_fd, AC_IOCTL_LIST_PROTECTED, &pl) < 0)
         return;
     vklayer_warned_forget_stale(&pl);
+    environ_trunc_warned_forget_stale(&pl);
     for (i = 0; i < pl.count; i++) {
         struct ac_environ_query vars[AC_VK_LAYER_ENV_VARS_COUNT];
         unsigned long long st0 = 0;
@@ -3521,8 +3598,19 @@ static void check_vk_layers_periodic(void)
             vars[j].name = AC_VK_LAYER_ENV_VARS[j];
         }
         if (ac_read_environ_vars(pl.items[i].pid, vars,
-                                  AC_VK_LAYER_ENV_VARS_COUNT) < 0)
+                                  AC_VK_LAYER_ENV_VARS_COUNT) < 0) {
+            if (errno == EMSGSIZE &&
+                !environ_trunc_already_warned(pl.items[i].pid, st0) &&
+                proc_same_generation(pl.items[i].pid, st0)) {
+                logmsg(LOG_WARNING,
+                       "pid %d (%s): /proc/%d/environ exceeds %d bytes; "
+                       "Vulkan-layer environment check inconclusive (not reported as clean)",
+                       pl.items[i].pid, pl.items[i].comm,
+                       pl.items[i].pid, AC_ENVIRON_BUF);
+                environ_trunc_mark_warned(pl.items[i].pid, st0);
+            }
             continue;
+        }
         if (!proc_same_generation(pl.items[i].pid, st0))
             continue;   /* exited/reused mid-check: vars may be another
                          * generation's -- discard, retry next period */
