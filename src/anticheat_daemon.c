@@ -4039,6 +4039,7 @@ static int ac_split_path_list(const char *list, const char *suffix,
         if (*p == ':')
             p++;
     }
+    return 0;
 }
 
 static int ac_scan_active_implicit_layers(int pid,
