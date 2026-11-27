@@ -1784,6 +1784,9 @@ static const char *const AC_VK_LAYER_ENV_VARS[] = {
     "VK_LOADER_LAYERS_ENABLE",
     "VK_LAYER_PATH",
     "VK_ADD_LAYER_PATH",
+    "VK_IMPLICIT_LAYER_PATH",
+    "VK_ADD_IMPLICIT_LAYER_PATH",
+    "VK_LOADER_LAYERS_DISABLE",
 };
 #define AC_VK_LAYER_ENV_VARS_COUNT \
     (sizeof(AC_VK_LAYER_ENV_VARS) / sizeof(AC_VK_LAYER_ENV_VARS[0]))
@@ -3766,28 +3769,107 @@ static int ac_resolve_pid_home(int pid, char *home, size_t homesz)
  * A missing directory is the overwhelmingly common case (most machines
  * have none of these paths at all) and is silently skipped, not an
  * error. */
-static void ac_scan_implicit_layer_dir(const char *dir,
-                                        struct ac_implicit_layer *layers,
-                                        unsigned int *count)
+/* Parses a single Vulkan implicit-layer manifest file at `path` and appends
+ * it to layers[*count] when it has both "name" and "library_path". Used
+ * both for *.json entries found inside a scanned directory and for
+ * manifest files named directly by VK_IMPLICIT_LAYER_PATH /
+ * VK_ADD_IMPLICIT_LAYER_PATH (Vulkan-Loader v1.4.326 accepts file
+ * entries there and handles them separately from directory entries). */
+/* Returns 0 for a clean scan (including "not a manifest") and -1 when a
+ * manifest that looked readable could not actually be read. */
+static int ac_scan_implicit_layer_file(const char *path,
+                                       struct ac_implicit_layer *layers,
+                                       unsigned int *count)
+{
+    int fd;
+    struct stat st;
+    char *buf;
+    ssize_t n;
+    struct ac_implicit_layer *layer;
+
+    if (*count >= AC_MAX_IMPLICIT_LAYERS)
+        return 0;
+    fd = open(path, O_RDONLY | O_NONBLOCK);
+    if (fd < 0)
+        return 0;
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        return -1;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        close(fd);
+        return 0;
+    }
+    {
+        int fl = fcntl(fd, F_GETFL);
+        if (fl >= 0)
+            (void)fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+    }
+    buf = malloc(AC_MANIFEST_MAX_BYTES);
+    if (!buf) {
+        close(fd);
+        return -1;
+    }
+    n = read(fd, buf, AC_MANIFEST_MAX_BYTES - 1);
+    close(fd);
+    if (n <= 0) {
+        free(buf);
+        return n < 0 ? -1 : 0;
+    }
+    buf[n] = '\0';
+
+    layer = &layers[*count];
+    memset(layer, 0, sizeof(*layer));
+    if (json_extract_string(buf, (size_t)n, "name", layer->name, sizeof(layer->name)) &&
+        json_extract_string(buf, (size_t)n, "library_path", layer->library_path,
+                             sizeof(layer->library_path))) {
+        json_extract_disable_env(buf, (size_t)n, layer->disable_env,
+                                  sizeof(layer->disable_env));
+        (*count)++;
+    }
+    free(buf);
+    return 0;
+}
+
+/* Returns 0 when the directory was scanned (or is simply absent) and -1
+ * when an existing directory could not be read: a partial scan must be
+ * reported as inconclusive rather than replacing a good baseline. */
+static int ac_scan_implicit_layer_dir(const char *dir,
+                                      struct ac_implicit_layer *layers,
+                                      unsigned int *count)
 {
     DIR *d;
     struct dirent *de;
+    struct stat st;
+
+    /* A path that is itself a regular .json file is treated as a single
+     * manifest entry -- the loader accepts
+     * VK_IMPLICIT_LAYER_PATH=/opt/layers/custom.json. A non-.json regular
+     * file is NOT a manifest to the loader (it calls opendir on it), so it
+     * must not produce a false positive here. */
+    if (stat(dir, &st) == 0 && S_ISREG(st.st_mode) &&
+        strlen(dir) >= 5 && strcmp(dir + strlen(dir) - 5, ".json") == 0) {
+        return ac_scan_implicit_layer_file(dir, layers, count);
+    }
 
     d = opendir(dir);
-    if (!d)
-        return;
+    if (!d) {
+        /* Optional directories are allowed to be missing; a directory that
+         * exists but cannot be read is a real scan failure. */
+        if (errno == ENOENT || errno == ENOTDIR)
+            return 0;
+        return -1;
+    }
     while (*count < AC_MAX_IMPLICIT_LAYERS && (de = readdir(d)) != NULL) {
         char path[PATH_MAX];
         size_t namelen = strlen(de->d_name);
-        int fd;
-        struct stat st;
-        char *buf;
-        ssize_t n;
-        struct ac_implicit_layer *layer;
 
         if (namelen < 5 || strcmp(de->d_name + namelen - 5, ".json") != 0)
             continue;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
         snprintf(path, sizeof(path), "%s/%s", dir, de->d_name);
+#pragma GCC diagnostic pop
         /* Fix #97: two of the scanned directories live under the target
          * process's own home directory (attacker-writable). A `.json`-named
          * FIFO with no writer would hang a plain O_RDONLY open() forever,
@@ -3804,47 +3886,13 @@ static void ac_scan_implicit_layer_dir(const char *dir,
          * Following symlinks keeps detection parity with the loader; the
          * FIFO/special-file risk holds through a symlink too and is still
          * closed by the S_ISREG gate below. */
-        fd = open(path, O_RDONLY | O_NONBLOCK);
-        if (fd < 0)
-            continue;
-        if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
-            close(fd);
-            continue;
+        if (ac_scan_implicit_layer_file(path, layers, count) < 0) {
+            closedir(d);
+            return -1;
         }
-        /* O_NONBLOCK was only needed to make the FIFO-with-no-writer
-         * open() return instead of blocking; a regular file reads the
-         * same either way, but clear it so the subsequent read() has
-         * plain blocking semantics. */
-        {
-            int fl = fcntl(fd, F_GETFL);
-            if (fl >= 0)
-                (void)fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
-        }
-        buf = malloc(AC_MANIFEST_MAX_BYTES);
-        if (!buf) {
-            close(fd);
-            continue;
-        }
-        n = read(fd, buf, AC_MANIFEST_MAX_BYTES - 1);
-        close(fd);
-        if (n <= 0) {
-            free(buf);
-            continue;
-        }
-        buf[n] = '\0';
-
-        layer = &layers[*count];
-        memset(layer, 0, sizeof(*layer));
-        if (json_extract_string(buf, (size_t)n, "name", layer->name, sizeof(layer->name)) &&
-            json_extract_string(buf, (size_t)n, "library_path", layer->library_path,
-                                 sizeof(layer->library_path))) {
-            json_extract_disable_env(buf, (size_t)n, layer->disable_env,
-                                      sizeof(layer->disable_env));
-            (*count)++;
-        }
-        free(buf);
     }
     closedir(d);
+    return 0;
 }
 
 /* True if `name` is an exact entry of a VK_INSTANCE_LAYERS-style list
@@ -3935,26 +3983,261 @@ static int ac_layer_library_mapped(int pid, const char *library_path)
  * and not disabled via its own "disable_environment" variable (if the
  * manifest defines one) in the target's own environ. Returns the count
  * found (0 is normal and common). */
+/* Adds `dir` to the scan list if it isn't already present (XDG and the
+ * legacy hardcoded paths overlap, e.g. /usr/share appears both as a
+ * literal and via XDG_DATA_DIRS' default; scanning it twice would
+ * duplicate every system layer in the result). */
+/* Returns -1 when the directory list is full: silently dropping a path
+ * would make the resulting "conclusive" scan incomplete. */
+static int ac_add_implicit_scan_dir(char dirs[][PATH_MAX],
+                                    unsigned int *ndirs,
+                                    const char *dir)
+{
+    unsigned int i;
+
+    if (!dir || !dir[0])
+        return 0;
+    for (i = 0; i < *ndirs; i++)
+        if (strcmp(dirs[i], dir) == 0)
+            return 0;
+    if (*ndirs >= 256)
+        return -1;
+    snprintf(dirs[*ndirs], PATH_MAX, "%s", dir);
+    (*ndirs)++;
+    return 0;
+}
+
+/* Splits a colon-separated path list (XDG_CONFIG_DIRS, XDG_DATA_DIRS, ...)
+ * into individual entries, appending the supplied suffix
+ * (e.g. "/vulkan/implicit_layer.d") to each. An empty list yields nothing
+ * (caller applies its own default). */
+static int ac_split_path_list(const char *list, const char *suffix,
+                              char dirs[][PATH_MAX], unsigned int *ndirs)
+{
+    const char *p = list;
+    char entry[PATH_MAX];
+
+    if (!list || !list[0])
+        return 0;
+    while (*p) {
+        size_t len = strcspn(p, ":");
+        if (len > 0 && len < PATH_MAX) {
+            snprintf(entry, sizeof(entry), "%.*s", (int)len, p);
+            /* trim trailing slashes for a clean suffix join, but keep the
+             * root slash: "/" is a real directory, not an empty entry. */
+            while (entry[0] && entry[strlen(entry) - 1] == '/' &&
+                   strcmp(entry, "/") != 0)
+                entry[strlen(entry) - 1] = '\0';
+            if (entry[0]) {
+                char full[PATH_MAX];
+                snprintf(full, sizeof(full), "%s%s", entry, suffix ? suffix : "");
+                if (ac_add_implicit_scan_dir(dirs, ndirs, full) < 0)
+                    return -1;
+            }
+        }
+        p += len;
+        if (*p == ':')
+            p++;
+    }
+    return 0;
+}
+
 static int ac_scan_active_implicit_layers(int pid,
                                            struct ac_implicit_layer *out,
                                            unsigned int outcap)
 {
     struct ac_implicit_layer found[AC_MAX_IMPLICIT_LAYERS];
     unsigned int nfound = 0, nactive = 0, i;
-    char home[PATH_MAX];
+    char home[PATH_MAX] = "";
+    char dirs[256][PATH_MAX];
+    unsigned int ndirs = 0;
+    struct ac_environ_query q[6];
+    char xdg_config_home[AC_ENVIRON_VAL_LEN];
+    char xdg_data_home[AC_ENVIRON_VAL_LEN];
+    char xdg_config_dirs[AC_ENVIRON_VAL_LEN];
+    char xdg_data_dirs[AC_ENVIRON_VAL_LEN];
+    char vk_implicit_path[AC_ENVIRON_VAL_LEN];
+    int have_xch = 0, have_xdh = 0, have_xcd = 0, have_xdd = 0, have_vip = 0;
+    unsigned int j;
 
-    if (ac_resolve_pid_home(pid, home, sizeof(home)) == 0) {
-        char dir[PATH_MAX + 64];   /* home[] + the longest suffix below, with headroom */
+    memset(xdg_config_home, 0, sizeof(xdg_config_home));
+    memset(xdg_data_home, 0, sizeof(xdg_data_home));
+    memset(xdg_config_dirs, 0, sizeof(xdg_config_dirs));
+    memset(xdg_data_dirs, 0, sizeof(xdg_data_dirs));
+    memset(vk_implicit_path, 0, sizeof(vk_implicit_path));
 
-        snprintf(dir, sizeof(dir), "%s/.config/vulkan/implicit_layer.d", home);
-        ac_scan_implicit_layer_dir(dir, found, &nfound);
-        snprintf(dir, sizeof(dir), "%s/.local/share/vulkan/implicit_layer.d", home);
-        ac_scan_implicit_layer_dir(dir, found, &nfound);
+    for (j = 0; j < 6; j++) {
+        memset(&q[j], 0, sizeof(q[j]));
     }
-    ac_scan_implicit_layer_dir("/etc/vulkan/implicit_layer.d", found, &nfound);
-    ac_scan_implicit_layer_dir("/usr/local/etc/vulkan/implicit_layer.d", found, &nfound);
-    ac_scan_implicit_layer_dir("/usr/share/vulkan/implicit_layer.d", found, &nfound);
-    ac_scan_implicit_layer_dir("/usr/local/share/vulkan/implicit_layer.d", found, &nfound);
+    q[0].name = "XDG_CONFIG_HOME";
+    q[1].name = "XDG_DATA_HOME";
+    q[2].name = "XDG_CONFIG_DIRS";
+    q[3].name = "XDG_DATA_DIRS";
+    q[4].name = "VK_IMPLICIT_LAYER_PATH";
+    q[5].name = "HOME";
+
+    /* Read the target's own environ for XDG + VK_IMPLICIT_LAYER_PATH.
+     * An incomplete read (failure or a value that didn't fit our buffer)
+     * makes the whole scan inconclusive rather than silently treating
+     * unknown settings as absent: the periodic caller then keeps its
+     * previous baseline instead of replacing it with a partial result. */
+    if (ac_read_environ_vars(pid, q, 6) != 0)
+        return -1;
+    for (j = 0; j < 6; j++) {
+        if (q[j].found && q[j].truncated)
+            return -1;
+    }
+    if (q[0].found) { have_xch = 1; snprintf(xdg_config_home, sizeof(xdg_config_home), "%s", q[0].value); }
+    if (q[1].found) { have_xdh = 1; snprintf(xdg_data_home, sizeof(xdg_data_home), "%s", q[1].value); }
+    if (q[2].found) { have_xcd = 1; snprintf(xdg_config_dirs, sizeof(xdg_config_dirs), "%s", q[2].value); }
+    if (q[3].found) { have_xdd = 1; snprintf(xdg_data_dirs, sizeof(xdg_data_dirs), "%s", q[3].value); }
+    if (q[4].found) { have_vip = 1; snprintf(vk_implicit_path, sizeof(vk_implicit_path), "%s", q[4].value); }
+
+    if (have_vip) {
+        /* VK_IMPLICIT_LAYER_PATH replaces the implicit search path when the
+         * variable is present, even if it is empty (an empty replacement list
+         * disables implicit layers). Like VK_LAYER_PATH, each entry names a
+         * manifest directory directly: the loader does not append the
+         * implicit_layer.d suffix to these entries. */
+        if (ac_split_path_list(vk_implicit_path, "", dirs, &ndirs) < 0)
+            return -1;
+    } else {
+        char cfg[PATH_MAX + 64];
+        /* A configured XDG home is usable without a passwd entry: the
+         * Vulkan loader honours it directly. Only look up the passwd home
+         * for a setting that is missing, and treat each setting
+         * independently. */
+        int have_home = (ac_resolve_pid_home(pid, home, sizeof(home)) == 0);
+
+        /* The loader uses the target's HOME for a missing XDG home, not the
+         * passwd entry: a sandbox can override HOME independently. */
+        if (q[5].found && q[5].value[0])
+            snprintf(home, sizeof(home), "%s", q[5].value);
+        else if (!have_home)
+            home[0] = '\0';
+
+        if ((have_xch && xdg_config_home[0]) || home[0]) {
+            if (have_xch && xdg_config_home[0])
+                snprintf(cfg, sizeof(cfg), "%s", xdg_config_home);
+            else
+                snprintf(cfg, sizeof(cfg), "%s/.config", home);
+            size_t cl = strlen(cfg);
+            if (cl + strlen("/vulkan/implicit_layer.d") < sizeof(cfg))
+                snprintf(cfg + cl, sizeof(cfg) - cl, "/vulkan/implicit_layer.d");
+            if (ac_add_implicit_scan_dir(dirs, &ndirs, cfg) < 0)
+                return -1;
+        }
+
+        if ((have_xdh && xdg_data_home[0]) || home[0]) {
+            if (have_xdh && xdg_data_home[0])
+                snprintf(cfg, sizeof(cfg), "%s", xdg_data_home);
+            else
+                snprintf(cfg, sizeof(cfg), "%s/.local/share", home);
+            size_t cl = strlen(cfg);
+            if (cl + strlen("/vulkan/implicit_layer.d") < sizeof(cfg))
+                snprintf(cfg + cl, sizeof(cfg) - cl, "/vulkan/implicit_layer.d");
+            if (ac_add_implicit_scan_dir(dirs, &ndirs, cfg) < 0)
+                return -1;
+        }
+
+        if (have_xcd && xdg_config_dirs[0]) {
+            if (ac_split_path_list(xdg_config_dirs, "/vulkan/implicit_layer.d",
+                                   dirs, &ndirs) < 0)
+                return -1;
+        } else {
+            if (ac_add_implicit_scan_dir(dirs, &ndirs,
+                                         "/etc/xdg/vulkan/implicit_layer.d") < 0)
+                return -1;
+        }
+
+        if (have_xdd && xdg_data_dirs[0]) {
+            if (ac_split_path_list(xdg_data_dirs, "/vulkan/implicit_layer.d",
+                                   dirs, &ndirs) < 0)
+                return -1;
+        } else {
+            if (ac_split_path_list("/usr/local/share:/usr/share",
+                                   "/vulkan/implicit_layer.d", dirs, &ndirs) < 0)
+                return -1;
+        }
+
+        /* Legacy paths kept for compatibility with older loaders/setups. */
+        if (ac_add_implicit_scan_dir(dirs, &ndirs, "/etc/vulkan/implicit_layer.d") < 0)
+            return -1;
+        if (ac_add_implicit_scan_dir(dirs, &ndirs, "/usr/local/etc/vulkan/implicit_layer.d") < 0)
+            return -1;
+        if (ac_add_implicit_scan_dir(dirs, &ndirs, "/usr/share/vulkan/implicit_layer.d") < 0)
+            return -1;
+        if (ac_add_implicit_scan_dir(dirs, &ndirs, "/usr/local/share/vulkan/implicit_layer.d") < 0)
+            return -1;
+    }
+
+    /* Additive implicit layer path (mirrors VK_ADD_LAYER_PATH). Only
+     * consulted when VK_IMPLICIT_LAYER_PATH is not set: the loader gives
+     * the replacement variable precedence and ignores the additive one
+     * in that case, so adding its directories would surface manifests
+     * that the loader never actually loads. */
+    if (!have_vip) {
+        struct ac_environ_query aq;
+        memset(&aq, 0, sizeof(aq));
+        aq.name = "VK_ADD_IMPLICIT_LAYER_PATH";
+        if (ac_read_environ_vars(pid, &aq, 1) != 0)
+            return -1;
+        if (aq.found && aq.truncated)
+            return -1;
+        if (aq.found && aq.value[0]) {
+            /* Same as VK_IMPLICIT_LAYER_PATH: entries are manifest
+             * directories used as-is (no implicit_layer.d suffix). */
+            if (ac_split_path_list(aq.value, "", dirs, &ndirs) < 0)
+                return -1;
+        }
+    }
+
+    /* Flatpak export directories are part of the loader's default implicit
+     * search path (issue #112). They must be scanned regardless of
+     * XDG_DATA_DIRS, but a VK_IMPLICIT_LAYER_PATH replacement excludes all
+     * default locations - don't add them when that variable is set. */
+    if (!have_vip) {
+        char fp[PATH_MAX + 64];
+
+        if (have_xdh && xdg_data_home[0])
+            snprintf(fp, sizeof(fp), "%s", xdg_data_home);
+        else if (home[0])
+            snprintf(fp, sizeof(fp), "%s/.local/share", home);
+        else
+            fp[0] = '\0';
+        if (fp[0]) {
+            size_t fl = strlen(fp);
+            if (fl + strlen("/flatpak/exports/share/vulkan/implicit_layer.d") < sizeof(fp))
+                snprintf(fp + fl, sizeof(fp) - fl,
+                         "/flatpak/exports/share/vulkan/implicit_layer.d");
+            if (ac_add_implicit_scan_dir(dirs, &ndirs, fp) < 0)
+                return -1;
+        }
+        if (ac_add_implicit_scan_dir(dirs, &ndirs,
+              "/var/lib/flatpak/exports/share/vulkan/implicit_layer.d") < 0)
+            return -1;
+    }
+
+    for (j = 0; j < ndirs; j++) {
+        char target_path[PATH_MAX + 64];
+        /* Resolve the directory through the target process's own filesystem
+         * view so sandboxed/contained targets are inspected as they see
+         * themselves rather than as the daemon's host namespace sees them.
+         * /proc/<pid>/root is "/" when both share a view, so this is a
+         * no-op there. Relative entries (e.g. from VK_IMPLICIT_LAYER_PATH)
+         * are resolved against the target's working directory. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+        if (dirs[j][0] == '/')
+            snprintf(target_path, sizeof(target_path), "/proc/%d/root%s", pid,
+                     dirs[j]);
+        else
+            snprintf(target_path, sizeof(target_path), "/proc/%d/cwd/%s", pid,
+                     dirs[j]);
+#pragma GCC diagnostic pop
+        if (ac_scan_implicit_layer_dir(target_path, found, &nfound) < 0)
+            return -1; /* inconclusive: do not publish a partial baseline */
+    }
 
     for (i = 0; i < nfound && nactive < outcap; i++) {
         if (found[i].disable_env[0]) {
@@ -4001,7 +4284,11 @@ static int check_implicit_layers(int pid)
     int n = ac_scan_active_implicit_layers(pid, layers, AC_MAX_IMPLICIT_LAYERS);
     int i, unknown = 0;
 
-    if (n <= 0) {
+    if (n < 0) {
+        printf("  Implicit Vulkan-layer check: could not determine active layers (inconclusive)\n");
+        return -1;
+    }
+    if (n == 0) {
         printf("  Implicit Vulkan-layer check: none active for this process\n");
         return 0;
     }
@@ -4025,20 +4312,73 @@ static int check_implicit_layers(int pid)
  * VK layer env vars), which read something fixed at exec() time,
  * manifest files live on disk and can change while a session is
  * running -- so this re-scans every cycle rather than checking once per
- * pid, but only ever warns on *growth* of the unrecognized-layer count
+ * pid, but only ever warns when an unrecognized (name, library_path) pair appears
  * for a given pid, the same baseline-delta design as
  * anon_baseline_check(): a pid's already-active layers at first
  * observation are its baseline, not something to alert on, and only a
  * later increase (a new unrecognized layer appearing mid-session) is
  * the signal. */
+/* An unrecognized layer is identified by its name AND its library_path
+ * (issue #112): a layer that keeps its name but is repointed at a
+ * different library is a different layer, and keying on the name alone
+ * would let that swap through silently. */
+struct ac_implicit_layer_id {
+    char name[AC_MANIFEST_STR_LEN];
+    char lib[AC_MANIFEST_STR_LEN];
+};
+
 struct ac_implicit_layer_baseline {
     int                pid;
     unsigned long long starttime;       /* always known: callers bracket, see above */
     int                have_starttime;  /* 0 (unknown) always treated as a new generation */
     unsigned int       count;
+    unsigned int       nunknown;        /* number of unrecognized layer ids below */
+    struct ac_implicit_layer_id ids[AC_MAX_IMPLICIT_LAYERS];
     int                in_use;
 };
 static struct ac_implicit_layer_baseline g_implicit_layer_baseline[AC_MAX_PROTS];
+
+/* 1 if any id in cur[0..cur_n) is absent from base[0..base_n): a new
+ * layer, or a known name now backed by a different library. An id that
+ * is unchanged, or that merely disappeared, is not a change. */
+static int ac_implicit_ids_have_new(const struct ac_implicit_layer_id *cur,
+                                    unsigned int cur_n,
+                                    const struct ac_implicit_layer_id *base,
+                                    unsigned int base_n)
+{
+    unsigned int ci, bi;
+
+    for (ci = 0; ci < cur_n; ci++) {
+        int found = 0;
+
+        for (bi = 0; bi < base_n; bi++) {
+            if (strcmp(cur[ci].name, base[bi].name) == 0 &&
+                strcmp(cur[ci].lib, base[bi].lib) == 0) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found)
+            return 1;
+    }
+    return 0;
+}
+
+/* Store cur[0..n) as the baseline's ids, clearing the unused tail. */
+static void ac_implicit_baseline_store(struct ac_implicit_layer_baseline *b,
+                                       const struct ac_implicit_layer_id *cur,
+                                       unsigned int n)
+{
+    unsigned int k;
+
+    if (n > AC_MAX_IMPLICIT_LAYERS)
+        n = AC_MAX_IMPLICIT_LAYERS;
+    for (k = 0; k < n; k++)
+        b->ids[k] = cur[k];
+    for (k = n; k < AC_MAX_IMPLICIT_LAYERS; k++)
+        memset(&b->ids[k], 0, sizeof(b->ids[k]));
+    b->nunknown = n;
+}
 
 static void implicit_layer_baseline_forget_stale(const struct ac_prot_list *pl)
 {
@@ -4071,6 +4411,8 @@ static void check_implicit_layers_periodic(void)
         char names[512];
         size_t noff = 0;
         unsigned int unknown = 0, j, slot = AC_MAX_PROTS, free_slot = AC_MAX_PROTS;
+        struct ac_implicit_layer_id cur_ids[AC_MAX_IMPLICIT_LAYERS];
+        unsigned int cur_n = 0;
 
         if (proc_starttime(pl.items[i].pid, &st0) != 0)
             continue;   /* gone before the scan; retry next period */
@@ -4088,15 +4430,16 @@ static void check_implicit_layers_periodic(void)
             nm = layers[j].name[0] ? layers[j].name : "(unnamed)";
             noff += (size_t)snprintf(names + noff,
                                       noff < sizeof(names) ? sizeof(names) - noff : 0,
-                                      "%s%s", unknown ? ", " : "", nm);
-            /* snprintf() returns the length it would have written, not the
-             * length actually written -- clamp so noff never grows past
-             * sizeof(names), which would otherwise make `names + noff`
-             * (formed unconditionally next iteration) point more than one
-             * element past the array's end: UB per C11 6.5.6p8 even without
-             * a dereference. */
+                                      "%s%s [%s]", unknown ? ", " : "", nm,
+                                      layers[j].library_path);
             if (noff > sizeof(names))
                 noff = sizeof(names);
+            if (cur_n < AC_MAX_IMPLICIT_LAYERS) {
+                snprintf(cur_ids[cur_n].name, AC_MANIFEST_STR_LEN, "%.255s", nm);
+                snprintf(cur_ids[cur_n].lib, AC_MANIFEST_STR_LEN, "%.255s",
+                         layers[j].library_path);
+                cur_n++;
+            }
             unknown++;
         }
 
@@ -4115,6 +4458,8 @@ static void check_implicit_layers_periodic(void)
                     g_implicit_layer_baseline[j].starttime = cur_st;
                     g_implicit_layer_baseline[j].have_starttime = 1;
                     g_implicit_layer_baseline[j].count = unknown;
+                    ac_implicit_baseline_store(&g_implicit_layer_baseline[j],
+                                               cur_ids, cur_n);
                 }
                 slot = j;
                 break;
@@ -4128,16 +4473,29 @@ static void check_implicit_layers_periodic(void)
                 g_implicit_layer_baseline[free_slot].starttime = st0;
                 g_implicit_layer_baseline[free_slot].have_starttime = 1;
                 g_implicit_layer_baseline[free_slot].count = unknown;
+                ac_implicit_baseline_store(&g_implicit_layer_baseline[free_slot],
+                                           cur_ids, cur_n);
                 g_implicit_layer_baseline[free_slot].in_use = 1;
             }
             continue;
         }
-        if (unknown > g_implicit_layer_baseline[slot].count)
-            logmsg(LOG_WARNING, "pid %d (%s): %u unrecognized implicit Vulkan "
-                   "layer(s) active (%s) -- not in the known-overlay "
-                   "allowlist; informational only, not a verdict on its own",
-                   pl.items[i].pid, pl.items[i].comm, unknown, names);
+        {
+            /* A count-only baseline misses one unrecognized layer being
+             * swapped for another mid-session (same count, different set),
+             * and a name-only one misses a layer repointed at a different
+             * library under the same name. Compare (name, library_path)
+             * pairs: any pair in the current set that wasn't in the
+             * baseline is a change. */
+            if (ac_implicit_ids_have_new(cur_ids, cur_n,
+                                         g_implicit_layer_baseline[slot].ids,
+                                         g_implicit_layer_baseline[slot].nunknown))
+                logmsg(LOG_WARNING, "pid %d (%s): %u unrecognized implicit Vulkan "
+                       "layer(s) active (%s) -- not in the known-overlay "
+                       "allowlist; informational only, not a verdict on its own",
+                       pl.items[i].pid, pl.items[i].comm, unknown, names);
+        }
         g_implicit_layer_baseline[slot].count = unknown;
+        ac_implicit_baseline_store(&g_implicit_layer_baseline[slot], cur_ids, cur_n);
     }
 }
 
