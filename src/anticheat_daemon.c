@@ -4312,22 +4312,73 @@ static int check_implicit_layers(int pid)
  * VK layer env vars), which read something fixed at exec() time,
  * manifest files live on disk and can change while a session is
  * running -- so this re-scans every cycle rather than checking once per
- * pid, but only ever warns on *growth* of the unrecognized-layer count
+ * pid, but only ever warns when an unrecognized (name, library_path) pair appears
  * for a given pid, the same baseline-delta design as
  * anon_baseline_check(): a pid's already-active layers at first
  * observation are its baseline, not something to alert on, and only a
  * later increase (a new unrecognized layer appearing mid-session) is
  * the signal. */
+/* An unrecognized layer is identified by its name AND its library_path
+ * (issue #112): a layer that keeps its name but is repointed at a
+ * different library is a different layer, and keying on the name alone
+ * would let that swap through silently. */
+struct ac_implicit_layer_id {
+    char name[AC_MANIFEST_STR_LEN];
+    char lib[AC_MANIFEST_STR_LEN];
+};
+
 struct ac_implicit_layer_baseline {
     int                pid;
     unsigned long long starttime;       /* always known: callers bracket, see above */
     int                have_starttime;  /* 0 (unknown) always treated as a new generation */
     unsigned int       count;
-    unsigned int       nunknown;        /* number of unrecognized layer names below */
-    char               names[AC_MAX_IMPLICIT_LAYERS][AC_MANIFEST_STR_LEN];
+    unsigned int       nunknown;        /* number of unrecognized layer ids below */
+    struct ac_implicit_layer_id ids[AC_MAX_IMPLICIT_LAYERS];
     int                in_use;
 };
 static struct ac_implicit_layer_baseline g_implicit_layer_baseline[AC_MAX_PROTS];
+
+/* 1 if any id in cur[0..cur_n) is absent from base[0..base_n): a new
+ * layer, or a known name now backed by a different library. An id that
+ * is unchanged, or that merely disappeared, is not a change. */
+static int ac_implicit_ids_have_new(const struct ac_implicit_layer_id *cur,
+                                    unsigned int cur_n,
+                                    const struct ac_implicit_layer_id *base,
+                                    unsigned int base_n)
+{
+    unsigned int ci, bi;
+
+    for (ci = 0; ci < cur_n; ci++) {
+        int found = 0;
+
+        for (bi = 0; bi < base_n; bi++) {
+            if (strcmp(cur[ci].name, base[bi].name) == 0 &&
+                strcmp(cur[ci].lib, base[bi].lib) == 0) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found)
+            return 1;
+    }
+    return 0;
+}
+
+/* Store cur[0..n) as the baseline's ids, clearing the unused tail. */
+static void ac_implicit_baseline_store(struct ac_implicit_layer_baseline *b,
+                                       const struct ac_implicit_layer_id *cur,
+                                       unsigned int n)
+{
+    unsigned int k;
+
+    if (n > AC_MAX_IMPLICIT_LAYERS)
+        n = AC_MAX_IMPLICIT_LAYERS;
+    for (k = 0; k < n; k++)
+        b->ids[k] = cur[k];
+    for (k = n; k < AC_MAX_IMPLICIT_LAYERS; k++)
+        memset(&b->ids[k], 0, sizeof(b->ids[k]));
+    b->nunknown = n;
+}
 
 static void implicit_layer_baseline_forget_stale(const struct ac_prot_list *pl)
 {
@@ -4360,7 +4411,7 @@ static void check_implicit_layers_periodic(void)
         char names[512];
         size_t noff = 0;
         unsigned int unknown = 0, j, slot = AC_MAX_PROTS, free_slot = AC_MAX_PROTS;
-        char cur_names[AC_MAX_IMPLICIT_LAYERS][AC_MANIFEST_STR_LEN];
+        struct ac_implicit_layer_id cur_ids[AC_MAX_IMPLICIT_LAYERS];
         unsigned int cur_n = 0;
 
         if (proc_starttime(pl.items[i].pid, &st0) != 0)
@@ -4379,11 +4430,14 @@ static void check_implicit_layers_periodic(void)
             nm = layers[j].name[0] ? layers[j].name : "(unnamed)";
             noff += (size_t)snprintf(names + noff,
                                       noff < sizeof(names) ? sizeof(names) - noff : 0,
-                                      "%s%s", unknown ? ", " : "", nm);
+                                      "%s%s [%s]", unknown ? ", " : "", nm,
+                                      layers[j].library_path);
             if (noff > sizeof(names))
                 noff = sizeof(names);
             if (cur_n < AC_MAX_IMPLICIT_LAYERS) {
-                snprintf(cur_names[cur_n], AC_MANIFEST_STR_LEN, "%.255s", nm);
+                snprintf(cur_ids[cur_n].name, AC_MANIFEST_STR_LEN, "%.255s", nm);
+                snprintf(cur_ids[cur_n].lib, AC_MANIFEST_STR_LEN, "%.255s",
+                         layers[j].library_path);
                 cur_n++;
             }
             unknown++;
@@ -4404,17 +4458,8 @@ static void check_implicit_layers_periodic(void)
                     g_implicit_layer_baseline[j].starttime = cur_st;
                     g_implicit_layer_baseline[j].have_starttime = 1;
                     g_implicit_layer_baseline[j].count = unknown;
-                    g_implicit_layer_baseline[j].nunknown = cur_n;
-                    {
-                        unsigned int k;
-                        for (k = 0; k < cur_n && k < AC_MAX_IMPLICIT_LAYERS; k++) {
-                            snprintf(g_implicit_layer_baseline[j].names[k],
-                                     AC_MANIFEST_STR_LEN, "%.255s", cur_names[k]);
-                        }
-                        for (k = cur_n; k < AC_MAX_IMPLICIT_LAYERS; k++) {
-                            g_implicit_layer_baseline[j].names[k][0] = '\0';
-                        }
-                    }
+                    ac_implicit_baseline_store(&g_implicit_layer_baseline[j],
+                                               cur_ids, cur_n);
                 }
                 slot = j;
                 break;
@@ -4428,57 +4473,29 @@ static void check_implicit_layers_periodic(void)
                 g_implicit_layer_baseline[free_slot].starttime = st0;
                 g_implicit_layer_baseline[free_slot].have_starttime = 1;
                 g_implicit_layer_baseline[free_slot].count = unknown;
-                g_implicit_layer_baseline[free_slot].nunknown = cur_n;
-                {
-                    unsigned int k;
-                    for (k = 0; k < cur_n && k < AC_MAX_IMPLICIT_LAYERS; k++)
-                        snprintf(g_implicit_layer_baseline[free_slot].names[k],
-                                 AC_MANIFEST_STR_LEN, "%.255s", cur_names[k]);
-                    for (k = cur_n; k < AC_MAX_IMPLICIT_LAYERS; k++)
-                        g_implicit_layer_baseline[free_slot].names[k][0] = '\0';
-                }
+                ac_implicit_baseline_store(&g_implicit_layer_baseline[free_slot],
+                                           cur_ids, cur_n);
                 g_implicit_layer_baseline[free_slot].in_use = 1;
             }
             continue;
         }
         {
-            unsigned int bi, ki;
-            int changed = 0;
-
-            /* A count-only baseline misses the case where one unrecognized
-             * layer is swapped for a different one mid-session (same count,
-             * different set). Compare the actual sets instead: any layer in
-             * the current set that wasn't in the baseline is a change. */
-            for (ki = 0; ki < cur_n; ki++) {
-                int found = 0;
-                for (bi = 0; bi < g_implicit_layer_baseline[slot].nunknown; bi++) {
-                    if (strcmp(cur_names[ki],
-                               g_implicit_layer_baseline[slot].names[bi]) == 0) {
-                        found = 1;
-                        break;
-                    }
-                }
-                if (!found) {
-                    changed = 1;
-                    break;
-                }
-            }
-            if (changed)
+            /* A count-only baseline misses one unrecognized layer being
+             * swapped for another mid-session (same count, different set),
+             * and a name-only one misses a layer repointed at a different
+             * library under the same name. Compare (name, library_path)
+             * pairs: any pair in the current set that wasn't in the
+             * baseline is a change. */
+            if (ac_implicit_ids_have_new(cur_ids, cur_n,
+                                         g_implicit_layer_baseline[slot].ids,
+                                         g_implicit_layer_baseline[slot].nunknown))
                 logmsg(LOG_WARNING, "pid %d (%s): %u unrecognized implicit Vulkan "
                        "layer(s) active (%s) -- not in the known-overlay "
                        "allowlist; informational only, not a verdict on its own",
                        pl.items[i].pid, pl.items[i].comm, unknown, names);
         }
         g_implicit_layer_baseline[slot].count = unknown;
-        g_implicit_layer_baseline[slot].nunknown = cur_n;
-        {
-            unsigned int k;
-            for (k = 0; k < cur_n && k < AC_MAX_IMPLICIT_LAYERS; k++)
-                snprintf(g_implicit_layer_baseline[slot].names[k],
-                         AC_MANIFEST_STR_LEN, "%.255s", cur_names[k]);
-            for (k = cur_n; k < AC_MAX_IMPLICIT_LAYERS; k++)
-                g_implicit_layer_baseline[slot].names[k][0] = '\0';
-        }
+        ac_implicit_baseline_store(&g_implicit_layer_baseline[slot], cur_ids, cur_n);
     }
 }
 
