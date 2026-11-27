@@ -274,6 +274,12 @@ test/daemon_limits_test: test/daemon_limits_test.c src/anticheat_daemon.c src/sh
 integrity-scan-test: test/integrity_scan_test
 	./test/integrity_scan_test
 
+implicit-layer-baseline-test: test/implicit_layer_baseline_test
+	./test/implicit_layer_baseline_test
+
+test/implicit_layer_baseline_test: test/implicit_layer_baseline_test.c src/anticheat_daemon.c src/sha256.c src/sha256.h src/anticheat.h
+	$(CC) $(CFLAGS) -o $@ test/implicit_layer_baseline_test.c src/sha256.c $(LDFLAGS)
+
 test/integrity_scan_test: test/integrity_scan_test.c src/anticheat_daemon.c src/sha256.c src/sha256.h src/anticheat.h
 	$(CC) $(CFLAGS) -o $@ test/integrity_scan_test.c src/sha256.c $(LDFLAGS)
 
@@ -315,7 +321,7 @@ ci:
 	else \
 		echo "warning: aarch64-linux-gnu-gcc not installed -- skipping aarch64 cross-build (CI enforces it)"; \
 	fi
-	$(MAKE) CFLAGS="-O2 -Wall -Wextra -Werror" daemon mock baseline-test ac-report-status-test ac-report-url-test ac-report-cooldown-test daemon-limits-test daemon-reporting-test integrity-scan-test
+	$(MAKE) CFLAGS="-O2 -Wall -Wextra -Werror" daemon mock baseline-test ac-report-status-test ac-report-url-test ac-report-cooldown-test daemon-limits-test daemon-reporting-test integrity-scan-test implicit-layer-baseline-test
 	./test/mock_test.sh
 	$(MAKE) CFLAGS="-O2 -Wall -Wextra -Werror" priv-drop-test render-hook-test mount-ns-test ioctl-fuzz
 # Dry run only -- against the mock, not a real kernel module: proves the
@@ -519,4 +525,4 @@ install-deck: all
 uninstall-deck:
 	rm -rf "$(DECK_PREFIX)"
 
-.PHONY: all module daemon hooks mock test-mock priv-drop-test render-hook-test mount-ns-test thread-exit-migration-test thread-spawn-after-protect-test ptracer-nominate-test ioctl-fuzz baseline-test ac-report-status-test ac-report-url-test ac-report-cooldown-test daemon-limits-test daemon-reporting-test integrity-scan-test ci ci-aur-check ci-actions-pin-check clean install uninstall install-deck uninstall-deck
+.PHONY: all module daemon hooks mock test-mock priv-drop-test render-hook-test mount-ns-test thread-exit-migration-test thread-spawn-after-protect-test ptracer-nominate-test ioctl-fuzz baseline-test ac-report-status-test ac-report-url-test ac-report-cooldown-test daemon-limits-test daemon-reporting-test integrity-scan-test implicit-layer-baseline-test ci ci-aur-check ci-actions-pin-check clean install uninstall install-deck uninstall-deck

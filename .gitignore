@@ -28,6 +28,7 @@ test/ac_report_cooldown_test
 test/daemon_limits_test
 test/daemon_reporting_test
 test/integrity_scan_test
+test/implicit_layer_baseline_test
 
 # runtime state
 *.log
