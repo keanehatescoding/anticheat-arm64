@@ -3342,6 +3342,8 @@ struct ac_preload_warned {
     unsigned long long starttime;       /* always known: callers bracket, see above */
     int                have_starttime;  /* 0 (unknown) always treated as a new generation */
     int                in_use;
+    unsigned int       warned_mask;     /* AC_ENVIRON_TRUNC_* bits: per-check flags
+                                         * for g_environ_trunc_warned, unused elsewhere */
 };
 static struct ac_preload_warned g_preload_warned[AC_MAX_PROTS];
 
@@ -3405,6 +3407,12 @@ static void preload_mark_warned(int pid, unsigned long long st0)
  * skipping every cycle (#111). */
 static struct ac_preload_warned g_environ_trunc_warned[AC_MAX_PROTS];
 
+/* Oversized /proc/<pid>/environ affects both the LD_PRELOAD and the Vulkan
+ * checks, and each must warn once per pid generation independently: a single
+ * shared "warned" bit would let whichever check runs first suppress the other. */
+#define AC_ENVIRON_TRUNC_LD_PRELOAD 0x1u
+#define AC_ENVIRON_TRUNC_VK_LAYER   0x2u
+
 static void environ_trunc_warned_forget_stale(const struct ac_prot_list *pl)
 {
     unsigned int i, j;
@@ -3420,7 +3428,8 @@ static void environ_trunc_warned_forget_stale(const struct ac_prot_list *pl)
     }
 }
 
-static int environ_trunc_already_warned(int pid, unsigned long long st0)
+static int environ_trunc_already_warned(int pid, unsigned long long st0,
+                                        unsigned int check_bit)
 {
     unsigned int i;
 
@@ -3433,19 +3442,22 @@ static int environ_trunc_already_warned(int pid, unsigned long long st0)
             g_environ_trunc_warned[i].in_use = 0;
             return 0;
         }
-        return 1;
+        return (g_environ_trunc_warned[i].warned_mask & check_bit) != 0;
     }
     return 0;
 }
 
-static void environ_trunc_mark_warned(int pid, unsigned long long st0)
+static void environ_trunc_mark_warned(int pid, unsigned long long st0,
+                                      unsigned int check_bit)
 {
     unsigned int i, free_slot = AC_MAX_PROTS;
 
     for (i = 0; i < AC_MAX_PROTS; i++) {
         if (g_environ_trunc_warned[i].in_use &&
-            g_environ_trunc_warned[i].pid == pid)
+            g_environ_trunc_warned[i].pid == pid) {
+            g_environ_trunc_warned[i].warned_mask |= check_bit;
             return;
+        }
         if (free_slot == AC_MAX_PROTS && !g_environ_trunc_warned[i].in_use)
             free_slot = i;
     }
@@ -3453,6 +3465,7 @@ static void environ_trunc_mark_warned(int pid, unsigned long long st0)
         g_environ_trunc_warned[free_slot].pid = pid;
         g_environ_trunc_warned[free_slot].starttime = st0;
         g_environ_trunc_warned[free_slot].have_starttime = 1;
+        g_environ_trunc_warned[free_slot].warned_mask = check_bit;
         g_environ_trunc_warned[free_slot].in_use = 1;
     }
 }
@@ -3480,14 +3493,16 @@ static void check_ld_preload_periodic(void)
 
             if (lrc < 0) {
                 if (errno == EMSGSIZE &&
-                    !environ_trunc_already_warned(pl.items[i].pid, st0) &&
+                    !environ_trunc_already_warned(pl.items[i].pid, st0,
+                                                  AC_ENVIRON_TRUNC_LD_PRELOAD) &&
                     proc_same_generation(pl.items[i].pid, st0)) {
                     logmsg(LOG_WARNING,
                            "pid %d (%s): /proc/%d/environ exceeds %d bytes; "
                            "LD_PRELOAD check inconclusive (not reported as clean)",
                            pl.items[i].pid, pl.items[i].comm,
                            pl.items[i].pid, AC_ENVIRON_BUF);
-                    environ_trunc_mark_warned(pl.items[i].pid, st0);
+                    environ_trunc_mark_warned(pl.items[i].pid, st0,
+                                             AC_ENVIRON_TRUNC_LD_PRELOAD);
                 }
                 continue;
             }
@@ -3600,14 +3615,16 @@ static void check_vk_layers_periodic(void)
         if (ac_read_environ_vars(pl.items[i].pid, vars,
                                   AC_VK_LAYER_ENV_VARS_COUNT) < 0) {
             if (errno == EMSGSIZE &&
-                !environ_trunc_already_warned(pl.items[i].pid, st0) &&
+                !environ_trunc_already_warned(pl.items[i].pid, st0,
+                                              AC_ENVIRON_TRUNC_VK_LAYER) &&
                 proc_same_generation(pl.items[i].pid, st0)) {
                 logmsg(LOG_WARNING,
                        "pid %d (%s): /proc/%d/environ exceeds %d bytes; "
                        "Vulkan-layer environment check inconclusive (not reported as clean)",
                        pl.items[i].pid, pl.items[i].comm,
                        pl.items[i].pid, AC_ENVIRON_BUF);
-                environ_trunc_mark_warned(pl.items[i].pid, st0);
+                environ_trunc_mark_warned(pl.items[i].pid, st0,
+                                         AC_ENVIRON_TRUNC_VK_LAYER);
             }
             continue;
         }
