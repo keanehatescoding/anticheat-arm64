@@ -3775,9 +3775,11 @@ static int ac_resolve_pid_home(int pid, char *home, size_t homesz)
  * manifest files named directly by VK_IMPLICIT_LAYER_PATH /
  * VK_ADD_IMPLICIT_LAYER_PATH (Vulkan-Loader v1.4.326 accepts file
  * entries there and handles them separately from directory entries). */
-static void ac_scan_implicit_layer_file(const char *path,
-                                        struct ac_implicit_layer *layers,
-                                        unsigned int *count)
+/* Returns 0 for a clean scan (including "not a manifest") and -1 when a
+ * manifest that looked readable could not actually be read. */
+static int ac_scan_implicit_layer_file(const char *path,
+                                       struct ac_implicit_layer *layers,
+                                       unsigned int *count)
 {
     int fd;
     struct stat st;
@@ -3786,13 +3788,17 @@ static void ac_scan_implicit_layer_file(const char *path,
     struct ac_implicit_layer *layer;
 
     if (*count >= AC_MAX_IMPLICIT_LAYERS)
-        return;
+        return 0;
     fd = open(path, O_RDONLY | O_NONBLOCK);
     if (fd < 0)
-        return;
-    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        return 0;
+    if (fstat(fd, &st) != 0) {
         close(fd);
-        return;
+        return -1;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        close(fd);
+        return 0;
     }
     {
         int fl = fcntl(fd, F_GETFL);
@@ -3802,13 +3808,13 @@ static void ac_scan_implicit_layer_file(const char *path,
     buf = malloc(AC_MANIFEST_MAX_BYTES);
     if (!buf) {
         close(fd);
-        return;
+        return -1;
     }
     n = read(fd, buf, AC_MANIFEST_MAX_BYTES - 1);
     close(fd);
     if (n <= 0) {
         free(buf);
-        return;
+        return n < 0 ? -1 : 0;
     }
     buf[n] = '\0';
 
@@ -3822,6 +3828,7 @@ static void ac_scan_implicit_layer_file(const char *path,
         (*count)++;
     }
     free(buf);
+    return 0;
 }
 
 /* Returns 0 when the directory was scanned (or is simply absent) and -1
@@ -3835,13 +3842,14 @@ static int ac_scan_implicit_layer_dir(const char *dir,
     struct dirent *de;
     struct stat st;
 
-    /* A path that is itself a regular file (rather than a directory) is
-     * treated as a single manifest entry -- Vulkan-Loader accepts
-     * VK_IMPLICIT_LAYER_PATH=/opt/layers/custom.json and loads that
-     * manifest directly. */
-    if (stat(dir, &st) == 0 && S_ISREG(st.st_mode)) {
-        ac_scan_implicit_layer_file(dir, layers, count);
-        return 0;
+    /* A path that is itself a regular .json file is treated as a single
+     * manifest entry -- the loader accepts
+     * VK_IMPLICIT_LAYER_PATH=/opt/layers/custom.json. A non-.json regular
+     * file is NOT a manifest to the loader (it calls opendir on it), so it
+     * must not produce a false positive here. */
+    if (stat(dir, &st) == 0 && S_ISREG(st.st_mode) &&
+        strlen(dir) >= 5 && strcmp(dir + strlen(dir) - 5, ".json") == 0) {
+        return ac_scan_implicit_layer_file(dir, layers, count);
     }
 
     d = opendir(dir);
@@ -3878,7 +3886,10 @@ static int ac_scan_implicit_layer_dir(const char *dir,
          * Following symlinks keeps detection parity with the loader; the
          * FIFO/special-file risk holds through a symlink too and is still
          * closed by the S_ISREG gate below. */
-        ac_scan_implicit_layer_file(path, layers, count);
+        if (ac_scan_implicit_layer_file(path, layers, count) < 0) {
+            closedir(d);
+            return -1;
+        }
     }
     closedir(d);
     return 0;
@@ -3976,35 +3987,38 @@ static int ac_layer_library_mapped(int pid, const char *library_path)
  * legacy hardcoded paths overlap, e.g. /usr/share appears both as a
  * literal and via XDG_DATA_DIRS' default; scanning it twice would
  * duplicate every system layer in the result). */
-static void ac_add_implicit_scan_dir(char dirs[][PATH_MAX],
-                                     unsigned int *ndirs,
-                                     const char *dir)
+/* Returns -1 when the directory list is full: silently dropping a path
+ * would make the resulting "conclusive" scan incomplete. */
+static int ac_add_implicit_scan_dir(char dirs[][PATH_MAX],
+                                    unsigned int *ndirs,
+                                    const char *dir)
 {
     unsigned int i;
 
     if (!dir || !dir[0])
-        return;
+        return 0;
     for (i = 0; i < *ndirs; i++)
         if (strcmp(dirs[i], dir) == 0)
-            return;
-    if (*ndirs < 256) {
-        snprintf(dirs[*ndirs], PATH_MAX, "%s", dir);
-        (*ndirs)++;
-    }
+            return 0;
+    if (*ndirs >= 256)
+        return -1;
+    snprintf(dirs[*ndirs], PATH_MAX, "%s", dir);
+    (*ndirs)++;
+    return 0;
 }
 
 /* Splits a colon-separated path list (XDG_CONFIG_DIRS, XDG_DATA_DIRS, ...)
  * into individual entries, appending the supplied suffix
  * (e.g. "/vulkan/implicit_layer.d") to each. An empty list yields nothing
  * (caller applies its own default). */
-static void ac_split_path_list(const char *list, const char *suffix,
-                               char dirs[][PATH_MAX], unsigned int *ndirs)
+static int ac_split_path_list(const char *list, const char *suffix,
+                              char dirs[][PATH_MAX], unsigned int *ndirs)
 {
     const char *p = list;
     char entry[PATH_MAX];
 
     if (!list || !list[0])
-        return;
+        return 0;
     while (*p) {
         size_t len = strcspn(p, ":");
         if (len > 0 && len < PATH_MAX) {
@@ -4017,7 +4031,8 @@ static void ac_split_path_list(const char *list, const char *suffix,
             if (entry[0]) {
                 char full[PATH_MAX];
                 snprintf(full, sizeof(full), "%s%s", entry, suffix ? suffix : "");
-                ac_add_implicit_scan_dir(dirs, ndirs, full);
+                if (ac_add_implicit_scan_dir(dirs, ndirs, full) < 0)
+                    return -1;
             }
         }
         p += len;
@@ -4083,7 +4098,8 @@ static int ac_scan_active_implicit_layers(int pid,
          * disables implicit layers). Like VK_LAYER_PATH, each entry names a
          * manifest directory directly: the loader does not append the
          * implicit_layer.d suffix to these entries. */
-        ac_split_path_list(vk_implicit_path, "", dirs, &ndirs);
+        if (ac_split_path_list(vk_implicit_path, "", dirs, &ndirs) < 0)
+            return -1;
     } else {
         char cfg[PATH_MAX + 64];
         /* A configured XDG home is usable without a passwd entry: the
@@ -4107,7 +4123,8 @@ static int ac_scan_active_implicit_layers(int pid,
             size_t cl = strlen(cfg);
             if (cl + strlen("/vulkan/implicit_layer.d") < sizeof(cfg))
                 snprintf(cfg + cl, sizeof(cfg) - cl, "/vulkan/implicit_layer.d");
-            ac_add_implicit_scan_dir(dirs, &ndirs, cfg);
+            if (ac_add_implicit_scan_dir(dirs, &ndirs, cfg) < 0)
+                return -1;
         }
 
         if ((have_xdh && xdg_data_home[0]) || home[0]) {
@@ -4118,24 +4135,39 @@ static int ac_scan_active_implicit_layers(int pid,
             size_t cl = strlen(cfg);
             if (cl + strlen("/vulkan/implicit_layer.d") < sizeof(cfg))
                 snprintf(cfg + cl, sizeof(cfg) - cl, "/vulkan/implicit_layer.d");
-            ac_add_implicit_scan_dir(dirs, &ndirs, cfg);
+            if (ac_add_implicit_scan_dir(dirs, &ndirs, cfg) < 0)
+                return -1;
         }
 
-        if (have_xcd && xdg_config_dirs[0])
-            ac_split_path_list(xdg_config_dirs, "/vulkan/implicit_layer.d", dirs, &ndirs);
-        else
-            ac_add_implicit_scan_dir(dirs, &ndirs, "/etc/xdg/vulkan/implicit_layer.d");
+        if (have_xcd && xdg_config_dirs[0]) {
+            if (ac_split_path_list(xdg_config_dirs, "/vulkan/implicit_layer.d",
+                                   dirs, &ndirs) < 0)
+                return -1;
+        } else {
+            if (ac_add_implicit_scan_dir(dirs, &ndirs,
+                                         "/etc/xdg/vulkan/implicit_layer.d") < 0)
+                return -1;
+        }
 
-        if (have_xdd && xdg_data_dirs[0])
-            ac_split_path_list(xdg_data_dirs, "/vulkan/implicit_layer.d", dirs, &ndirs);
-        else
-            ac_split_path_list("/usr/local/share:/usr/share", "/vulkan/implicit_layer.d", dirs, &ndirs);
+        if (have_xdd && xdg_data_dirs[0]) {
+            if (ac_split_path_list(xdg_data_dirs, "/vulkan/implicit_layer.d",
+                                   dirs, &ndirs) < 0)
+                return -1;
+        } else {
+            if (ac_split_path_list("/usr/local/share:/usr/share",
+                                   "/vulkan/implicit_layer.d", dirs, &ndirs) < 0)
+                return -1;
+        }
 
         /* Legacy paths kept for compatibility with older loaders/setups. */
-        ac_add_implicit_scan_dir(dirs, &ndirs, "/etc/vulkan/implicit_layer.d");
-        ac_add_implicit_scan_dir(dirs, &ndirs, "/usr/local/etc/vulkan/implicit_layer.d");
-        ac_add_implicit_scan_dir(dirs, &ndirs, "/usr/share/vulkan/implicit_layer.d");
-        ac_add_implicit_scan_dir(dirs, &ndirs, "/usr/local/share/vulkan/implicit_layer.d");
+        if (ac_add_implicit_scan_dir(dirs, &ndirs, "/etc/vulkan/implicit_layer.d") < 0)
+            return -1;
+        if (ac_add_implicit_scan_dir(dirs, &ndirs, "/usr/local/etc/vulkan/implicit_layer.d") < 0)
+            return -1;
+        if (ac_add_implicit_scan_dir(dirs, &ndirs, "/usr/share/vulkan/implicit_layer.d") < 0)
+            return -1;
+        if (ac_add_implicit_scan_dir(dirs, &ndirs, "/usr/local/share/vulkan/implicit_layer.d") < 0)
+            return -1;
     }
 
     /* Additive implicit layer path (mirrors VK_ADD_LAYER_PATH). Only
@@ -4154,7 +4186,8 @@ static int ac_scan_active_implicit_layers(int pid,
         if (aq.found && aq.value[0]) {
             /* Same as VK_IMPLICIT_LAYER_PATH: entries are manifest
              * directories used as-is (no implicit_layer.d suffix). */
-            ac_split_path_list(aq.value, "", dirs, &ndirs);
+            if (ac_split_path_list(aq.value, "", dirs, &ndirs) < 0)
+                return -1;
         }
     }
 
@@ -4176,10 +4209,12 @@ static int ac_scan_active_implicit_layers(int pid,
             if (fl + strlen("/flatpak/exports/share/vulkan/implicit_layer.d") < sizeof(fp))
                 snprintf(fp + fl, sizeof(fp) - fl,
                          "/flatpak/exports/share/vulkan/implicit_layer.d");
-            ac_add_implicit_scan_dir(dirs, &ndirs, fp);
+            if (ac_add_implicit_scan_dir(dirs, &ndirs, fp) < 0)
+                return -1;
         }
-        ac_add_implicit_scan_dir(dirs, &ndirs,
-            "/var/lib/flatpak/exports/share/vulkan/implicit_layer.d");
+        if (ac_add_implicit_scan_dir(dirs, &ndirs,
+              "/var/lib/flatpak/exports/share/vulkan/implicit_layer.d") < 0)
+            return -1;
     }
 
     for (j = 0; j < ndirs; j++) {
