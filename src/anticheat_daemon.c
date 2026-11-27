@@ -3775,8 +3775,12 @@ static int ac_resolve_pid_home(int pid, char *home, size_t homesz)
  * manifest files named directly by VK_IMPLICIT_LAYER_PATH /
  * VK_ADD_IMPLICIT_LAYER_PATH (Vulkan-Loader v1.4.326 accepts file
  * entries there and handles them separately from directory entries). */
-/* Returns 0 for a clean scan (including "not a manifest") and -1 when a
- * manifest that looked readable could not actually be read. */
+/* Returns 0 for a clean scan (including "not a manifest") and -1 when the
+ * scan cannot be trusted to be complete: a manifest that looked readable
+ * could not actually be read, or a valid manifest turned up after
+ * layers[] was already full. Silently dropping that manifest would let an
+ * attacker-writable directory padded with decoy manifests push a real
+ * layer off the end of the list and still get a "conclusive" result. */
 static int ac_scan_implicit_layer_file(const char *path,
                                        struct ac_implicit_layer *layers,
                                        unsigned int *count)
@@ -3785,10 +3789,8 @@ static int ac_scan_implicit_layer_file(const char *path,
     struct stat st;
     char *buf;
     ssize_t n;
-    struct ac_implicit_layer *layer;
+    struct ac_implicit_layer parsed;
 
-    if (*count >= AC_MAX_IMPLICIT_LAYERS)
-        return 0;
     fd = open(path, O_RDONLY | O_NONBLOCK);
     if (fd < 0)
         return 0;
@@ -3818,14 +3820,17 @@ static int ac_scan_implicit_layer_file(const char *path,
     }
     buf[n] = '\0';
 
-    layer = &layers[*count];
-    memset(layer, 0, sizeof(*layer));
-    if (json_extract_string(buf, (size_t)n, "name", layer->name, sizeof(layer->name)) &&
-        json_extract_string(buf, (size_t)n, "library_path", layer->library_path,
-                             sizeof(layer->library_path))) {
-        json_extract_disable_env(buf, (size_t)n, layer->disable_env,
-                                  sizeof(layer->disable_env));
-        (*count)++;
+    memset(&parsed, 0, sizeof(parsed));
+    if (json_extract_string(buf, (size_t)n, "name", parsed.name, sizeof(parsed.name)) &&
+        json_extract_string(buf, (size_t)n, "library_path", parsed.library_path,
+                             sizeof(parsed.library_path))) {
+        json_extract_disable_env(buf, (size_t)n, parsed.disable_env,
+                                  sizeof(parsed.disable_env));
+        if (*count >= AC_MAX_IMPLICIT_LAYERS) {
+            free(buf);
+            return -1;   /* one more valid layer than we can hold */
+        }
+        layers[(*count)++] = parsed;
     }
     free(buf);
     return 0;
@@ -3860,7 +3865,7 @@ static int ac_scan_implicit_layer_dir(const char *dir,
             return 0;
         return -1;
     }
-    while (*count < AC_MAX_IMPLICIT_LAYERS && (de = readdir(d)) != NULL) {
+    while ((de = readdir(d)) != NULL) {
         char path[PATH_MAX];
         size_t namelen = strlen(de->d_name);
 
