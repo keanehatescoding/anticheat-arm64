@@ -72,7 +72,7 @@ int main(void)
         n.inode   = 0x123456789abcULL;
         n.flags   = (unsigned long)(AC_VM_EXEC | AC_VM_WRITE);
         if (sizeof(unsigned long) == 8)
-            n.flags |= 1UL << 36;   /* arm64-only high VM bit: dropped */
+            n.flags |= (unsigned long)(1ULL << 36); /* arm64-only high VM bit: dropped */
         n.is_file = 1;
         strcpy(n.path, "/usr/lib/libexample.so");
 
