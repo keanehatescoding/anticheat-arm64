@@ -62,6 +62,7 @@
 #include <linux/mempool.h>
 #include <linux/cred.h>
 #include <linux/capability.h>
+#include <linux/compat.h>
 #include <linux/ptrace.h>
 #include <linux/prctl.h>
 #include <linux/err.h>
@@ -2848,6 +2849,27 @@ static int ac_build_mod_snapshot(struct ac_fd_state *st)
 /* ------------------------------------------------------------------ */
 /* ioctl / misc device                                                 */
 /* ------------------------------------------------------------------ */
+
+/* Copy snapshot entry `index` of this fd's VMA scan into *out. Shared by
+ * the native and compat AC_IOCTL_SCAN_GET paths so both apply the same
+ * locking and bounds check. */
+static int ac_scan_fetch(struct file *file, unsigned int index,
+                         struct ac_vma_info *out)
+{
+    struct ac_fd_state *st = smp_load_acquire(&file->private_data);
+    int rc = 0;
+
+    if (!st)
+        return -EINVAL;
+    mutex_lock(&st->lock);
+    if (index >= st->n_vmas)
+        rc = -EINVAL;
+    else
+        *out = st->vmas[index];
+    mutex_unlock(&st->lock);
+    return rc;
+}
+
 static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     void __user *uarg = (void __user *)arg;
@@ -2950,21 +2972,11 @@ static long ac_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     }
     case AC_IOCTL_SCAN_GET: {
         struct ac_scan_get g;
-        struct ac_fd_state *st = smp_load_acquire(&file->private_data);
-        int rc = 0;
+        int rc;
 
         if (copy_from_user(&g, uarg, sizeof(g)))
             return -EFAULT;
-        if (!st) {
-            rc = -EINVAL;
-        } else {
-            mutex_lock(&st->lock);
-            if (g.index >= st->n_vmas)
-                rc = -EINVAL;
-            else
-                g.vma = st->vmas[g.index];
-            mutex_unlock(&st->lock);
-        }
+        rc = ac_scan_fetch(file, g.index, &g.vma);
         if (rc)
             return rc;
         if (copy_to_user(uarg, &g, sizeof(g)))
@@ -3174,11 +3186,54 @@ static int ac_release(struct inode *inode, struct file *file)
     return 0;
 }
 
+#ifdef CONFIG_COMPAT
+/* 32-bit (AArch32) callers of the control device (#80). The detection side
+ * already treats 32-bit tasks as in scope; without this every ioctl from
+ * one failed with -ENOTTY before ac_ioctl() ran.
+ *
+ * Every command except AC_IOCTL_SCAN_GET has an identical struct layout
+ * for both ABIs (all-fixed-width types), so it only needs the user
+ * pointer converted via compat_ptr() -- compat_ptr_ioctl() does exactly
+ * that and calls ac_ioctl(). struct ac_vma_info's native-width `flags`
+ * makes SCAN_GET differ (see struct ac_scan_get32 in anticheat.h), so it
+ * is translated here. The same CAP_SYS_ADMIN re-check as ac_ioctl() runs
+ * first: the translated path must not be a way around it. */
+static long ac_compat_ioctl(struct file *file, unsigned int cmd,
+                            unsigned long arg)
+{
+    struct ac_scan_get32 g;
+    struct ac_vma_info vma;
+    void __user *uarg;
+    int rc;
+
+    if (cmd != AC_IOCTL_SCAN_GET32)
+        return compat_ptr_ioctl(file, cmd, arg);
+
+    if (!capable(CAP_SYS_ADMIN))
+        return -EPERM;
+
+    uarg = compat_ptr(arg);
+    if (copy_from_user(&g, uarg, sizeof(g)))
+        return -EFAULT;
+    rc = ac_scan_fetch(file, g.index, &vma);
+    if (rc)
+        return rc;
+    memset(&g.vma, 0, sizeof(g.vma));
+    ac_vma_info_to32(&g.vma, &vma);
+    if (copy_to_user(uarg, &g, sizeof(g)))
+        return -EFAULT;
+    return 0;
+}
+#endif /* CONFIG_COMPAT */
+
 static const struct file_operations ac_fops = {
     .owner = THIS_MODULE,
     .open = ac_open,
     .release = ac_release,
     .unlocked_ioctl = ac_ioctl,
+#ifdef CONFIG_COMPAT
+    .compat_ioctl = ac_compat_ioctl,
+#endif
 };
 
 static struct miscdevice ac_misc = {
