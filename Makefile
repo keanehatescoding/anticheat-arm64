@@ -189,6 +189,15 @@ ioctl-fuzz: test/ioctl_fuzz
 test/ioctl_fuzz: test/ioctl_fuzz.c src/anticheat.h
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
+# 32-bit control-device layout contract (#80): AArch32 layout of
+# AC_IOCTL_SCAN_GET plus the native->compat conversion the module's
+# .compat_ioctl uses. Pure userspace; the module itself isn't built here.
+compat-ioctl-layout-test: test/compat_ioctl_layout_test
+	./test/compat_ioctl_layout_test
+
+test/compat_ioctl_layout_test: test/compat_ioctl_layout_test.c src/anticheat.h
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
 # baseline-file unit test (#51): pulls anticheat_daemon.c in directly (no
 # kernel/mock scan involved -- baseline_save_record()/baseline_load_records()/
 # baseline_find_record() are pure file I/O) and proves a second (inode,
@@ -321,7 +330,7 @@ ci:
 	else \
 		echo "warning: aarch64-linux-gnu-gcc not installed -- skipping aarch64 cross-build (CI enforces it)"; \
 	fi
-	$(MAKE) CFLAGS="-O2 -Wall -Wextra -Werror" daemon mock baseline-test ac-report-status-test ac-report-url-test ac-report-cooldown-test daemon-limits-test daemon-reporting-test integrity-scan-test implicit-layer-baseline-test
+	$(MAKE) CFLAGS="-O2 -Wall -Wextra -Werror" daemon mock baseline-test ac-report-status-test ac-report-url-test ac-report-cooldown-test daemon-limits-test daemon-reporting-test integrity-scan-test implicit-layer-baseline-test compat-ioctl-layout-test
 	./test/mock_test.sh
 	$(MAKE) CFLAGS="-O2 -Wall -Wextra -Werror" priv-drop-test render-hook-test mount-ns-test ioctl-fuzz
 # Dry run only -- against the mock, not a real kernel module: proves the
@@ -466,7 +475,7 @@ ci-aur-check:
 
 clean:
 	@if [ -d "$(KDIR)" ]; then $(MAKE) -C "$(KDIR)" M="$(PWD)" clean; fi
-	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test test/mount_ns_probe test/anon_exec_test test/thread_exit_migration_test test/thread_spawn_after_protect_test test/ptracer_nominate_test test/ioctl_fuzz test/baseline_test test/ac_report_status_test test/ac_report_url_test test/ac_report_cooldown_test test/daemon_limits_test test/daemon_reporting_test test/integrity_scan_test test/implicit_layer_baseline_test
+	rm -f anticheat test/libmock_anticheat.so test/priv_drop_test test/render_hook_test test/mount_ns_probe test/anon_exec_test test/thread_exit_migration_test test/thread_spawn_after_protect_test test/ptracer_nominate_test test/ioctl_fuzz test/baseline_test test/ac_report_status_test test/ac_report_url_test test/ac_report_cooldown_test test/daemon_limits_test test/daemon_reporting_test test/integrity_scan_test test/implicit_layer_baseline_test test/compat_ioctl_layout_test
 
 install: all
 	@if [ -z "$(DESTDIR)" ] && [ "$$(id -u)" -ne 0 ]; then echo "error: 'make install' writes to /usr/local and /lib/modules -- run as root, or set DESTDIR= for a staged/packaging install"; exit 1; fi
@@ -525,4 +534,4 @@ install-deck: all
 uninstall-deck:
 	rm -rf "$(DECK_PREFIX)"
 
-.PHONY: all module daemon hooks mock test-mock priv-drop-test render-hook-test mount-ns-test thread-exit-migration-test thread-spawn-after-protect-test ptracer-nominate-test ioctl-fuzz baseline-test ac-report-status-test ac-report-url-test ac-report-cooldown-test daemon-limits-test daemon-reporting-test integrity-scan-test implicit-layer-baseline-test ci ci-aur-check ci-actions-pin-check clean install uninstall install-deck uninstall-deck
+.PHONY: all module daemon hooks mock test-mock priv-drop-test render-hook-test mount-ns-test thread-exit-migration-test thread-spawn-after-protect-test ptracer-nominate-test ioctl-fuzz baseline-test ac-report-status-test ac-report-url-test ac-report-cooldown-test daemon-limits-test daemon-reporting-test integrity-scan-test implicit-layer-baseline-test compat-ioctl-layout-test ci ci-aur-check ci-actions-pin-check clean install uninstall install-deck uninstall-deck

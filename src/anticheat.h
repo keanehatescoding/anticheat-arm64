@@ -252,6 +252,55 @@ struct ac_syscall_check {
     struct ac_compat_syscall_check compat;
 };
 
+/* ------------------------------------------------------------------ */
+/* AArch32 (compat) layout of AC_IOCTL_SCAN_GET (#80)                  */
+/*                                                                      */
+/* Every ioctl struct above is fixed-width except struct ac_vma_info,   */
+/* whose `unsigned long flags` is 4 bytes for an AArch32 caller and 8   */
+/* for the arm64 kernel. That changes sizeof(struct ac_scan_get) (176   */
+/* vs 184) and so the _IOWR() number, and shifts is_file/path inside    */
+/* the struct. A 32-bit build of this header therefore already computes */
+/* the layout below for struct ac_scan_get; the 64-bit kernel needs it  */
+/* spelled out to translate. Every other command is layout-identical    */
+/* for both callers and takes the plain compat_ptr_ioctl() path.        */
+/*                                                                      */
+/* `flags` is narrowed to 32 bits for compat callers: the VM_* bits any */
+/* consumer here reads (AC_VM_EXEC/AC_VM_WRITE) are in the low word;    */
+/* arm64-only high VM bits are not reported to a 32-bit caller.         */
+/* ------------------------------------------------------------------ */
+struct ac_vma_info32 {
+    unsigned long long start;
+    unsigned long long end;
+    unsigned long long offset;
+    unsigned long long inode;
+    unsigned int       flags;        /* low 32 bits of the native flags */
+    unsigned int       is_file;
+    char               path[AC_VMA_PATH];
+};
+
+struct ac_scan_get32 {
+    int                  pid;
+    unsigned int         index;
+    struct ac_vma_info32 vma;       /* out */
+};
+
+#define AC_IOCTL_SCAN_GET32       _IOWR(AC_IOCTL_MAGIC, 12, struct ac_scan_get32)
+
+static inline void ac_vma_info_to32(struct ac_vma_info32 *dst,
+                                    const struct ac_vma_info *src)
+{
+    unsigned int i;
+
+    dst->start   = src->start;
+    dst->end     = src->end;
+    dst->offset  = src->offset;
+    dst->inode   = src->inode;
+    dst->flags   = (unsigned int)src->flags;
+    dst->is_file = src->is_file;
+    for (i = 0; i < AC_VMA_PATH; i++)
+        dst->path[i] = src->path[i];
+}
+
 struct ac_mod_info {
     char           name[AC_MOD_NAME_LEN];
     unsigned long long size;

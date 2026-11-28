@@ -150,6 +150,21 @@ userspace daemon/CLI that talks to it over a small ioctl interface
 8. **Module pinning.** While the daemon holds `/dev/anticheat` open (or after
    `anticheat lock`), `rmmod` fails with `EBUSY`.
 
+9. **32-bit callers of the control device.** On a `CONFIG_COMPAT` kernel,
+   `/dev/anticheat` also serves AArch32 processes (`.compat_ioctl`), so a
+   32-bit build of the CLI/daemon works against the same module, matching
+   the compat syscall probes that already watch 32-bit tasks. Every ioctl
+   struct is fixed-width except `struct ac_vma_info`'s `flags`
+   (`unsigned long`: 4 bytes for AArch32, 8 for arm64), so
+   `AC_IOCTL_SCAN_GET` is translated through `struct ac_scan_get32`
+   (see `src/anticheat.h`); every other command is layout-identical and
+   forwarded unchanged. `flags` is narrowed to its low 32 bits for
+   compat callers (`AC_VM_EXEC`/`AC_VM_WRITE` are unaffected). The ABI
+   version is unchanged. `CAP_SYS_ADMIN` is re-checked on the compat path
+   exactly as on the native one. The layout contract is checked by
+   `make compat-ioctl-layout-test`; there is no 32-bit userspace test
+   against a loaded module yet.
+
 ### Userspace
 
 ```
@@ -1241,6 +1256,7 @@ test.sh                  end-to-end live test (root)
 diag.sh                  root diagnostics (dmesg, discovery, module walk)
 test/mock_anticheat.c    LD_PRELOAD mock of /dev/anticheat (no-root tests)
 test/mock_test.sh        mock test suite: `make test-mock`
+test/compat_ioctl_layout_test.c  AArch32 layout of AC_IOCTL_SCAN_GET + compat conversion: `make compat-ioctl-layout-test`
 test/priv_drop_test.c    live test: proves ac_ioctl() rechecks CAP_SYS_ADMIN
                          (root, real module -- run via test.sh)
 test/render_hook_test.c  live test: self-hooks vkQueuePresentKHR or (given
